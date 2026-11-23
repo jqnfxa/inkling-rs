@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/ik-kernels", "crates/ik-engine"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.metadata.kernite]
+name = "ik"
+
+[profile.release]
+debug = 1
+codegen-units = 16
+lto = "thin"
+
+[profile.dev]
+opt-level = 1
