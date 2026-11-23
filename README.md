@@ -97,7 +97,8 @@ server takes `--ctx` up to what the VRAM holds (about 350k tokens, with no exper
 | `ik-cpubw <model> [threads..]` | CPU expert kernels, hot in cache and streaming from RAM |
 | `ik-attnmass <model> <text> <n>` | how much of the context full attention needs at depth n |
 
-`IK_FAKE_CPU=1` skips the CPU experts and so measures the GPU path alone.
+`IK_FAKE_CPU=1` skips the CPU experts and so measures the GPU path alone; `IK_NO_GRAPH=1` (`ik-bench`) launches each
+kernel instead of one CUDA graph per token.
 
 ## Limits
 

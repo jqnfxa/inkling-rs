@@ -1,4 +1,5 @@
-//! Decode speed: `ik-bench <model.gguf> [n_gen] [cache_slots] [prompt]`; IK_THREADS sets the expert threads.
+//! Decode speed: `ik-bench <model.gguf> [n_gen] [cache_slots] [prompt]`; IK_THREADS sets the expert threads, IK_NO_GRAPH
+//! launches each kernel instead of one CUDA graph per token.
 use ik_engine::engine::{Engine, Options, threads_from_env};
 use ik_engine::tokenizer::Tokenizer;
 
@@ -12,7 +13,7 @@ fn main() -> Result<(), String> {
     let slots: usize = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
     let prompt = a.get(4).cloned().unwrap_or("<|message_user|><|content_text|>Write a detailed technical explanation of how a CPU cache hierarchy works, including L1, L2 and L3 caches, cache lines, associativity, and replacement policies.<|end_message|><|message_model|><|content_text|>".into());
     let t0 = std::time::Instant::now();
-    let mut e = Engine::new(std::path::Path::new(&a[1]), Options { n_ctx: 8192, cache_slots: slots, threads: threads_from_env(), graph: true, upload_budget: std::env::var("IK_UPLOADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4) })?;
+    let mut e = Engine::new(std::path::Path::new(&a[1]), Options { n_ctx: 8192, cache_slots: slots, threads: threads_from_env(), graph: std::env::var("IK_NO_GRAPH").is_err(), upload_budget: std::env::var("IK_UPLOADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4) })?;
     let tok = Tokenizer::from_gguf(&e.g)?;
     eprintln!("loaded in {:?}: {} MiB weights, {} cache slots, free VRAM {} MiB", t0.elapsed(), e.w.bytes >> 20, e.cache.n_slots, e.ctx.mem_info()?.0 >> 20);
     let ids = tok.encode(&prompt, true);
