@@ -64,6 +64,35 @@ unsafe extern "C" {
     fn cuGraphLaunch(e: CUgraphExec, s: CUstream) -> CUresult;
     fn cuGraphExecDestroy(e: CUgraphExec) -> CUresult;
     fn cuGraphDestroy(g: CUgraph) -> CUresult;
+    fn cuMemGetAllocationGranularity(g: *mut usize, prop: *const CUmemAllocationProp, option: c_int) -> CUresult;
+    fn cuMemAddressReserve(p: *mut CUdeviceptr, size: usize, align: usize, addr: CUdeviceptr, flags: u64) -> CUresult;
+    fn cuMemAddressFree(p: CUdeviceptr, size: usize) -> CUresult;
+    fn cuMemCreate(h: *mut u64, size: usize, prop: *const CUmemAllocationProp, flags: u64) -> CUresult;
+    fn cuMemRelease(h: u64) -> CUresult;
+    fn cuMemMap(p: CUdeviceptr, size: usize, offset: usize, h: u64, flags: u64) -> CUresult;
+    fn cuMemUnmap(p: CUdeviceptr, size: usize) -> CUresult;
+    fn cuMemSetAccess(p: CUdeviceptr, size: usize, desc: *const CUmemAccessDesc, count: usize) -> CUresult;
+}
+
+#[repr(C)]
+struct CUmemLocation {
+    ty: c_int, // CU_MEM_LOCATION_TYPE_DEVICE = 1
+    id: c_int,
+}
+
+#[repr(C)]
+struct CUmemAllocationProp {
+    ty: c_int,           // CU_MEM_ALLOCATION_TYPE_PINNED = 1
+    handle_types: c_int, // none
+    location: CUmemLocation,
+    win32: *mut c_void,
+    flags: [u8; 8],
+}
+
+#[repr(C)]
+struct CUmemAccessDesc {
+    location: CUmemLocation,
+    flags: c_int, // CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3
 }
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -282,6 +311,104 @@ impl DevBuf {
 impl Drop for DevBuf {
     fn drop(&mut self) {
         unsafe { cuMemFree_v2(self.ptr) };
+    }
+}
+
+/// Device memory at a fixed address range whose pages are backed on demand: the first `mapped()` bytes are usable.
+/// Kernels and CUDA graphs keep the address while pages come and go, so memory can move between buffers.
+pub struct VmBuf {
+    pub ptr: CUdeviceptr,
+    /// the reserved bytes, a whole number of pages
+    pub len: usize,
+    pages: Vec<u64>,
+    page: usize,
+    dev: CUdevice,
+}
+unsafe impl Send for VmBuf {}
+unsafe impl Sync for VmBuf {}
+
+impl VmBuf {
+    fn prop(dev: CUdevice) -> CUmemAllocationProp {
+        CUmemAllocationProp { ty: 1, handle_types: 0, location: CUmemLocation { ty: 1, id: dev }, win32: null_mut(), flags: [0; 8] }
+    }
+
+    /// The page size: the driver's minimum granularity (2 MiB on current GPUs).
+    pub fn granularity(dev: CUdevice) -> Result<usize> {
+        let mut g = 0;
+        ck!(cuMemGetAllocationGranularity(&mut g, &Self::prop(dev), 0))?;
+        Ok(g)
+    }
+
+    /// Reserves addresses for `len` bytes (rounded up to pages); no memory is mapped yet.
+    pub fn reserve(len: usize, dev: CUdevice) -> Result<VmBuf> {
+        let page = Self::granularity(dev)?;
+        let len = len.max(1).div_ceil(page) * page;
+        let mut ptr = 0;
+        ck!(cuMemAddressReserve(&mut ptr, len, page, 0, 0))?;
+        Ok(VmBuf { ptr, len, pages: vec![], page, dev })
+    }
+
+    /// The bytes that `bytes` of content take: whole pages.
+    pub fn pages_for(&self, bytes: usize) -> usize {
+        bytes.div_ceil(self.page) * self.page
+    }
+
+    pub fn mapped(&self) -> usize {
+        self.pages.len() * self.page
+    }
+
+    /// Backs the first `bytes` (rounded up to pages) with memory, mapping or releasing pages at the end; new pages are
+    /// zeroed on `s`. The caller makes sure no work in flight reads released pages.
+    pub fn resize(&mut self, bytes: usize, s: &Stream) -> Result<()> {
+        let want = self.pages_for(bytes).min(self.len) / self.page;
+        let have = self.pages.len();
+        if want < have {
+            ck!(cuMemUnmap(self.ptr + (want * self.page) as u64, (have - want) * self.page))?;
+            for h in self.pages.drain(want..) {
+                ck!(cuMemRelease(h))?;
+            }
+        } else if want > have {
+            let prop = Self::prop(self.dev);
+            for i in have..want {
+                let mut h = 0;
+                ck!(cuMemCreate(&mut h, self.page, &prop, 0))?;
+                if let Err(e) = ck!(cuMemMap(self.ptr + (i * self.page) as u64, self.page, 0, h, 0)) {
+                    unsafe { cuMemRelease(h) };
+                    return Err(e);
+                }
+                self.pages.push(h);
+            }
+            let (at, n) = (self.ptr + (have * self.page) as u64, (want - have) * self.page);
+            let desc = CUmemAccessDesc { location: CUmemLocation { ty: 1, id: self.dev }, flags: 3 };
+            ck!(cuMemSetAccess(at, n, &desc, 1))?;
+            ck!(cuMemsetD8Async(at, 0, n, s.0))?;
+        }
+        Ok(())
+    }
+
+    pub fn upload_at<T: Copy>(&self, off: usize, data: &[T]) -> Result<()> {
+        let n = size_of_val(data);
+        assert!(off + n <= self.mapped(), "upload of {n} bytes at {off} past {}", self.mapped());
+        ck!(cuMemcpyHtoD_v2(self.ptr + off as u64, data.as_ptr() as *const c_void, n))
+    }
+
+    pub fn at(&self, off: usize) -> CUdeviceptr {
+        assert!(off <= self.mapped());
+        self.ptr + off as u64
+    }
+}
+
+impl Drop for VmBuf {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.pages.is_empty() {
+                cuMemUnmap(self.ptr, self.mapped());
+            }
+            for &h in &self.pages {
+                cuMemRelease(h);
+            }
+            cuMemAddressFree(self.ptr, self.len);
+        }
     }
 }
 

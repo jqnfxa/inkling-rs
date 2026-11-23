@@ -30,7 +30,7 @@ fn main() -> Result<(), String> {
     let eng = Engine::new(std::path::Path::new(&model), Options { n_ctx, cache_slots: slots, threads: threads_from_env(), graph: true, upload_budget: 4 })?;
     let tok = Arc::new(Tokenizer::from_gguf(&eng.g)?);
     let name = eng.g.str("general.name").unwrap_or("inkling").to_string();
-    eprintln!("{name}: loaded in {:.1}s on {}, context {n_ctx}, {} expert cache slots", t0.elapsed().as_secs_f64(), eng.ctx.name, eng.cache.n_slots);
+    eprintln!("{name}: loaded in {:.1}s on {}, context {n_ctx}, {} expert cache slots (fewer as the context fills)", t0.elapsed().as_secs_f64(), eng.ctx.name, eng.cache.n_slots);
     let site = site(&eng, &model, &name, n_ctx, ui.clone());
     let (tx, rx) = std::sync::mpsc::channel();
     let addr = format!("{host}:{port}");

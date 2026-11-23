@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cpu_pool::Pool;
-use crate::cuda::{self, Ctx, DevBuf, Graph, HostBuf, Result, Stream};
+use crate::cuda::{self, Ctx, DevBuf, Graph, HostBuf, Result, Stream, VmBuf};
 use crate::experts::{ExpertCache, Experts};
 use crate::gguf::Gguf;
 use crate::hp::{Hp, Step};
@@ -40,6 +40,9 @@ fn kv_f16() -> bool {
 fn kv_row() -> usize {
     if kv_f16() { 2048 } else { KV_ROW }
 }
+/// The full-attention KV caches get memory in steps of this many rows (a 2 MiB page of int8 values).
+const KV_STEP: usize = 2048;
+
 /// Decode attention: keys per chunk, log2, of the sliding window layers and of the full ones.
 const CS_SWA: u32 = 6;
 const CS_FULL: u32 = 7;
@@ -183,8 +186,13 @@ pub struct Engine {
     pub s: Stream,
     pub n_ctx: usize,
     sched: Vec<Step>,
-    kcache: Vec<DevBuf>, // int8 rows [rows][8][128], then their f16 scales [rows][8][4]
-    vcache: Vec<DevBuf>,
+    kcache: Vec<Option<DevBuf>>, // int8 rows [rows][8][128], then their f16 scales [rows][8][4]; the SWA rings (all with IK_KV_F16)
+    vcache: Vec<Option<DevBuf>>,
+    /// the full-attention caches: int8 K, its scales, int8 V, its scales, at addresses for n_ctx rows; memory for kv_mapped
+    kv_vm: Vec<Option<[VmBuf; 4]>>,
+    kv_mapped: usize,
+    /// VRAM for the expert cache and the mapped rows of kv_vm together
+    vram_budget: usize,
     kv_rows: Vec<usize>,
     ring: Vec<u32>,
     conv: Vec<DevBuf>, // per slot: k [kv][3], v [kv][3], post [n][3], ffn [n][3]
@@ -259,14 +267,24 @@ impl Engine {
         let n_slots = hp.n_slots();
         let mut kcache = vec![];
         let mut vcache = vec![];
+        let mut kv_vm = vec![];
         let mut kv_rows = vec![];
         let mut ring = vec![];
         let mut conv = vec![];
         for il in 0..n_slots {
             let ip = Self::phys(&hp, il);
             let rows = if hp.is_swa[ip] { hp.n_swa + T_MAX } else { opt.n_ctx };
-            kcache.push(DevBuf::zeroed(rows * kv_row(), &s)?);
-            vcache.push(DevBuf::zeroed(rows * kv_row(), &s)?);
+            if hp.is_swa[ip] || kv_f16() {
+                kcache.push(Some(DevBuf::zeroed(rows * kv_row(), &s)?));
+                vcache.push(Some(DevBuf::zeroed(rows * kv_row(), &s)?));
+                kv_vm.push(None);
+            } else {
+                // memory comes as the context grows (plan_kv)
+                let r = |b: usize| VmBuf::reserve(rows.div_ceil(KV_STEP) * KV_STEP * b, ctx.device);
+                kcache.push(None);
+                vcache.push(None);
+                kv_vm.push(Some([r(1024)?, r(64)?, r(1024)?, r(64)?]));
+            }
             kv_rows.push(rows);
             ring.push(if hp.is_swa[ip] { (hp.n_swa + T_MAX) as u32 } else { 0 });
             conv.push(f((2 * kv + 2 * n) * 3)?);
@@ -392,16 +410,14 @@ impl Engine {
             host_slots: HostBuf::new(4 * tm * 8)?,
             cpu_out: HostBuf::new(4 * tm * 8 * n)?,
         };
-        // the expert cache takes what is free once the KV caches and scratch exist, less the upload staging
-        // buffers and a margin for the CUDA graph and the driver (IK_VRAM_MARGIN_MIB, default 160)
-        let slots = if opt.cache_slots == usize::MAX {
-            let (free, _) = ctx.mem_info()?;
-            let margin = std::env::var("IK_VRAM_MARGIN_MIB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(160) << 20;
-            free.saturating_sub(STAGES * down_bytes + margin) / (ex.gu_bytes + ex.down_bytes)
-        } else {
-            opt.cache_slots
-        };
-        let cache = ExpertCache::new(&ex, &hp, slots)?;
+        // the expert cache and the full-attention KV rows share what is free once the rest exists, less the upload
+        // staging buffers and a margin for the CUDA graph and the driver (IK_VRAM_MARGIN_MIB, default 160); the KV
+        // rows take memory as the context grows and give it back when a new sequence is shorter (plan_kv)
+        let (free, _) = ctx.mem_info()?;
+        let margin = std::env::var("IK_VRAM_MARGIN_MIB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(160) << 20;
+        let vram_budget = free.saturating_sub(STAGES * down_bytes + margin);
+        let max_slots = (vram_budget / (ex.gu_bytes + ex.down_bytes)).min(opt.cache_slots);
+        let cache = ExpertCache::new(&ex, &hp, max_slots, ctx.device)?;
         s.sync()?;
         let job = HostBuf::new(4 * (32 + n))?;
         let ack = HostBuf::new(64)?;
@@ -409,7 +425,7 @@ impl Engine {
         let cpu_out = HostBuf::new(4 * 8 * n)?;
         let threads = if opt.threads.is_empty() { vec![None] } else { opt.threads.clone() };
         let pool = Pool::new(g.clone(), ex.clone(), &job, &ack, &cpu_out, hp.n_phys, hp.n_expert, threads);
-        Ok(Engine {
+        let mut e = Engine {
             params: DevBuf::zeroed(16, &s)?,
             ptrs: DevBuf::zeroed(8 * 4096, &s)?,
             ptr_lists: HashMap::new(),
@@ -440,6 +456,9 @@ impl Engine {
             sched,
             kcache,
             vcache,
+            kv_vm,
+            kv_mapped: 0,
+            vram_budget,
             kv_rows,
             ring,
             conv,
@@ -457,7 +476,83 @@ impl Engine {
             copy_s: Stream::new_nonblocking()?,
             stage: (0..STAGES).map(|_| DevBuf::new(down_bytes)).collect::<Result<_>>()?,
             stage_free: vec![true; STAGES],
-        })
+        };
+        let need = e.kv_bytes(e.n_ctx);
+        if need > e.vram_budget {
+            let per = e.kv_bytes(KV_STEP * 64) / (KV_STEP * 64);
+            return Err(format!(
+                "a context of {} tokens needs {} MiB of KV cache, more than the {} MiB of VRAM there are for it and the experts: {} tokens at most",
+                e.n_ctx,
+                need >> 20,
+                e.vram_budget >> 20,
+                e.vram_budget / per.max(1)
+            ));
+        }
+        e.plan_kv(T_MAX)?;
+        Ok(e)
+    }
+
+    /// Bytes of the full-attention KV caches with `rows` rows mapped.
+    fn kv_bytes(&self, rows: usize) -> usize {
+        self.kv_vm.iter().flatten().map(|b| b.iter().zip([1024, 64, 1024, 64]).map(|(v, w)| v.pages_for(rows * w)).sum::<usize>()).sum()
+    }
+
+    /// Gives the full-attention KV caches memory for `rows` positions (rounded up to KV_STEP) and the expert cache the
+    /// rest of the budget. As the context grows the last slots go, with their experts; when a new sequence is shorter
+    /// they come back empty and fill as experts are used.
+    fn plan_kv(&mut self, rows: usize) -> Result<()> {
+        let rows = (rows.div_ceil(KV_STEP) * KV_STEP).min(self.n_ctx.div_ceil(KV_STEP) * KV_STEP);
+        let kv = self.kv_bytes(rows);
+        if kv > self.vram_budget {
+            return Err(format!("not enough VRAM for the KV cache of {rows} tokens"));
+        }
+        let slots = self.cache.fit(&self.ex, self.vram_budget - kv);
+        if rows == self.kv_mapped && slots == self.cache.n_slots {
+            return Ok(());
+        }
+        // nothing in flight may touch the pages that go: finish the token's work and the uploads
+        self.s.sync()?;
+        self.copy_s.sync()?;
+        self.join_uploads();
+        let resize = |e: &mut Engine, rows: usize| -> Result<()> {
+            for b in e.kv_vm.iter_mut().flatten() {
+                for (v, w) in b.iter_mut().zip([1024, 64, 1024, 64]) {
+                    v.resize(rows * w, &e.s)?;
+                }
+            }
+            Ok(())
+        };
+        // release before taking: the KV rows first when they shrink, the slots first when they do
+        if rows < self.kv_mapped {
+            resize(self, rows)?;
+        }
+        self.cache.set_slots(&self.ex, slots, &self.s)?;
+        if rows > self.kv_mapped {
+            resize(self, rows)?;
+        }
+        self.kv_mapped = rows;
+        self.s.sync()?;
+        let flat: Vec<i32> = self.cache.slot_of.iter().flatten().copied().collect();
+        self.map.upload(&flat)
+    }
+
+    /// Finished async uploads join the cache; returns whether any did.
+    fn join_uploads(&mut self) -> bool {
+        let mut changed = false;
+        let mut k = 0;
+        while k < self.cache.pending.len() {
+            if self.cache.pending[k].ev.done() {
+                let p = self.cache.pending.swap_remove(k);
+                self.cache.slot_of[p.layer][p.e] = p.slot as i32;
+                self.cache.owner[p.slot] = (p.layer, p.e);
+                self.cache.busy[p.slot] = false;
+                self.stage_free[p.stage] = true;
+                changed = true;
+            } else {
+                k += 1;
+            }
+        }
+        changed
     }
 
     pub fn phys(hp: &Hp, il: usize) -> usize {
@@ -541,6 +636,10 @@ impl Engine {
         } else {
             self.reset()?;
         }
+        // a shorter sequence than the last gives its KV memory back to the expert cache
+        if self.kv_mapped > prompt.len() + 2 * KV_STEP {
+            self.plan_kv(prompt.len() + 1)?;
+        }
         let mut logits = vec![];
         for chunk in prompt[reuse..].chunks(T_MAX) {
             logits = if chunk.len() == 1 { self.decode(chunk[0])? } else { self.prefill(chunk)? };
@@ -561,8 +660,12 @@ impl Engine {
 
     /// The int8 values and the scales of slot il's K and V caches.
     fn kv8(&self, il: usize) -> [P; 4] {
+        if let Some(b) = &self.kv_vm[il] {
+            return [b[0].ptr, b[1].ptr, b[2].ptr, b[3].ptr];
+        }
+        let (k, v) = (self.kcache[il].as_ref().unwrap(), self.vcache[il].as_ref().unwrap());
         let q = self.kv_rows[il] * 1024;
-        [self.kcache[il].ptr, self.kcache[il].ptr + q as u64, self.vcache[il].ptr, self.vcache[il].ptr + q as u64]
+        [k.ptr, k.ptr + q as u64, v.ptr, v.ptr + q as u64]
     }
 
     /// The (offset, bytes a row) in a cache of `rows` rows of row `row`'s int8 values and of its scales (or its f16 row).
@@ -582,7 +685,7 @@ impl Engine {
             if ring == 0 {
                 continue;
             }
-            for (ci, cache) in [&self.kcache[il], &self.vcache[il]].into_iter().enumerate() {
+            for (ci, cache) in [&self.kcache[il], &self.vcache[il]].into_iter().flatten().enumerate() {
                 // the window's int8 rows, then its scales
                 let base = (il * 2 + ci) * w * kv_row();
                 for (row, off, cnt) in self.window_rows(ring) {
@@ -615,7 +718,7 @@ impl Engine {
             if ring == 0 {
                 continue;
             }
-            for (ci, cache) in [&self.kcache[il], &self.vcache[il]].into_iter().enumerate() {
+            for (ci, cache) in [&self.kcache[il], &self.vcache[il]].into_iter().flatten().enumerate() {
                 let base = (il * 2 + ci) * w * kv_row();
                 for (row, off, cnt) in self.window_rows(ring) {
                     let mut at = base;
@@ -637,6 +740,9 @@ impl Engine {
         let n = hp.n_embd;
         if self.pos >= self.n_ctx {
             return Err(format!("context of {} tokens is full", self.n_ctx));
+        }
+        if self.pos + 1 > self.kv_mapped {
+            self.plan_kv(self.pos + 1)?;
         }
         // embedding row, dequantized on the host
         let te = self.g.tensor("token_embd.weight")?;
@@ -748,21 +854,8 @@ impl Engine {
         if self.cache.n_slots == 0 {
             return Ok(());
         }
-        let mut changed = false;
         // finished uploads join the cache
-        let mut k = 0;
-        while k < self.cache.pending.len() {
-            if self.cache.pending[k].ev.done() {
-                let p = self.cache.pending.swap_remove(k);
-                self.cache.slot_of[p.layer][p.e] = p.slot as i32;
-                self.cache.owner[p.slot] = (p.layer, p.e);
-                self.cache.busy[p.slot] = false;
-                self.stage_free[p.stage] = true;
-                changed = true;
-            } else {
-                k += 1;
-            }
-        }
+        let mut changed = self.join_uploads();
         let mut cands = vec![];
         {
             let mut u = self.pool.usage.lock().unwrap();
@@ -846,6 +939,9 @@ impl Engine {
         assert!(nt > 0 && nt <= T_MAX);
         if self.pos + nt > self.n_ctx {
             return Err(format!("context of {} tokens is full", self.n_ctx));
+        }
+        if self.pos + nt > self.kv_mapped {
+            self.plan_kv(self.pos + nt)?;
         }
         let te = self.g.tensor("token_embd.weight")?;
         let row = te.ty.row_bytes(n);
@@ -1405,6 +1501,8 @@ impl Engine {
         let hp = self.hp.clone();
         let n = hp.n_embd as u32;
         let reps = 50;
+        // the attention cases read up to n_ctx keys
+        self.plan_kv(self.n_ctx)?;
         let mut res = vec![];
         let ev0 = cuda::Event::new(true)?;
         let ev1 = cuda::Event::new(true)?;

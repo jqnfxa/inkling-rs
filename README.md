@@ -26,7 +26,7 @@ tools/fetch-ui.sh        # llama.cpp's chat UI, into ./ui (optional)
 ./run-inkling-rs.sh      # builds, then serves on http://127.0.0.1:8080
 ```
 
-Open http://127.0.0.1:8080 to chat. `run-inkling-rs.sh` reads `MODEL`, `CTX` (65536), `PORT`, `HOST` and `IK_THREADS`
+Open http://127.0.0.1:8080 to chat. `run-inkling-rs.sh` reads `MODEL`, `CTX` (131072), `PORT`, `HOST` and `IK_THREADS`
 (the CPU expert threads: a count, or a list of CPUs to pin).
 
 ## API
@@ -47,8 +47,8 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, `/v1/streams/looku
 ## Design
 
 - Attention, router and output head stay on the GPU. The 3072 routed experts live in host RAM (huge pages,
-  page-locked), and a VRAM cache holds the hot ones: about 1000 slots, keyed by physical layer so the three loop passes
-  share them, with LFU admission and uploads on a copy stream.
+  page-locked), and a VRAM cache holds the hot ones: up to about 1260 slots, keyed by physical layer so the three loop
+  passes share them, with LFU admission and uploads on a copy stream.
 - Decode is one CUDA graph per token. At each MoE layer the GPU posts the routing to the CPU through pinned memory
   (`router_dispatch`), computes the cached experts while the CPU threads compute the misses (AVX2, int8), and waits on
   a flag (`moe_wait`). No host round trip per layer.
@@ -65,9 +65,23 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, `/v1/streams/looku
 
 ## Context
 
-The model has 8 full-attention layer passes per token. Their KV cache takes 17 KiB per token of `--ctx`, allocated at
-start, and the expert cache gets the VRAM that is left: 1036 slots at 65536. The other 40 passes use a sliding window of
-1024 tokens.
+The model has 8 full-attention layer passes per token; the other 40 use a sliding window of 1024 tokens. The full
+passes' KV cache takes 17 KiB per token. It has addresses for all of `--ctx` from the start but memory only for the
+tokens in use, mapped in 2 MiB pages (CUDA virtual memory) as the context grows: the expert cache gets the rest, so a
+short chat runs with the whole budget (about 1260 slots) whatever `--ctx` is, and each 2048 tokens of context take
+about 7 slots back. A new chat that is shorter than the last gives the pages back to the expert cache.
+
+Decode slows as the context fills, from fewer expert slots and from attention over more keys (about 0.4 ms per token
+for each 8k tokens):
+
+| Context in use | Expert slots | Decode |
+|---|---|---|
+| short | 1260 | 50 t/s |
+| 64k | ~1036 | ~38 t/s |
+| 128k | ~800 | ~33 t/s |
+
+Measured with `ik-bench` at a short context with the slots capped, plus the attention time from `ik-kbench`; the
+server takes `--ctx` up to what the VRAM holds (about 350k tokens, with no expert cache left).
 
 ## Tools
 

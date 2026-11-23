@@ -3,7 +3,7 @@
 
 use rayon::prelude::*;
 
-use crate::cuda::{DevBuf, Result};
+use crate::cuda::{DevBuf, Result, Stream, VmBuf};
 use crate::gguf::{Gguf, GgmlType};
 use crate::hp::Hp;
 use crate::quant::{dequant_q4k_row, dequant_q50_row, dot};
@@ -174,11 +174,13 @@ impl Experts {
     }
 }
 
-/// GPU cache of experts: two banks of slots, and the slot of each (physical layer, expert).
+/// GPU cache of experts: two banks of slots, and the slot of each (physical layer, expert). The banks have addresses for
+/// `max_slots` and memory for the first `n_slots`, which change as the KV cache takes VRAM or gives it back.
 pub struct ExpertCache {
-    pub gu_bank: DevBuf,
-    pub down_bank: DevBuf,
+    pub gu_bank: VmBuf,
+    pub down_bank: VmBuf,
     pub n_slots: usize,
+    pub max_slots: usize,
     pub slot_of: Vec<Vec<i32>>, // [layer][expert] -> slot or -1
     pub owner: Vec<(usize, usize)>, // [slot] -> (layer, expert), usize::MAX if free
     pub uses: Vec<Vec<f32>>, // decayed use counts
@@ -200,20 +202,55 @@ pub struct Pending {
 }
 
 impl ExpertCache {
-    pub fn new(ex: &Experts, hp: &Hp, n_slots: usize) -> Result<ExpertCache> {
+    /// A cache with addresses for `max_slots` and no memory yet (see set_slots).
+    pub fn new(ex: &Experts, hp: &Hp, max_slots: usize, dev: i32) -> Result<ExpertCache> {
         Ok(ExpertCache {
-            gu_bank: DevBuf::new(ex.gu_bytes * n_slots.max(1))?,
-            down_bank: DevBuf::new(ex.down_bytes * n_slots.max(1))?,
-            n_slots,
+            gu_bank: VmBuf::reserve(ex.gu_bytes * max_slots, dev)?,
+            down_bank: VmBuf::reserve(ex.down_bytes * max_slots, dev)?,
+            n_slots: 0,
+            max_slots,
             slot_of: vec![vec![-1; hp.n_expert]; hp.n_phys],
-            owner: vec![(usize::MAX, usize::MAX); n_slots],
+            owner: vec![(usize::MAX, usize::MAX); max_slots],
             uses: vec![vec![0.0; hp.n_expert]; hp.n_phys],
             hits: 0,
             misses: 0,
             uploads: 0,
-            busy: vec![false; n_slots],
+            busy: vec![false; max_slots],
             pending: vec![],
         })
+    }
+
+    /// The most slots that `bytes` of memory hold, up to max_slots.
+    pub fn fit(&self, ex: &Experts, bytes: usize) -> usize {
+        let need = |n: usize| self.gu_bank.pages_for(n * ex.gu_bytes) + self.down_bank.pages_for(n * ex.down_bytes);
+        let mut n = (bytes / (ex.gu_bytes + ex.down_bytes)).min(self.max_slots);
+        while n > 0 && need(n) > bytes {
+            n -= 1;
+        }
+        n
+    }
+
+    /// The bytes that n slots take.
+    pub fn bytes_for(&self, ex: &Experts, n: usize) -> usize {
+        self.gu_bank.pages_for(n * ex.gu_bytes) + self.down_bank.pages_for(n * ex.down_bytes)
+    }
+
+    /// Sets the number of usable slots: the experts in the slots that go are dropped, and new slots start free.
+    /// No upload may be pending into a slot that goes, and no work in flight may read it.
+    pub fn set_slots(&mut self, ex: &Experts, n: usize, s: &Stream) -> Result<()> {
+        let n = n.min(self.max_slots);
+        for v in n..self.n_slots {
+            assert!(!self.busy[v], "slot {v} is being filled");
+            let (l, e) = self.owner[v];
+            if l != usize::MAX {
+                self.slot_of[l][e] = -1;
+            }
+            self.owner[v] = (usize::MAX, usize::MAX);
+        }
+        self.gu_bank.resize(n * ex.gu_bytes, s)?;
+        self.down_bank.resize(n * ex.down_bytes, s)?;
+        self.n_slots = n;
+        Ok(())
     }
 
     /// Uploads expert e of `layer` into `slot` (synchronous); the down matrix goes raw to `stage_down`, for the caller
@@ -234,7 +271,7 @@ impl ExpertCache {
     /// The least used slot, free slots first; None if all are being filled.
     pub fn victim(&self) -> Option<usize> {
         let mut best = (f32::INFINITY, usize::MAX);
-        for (s, &(l, e)) in self.owner.iter().enumerate() {
+        for (s, &(l, e)) in self.owner[..self.n_slots].iter().enumerate() {
             if self.busy[s] {
                 continue;
             }
