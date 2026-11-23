@@ -95,6 +95,7 @@ server takes `--ctx` up to what the VRAM holds (about 350k tokens, with no exper
 | `ik-rollback <model> [repeats]` | KV cache rollback against a fresh prefill |
 | `ik-kbench`, `ik-kcmp` | GPU kernel timings; new kernels against the ones they replace |
 | `ik-cpubw <model> [threads..]` | CPU expert kernels, hot in cache and streaming from RAM |
+| `ik-attnmass <model> <text> <n>` | how much of the context full attention needs at depth n |
 
 `IK_FAKE_CPU=1` skips the CPU experts and so measures the GPU path alone.
 

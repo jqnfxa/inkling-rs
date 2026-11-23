@@ -1433,6 +1433,11 @@ impl Engine {
             self.k.attn_reduce(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, p_pos, window, maxs, hp.n_head as u32)?;
         } else {
             self.k.attn_part8(&self.s, self.sc.q.ptr, self.sc.r.ptr, sink, l.rel_bias.ptr, kv8, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, p_pos, ring, extent, scale, maxs, nsplit, window, cs)?;
+            if !swa {
+                // the per-chunk max and sum of each head: [kv head][chunk][3]
+                self.probe("attn_pm", il, self.sc.pm.ptr, 8 * maxs as usize * 3)?;
+                self.probe("attn_pl", il, self.sc.pl.ptr, 8 * maxs as usize * 3)?;
+            }
             self.k.attn_reduce8(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, p_pos, window, maxs, cs, hp.n_head as u32)?;
         }
         self.probe("kqv_out", il, self.sc.att.ptr, nh as usize)?;
