@@ -3,9 +3,9 @@
 use crate::cuda::{DevBuf, Result};
 use crate::gguf::{Gguf, GgmlType};
 use crate::hp::Hp;
-use crate::quant::repack_q8;
+use crate::quant::{float_row, quantize_q8_rows, repack_q8};
 
-/// A repacked Q8_0 matrix: `qs` [rows][k] int8, `d` [rows][k/32] f16. Several GGUF matrices of the same k may be
+/// A repacked Q8_0 matrix: `qs` [rows][k] int8, `d` [rows][k/32] f16 (float matrices are quantized to it). Several GGUF matrices of the same k may be
 /// stacked by rows, so that one GEMV computes them all.
 pub struct Q8Mat {
     pub qs: DevBuf,
@@ -21,15 +21,24 @@ impl Q8Mat {
         let mut k = 0;
         for name in names {
             let t = g.tensor(name)?;
-            if t.ty != GgmlType::Q8_0 || t.ne.len() != 2 {
-                return Err(format!("{name} is not a Q8_0 matrix"));
+            if t.ne.len() != 2 {
+                return Err(format!("{name} is not a matrix"));
             }
             if k != 0 && k != t.ne[0] {
                 return Err(format!("{name}: k {} differs from {k}", t.ne[0]));
             }
             k = t.ne[0];
             rows += t.ne[1];
-            repack_q8(g.bytes(t), t.ne[1], k, &mut qs, &mut d);
+            match t.ty {
+                GgmlType::Q8_0 => repack_q8(g.bytes(t), t.ne[1], k, &mut qs, &mut d),
+                // the small float matrices (BF16 projections, F32 loop gates) join the Q8_0 GEMVs they are stacked in
+                GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => {
+                    let mut x = vec![0f32; t.ne[0] * t.ne[1]];
+                    float_row(t.ty, g.bytes(t), &mut x);
+                    quantize_q8_rows(&x, k, &mut qs, &mut d);
+                }
+                ty => return Err(format!("{name} is {ty:?}: the GEMVs take Q8_0 or float matrices")),
+            }
         }
         Ok(Q8Mat { qs: DevBuf::from_slice(&qs)?, d: DevBuf::from_slice(&d)?, rows, k })
     }

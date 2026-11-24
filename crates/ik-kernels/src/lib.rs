@@ -1243,325 +1243,6 @@ pub mod gpu {
 
     // ---------------------------------------------------------------- MoE experts on the GPU
 
-    /// gate_up of the cached experts: y[k] = W[slot_k] x for each k of the 8 selected experts with `slots[k] >= 0`.
-    /// W is Q4_K [rows][kdim] in GGUF block layout, `slot_bytes` apart in `bank`. A warp per row, 8 rows per block,
-    /// grid.y = 8 experts.
-    #[reqntid(256)]
-    pub unsafe extern "ptx-kernel" fn moe_q4k(bank: *const u8, slot_bytes: u64, slots: *const i32, x: *const f32, y: *mut f32, rows: u32, kdim: u32) {
-        let xs: shared<[f32; 4608], 16>;
-        let ke: u32;
-        mov.u32(ke, ctaid.y);
-        let (sa, slot): (u64, s32);
-        mad.wide.u32(sa, ke, 4, slots);
-        ld.global.s32(slot, [sa]);
-        let none: pred;
-        setp.lt.s32(none, slot, 0);
-        if none {
-            ret();
-        }
-        let base: u32;
-        mov.u32(base, xs);
-        stage(base, x, kdim);
-        let (lane, row): (u32, u32);
-        warp_row(lane, row);
-        let past: pred;
-        setp.ge.u32(past, row, rows);
-        if past {
-            ret();
-        }
-        let (nsb, rowb): (u32, u32);
-        shr.u32(nsb, kdim, 8);
-        mul.lo.u32(rowb, nsb, 144);
-        let (sl, wbase, ra): (u64, u64, u64);
-        cvt.u64.s32(sl, slot);
-        mul.lo.u64(sl, sl, slot_bytes);
-        add.u64(wbase, bank, sl);
-        mad.wide.u32(ra, row, rowb, wbase);
-
-        let (j, sb0): (u32, u32);
-        and.b32(j, lane, 7);
-        shr.u32(sb0, lane, 3);
-        let lo4: pred;
-        setp.lt.u32(lo4, j, 4);
-        let (jj, p8, shift): (u32, u32, u32);
-        and.b32(jj, j, 3);
-        shl.b32(p8, jj, 3);
-        and.b32(shift, j, 1);
-        shl.b32(shift, shift, 2);
-        let chunk: u32;
-        shr.u32(chunk, j, 1);
-        shl.b32(chunk, chunk, 5);
-        add.u32(chunk, chunk, 16);
-
-        let acc: f32;
-        mov.f32(acc, 0.0);
-        for it in 0..3 {
-            let sbi: u32;
-            add.u32(sbi, sb0, it * 4);
-            let inr: pred;
-            setp.lt.u32(inr, sbi, nsb);
-            if inr {
-                let ba: u64;
-                mad.wide.u32(ba, sbi, 144, ra);
-                let (hd, hm): (f16, f16);
-                let (d, dmin): (f32, f32);
-                ld.global.nc.b16(hd, [ba]);
-                ld.global.nc.b16(hm, [ba + 2]);
-                cvt.f32.f16(d, hd);
-                cvt.f32.f16(dmin, hm);
-                let (s0, s1, s2): (u32, u32, u32);
-                ld.global.nc.u32(s0, [ba + 4]);
-                ld.global.nc.u32(s1, [ba + 8]);
-                ld.global.nc.u32(s2, [ba + 12]);
-                // j < 4: sc = s0[j] & 63, m = s1[j] & 63; else (jj = j - 4): sc = s2[jj] & 15 | (s0[jj] >> 6) << 4, m = s2[jj] >> 4 | (s1[jj] >> 6) << 4
-                let (sc_a, m_a, sc_b, m_b, hi, p6, p4): (u32, u32, u32, u32, u32, u32, u32);
-                bfe.u32(sc_a, s0, p8, 6);
-                bfe.u32(m_a, s1, p8, 6);
-                add.u32(p6, p8, 6);
-                add.u32(p4, p8, 4);
-                bfe.u32(sc_b, s2, p8, 4);
-                bfe.u32(hi, s0, p6, 2);
-                shl.b32(hi, hi, 4);
-                or.b32(sc_b, sc_b, hi);
-                bfe.u32(m_b, s2, p4, 4);
-                bfe.u32(hi, s1, p6, 2);
-                shl.b32(hi, hi, 4);
-                or.b32(m_b, m_b, hi);
-                let (scu, mu): (u32, u32);
-                selp.u32(scu, sc_a, sc_b, lo4);
-                selp.u32(mu, m_a, m_b, lo4);
-                let (scf, mf): (f32, f32);
-                cvt.rn.f32.u32(scf, scu);
-                cvt.rn.f32.u32(mf, mu);
-                mul.rn.f32(scf, scf, d);
-                mul.rn.f32(mf, mf, dmin);
-                let qa: u64;
-                cvt.u64.u32(qa, chunk);
-                add.u64(qa, qa, ba);
-                let (w0, w1, w2, w3, w4, w5, w6, w7): (u32, u32, u32, u32, u32, u32, u32, u32);
-                ld.global.nc.v4.u32((w0, w1, w2, w3), [qa]);
-                ld.global.nc.v4.u32((w4, w5, w6, w7), [qa + 16]);
-                let xo: u32;
-                shl.b32(xo, sbi, 8);
-                mad.lo.u32(xo, j, 32, xo);
-                mad.lo.u32(xo, xo, 4, base);
-                let (sqx, sx): (f32, f32);
-                mov.f32(sqx, 0.0);
-                mov.f32(sx, 0.0);
-                let (xo1, xo2, xo3): (u32, u32, u32);
-                add.u32(xo1, xo, 32);
-                add.u32(xo2, xo, 64);
-                add.u32(xo3, xo, 96);
-                nib8(sqx, sx, w0, w1, shift, xo);
-                nib8(sqx, sx, w2, w3, shift, xo1);
-                nib8(sqx, sx, w4, w5, shift, xo2);
-                nib8(sqx, sx, w6, w7, shift, xo3);
-                fma.rn.f32(acc, scf, sqx, acc);
-                mul.rn.f32(sx, sx, mf);
-                sub.rn.f32(acc, acc, sx);
-            }
-        }
-        warp_sum(acc);
-        let first: pred;
-        setp.eq.u32(first, lane, 0);
-        if first {
-            let (o, oa): (u32, u64);
-            mad.lo.u32(o, ke, rows, row);
-            mad.wide.u32(oa, o, 4, y);
-            st.global.f32([oa], acc);
-        }
-    }
-
-    /// sqx += sum of the 8 nibbles at `shift` of the 8 bytes (wa, wb) times x[0..8] at shared `xo`; sx += sum x.
-    fn nib8(sqx: f32, sx: f32, wa: u32, wb: u32, shift: u32, xo: u32) {
-        let (x0, x1, x2, x3): (f32, f32, f32, f32);
-        ld.shared.v4.f32((x0, x1, x2, x3), [xo]);
-        nib4(sqx, sx, wa, shift, x0, x1, x2, x3);
-        ld.shared.v4.f32((x0, x1, x2, x3), [xo + 16]);
-        nib4(sqx, sx, wb, shift, x0, x1, x2, x3);
-    }
-
-    fn nib4(sqx: f32, sx: f32, w: u32, shift: u32, x0: f32, x1: f32, x2: f32, x3: f32) {
-        let (q, p): (u32, u32);
-        let f: f32;
-        for b in 0..4 {
-            add.u32(p, shift, b * 8);
-            bfe.u32(q, w, p, 4);
-            cvt.rn.f32.u32(f, q);
-            if b == 0 {
-                fma.rn.f32(sqx, f, x0, sqx);
-                add.rn.f32(sx, sx, x0);
-            }
-            if b == 1 {
-                fma.rn.f32(sqx, f, x1, sqx);
-                add.rn.f32(sx, sx, x1);
-            }
-            if b == 2 {
-                fma.rn.f32(sqx, f, x2, sqx);
-                add.rn.f32(sx, sx, x2);
-            }
-            if b == 3 {
-                fma.rn.f32(sqx, f, x3, sqx);
-                add.rn.f32(sx, sx, x3);
-            }
-        }
-    }
-
-    /// down of the cached experts, after the SITU activation of their gate_up `gu` ([8][2 kdim]):
-    /// a = beta tanh(g/beta) sigmoid(g) * lb tanh(u/lb), y[k] = W[slot_k] a. W is Q5_0 [rows][kdim], GGUF block layout.
-    #[reqntid(256)]
-    pub unsafe extern "ptx-kernel" fn moe_q50_situ(
-        bank: *const u8, slot_bytes: u64, slots: *const i32, gu: *const f32, y: *mut f32, rows: u32, kdim: u32, beta: f32, lb: f32,
-    ) {
-        let xs: shared<[f32; 2304], 16>;
-        let ke: u32;
-        mov.u32(ke, ctaid.y);
-        let (sa, slot): (u64, s32);
-        mad.wide.u32(sa, ke, 4, slots);
-        ld.global.s32(slot, [sa]);
-        let none: pred;
-        setp.lt.s32(none, slot, 0);
-        if none {
-            ret();
-        }
-        let base: u32;
-        mov.u32(base, xs);
-        let gk: u64;
-        let k2: u32;
-        shl.b32(k2, kdim, 1);
-        mul.lo.u32(k2, k2, ke);
-        mad.wide.u32(gk, k2, 4, gu);
-        situ_stage(base, gk, kdim, beta, lb);
-
-        let (lane, row): (u32, u32);
-        warp_row(lane, row);
-        let past: pred;
-        setp.ge.u32(past, row, rows);
-        if past {
-            ret();
-        }
-        let (nb, rowb): (u32, u32);
-        shr.u32(nb, kdim, 5);
-        mul.lo.u32(rowb, nb, 22);
-        let (sl, wbase, ra): (u64, u64, u64);
-        cvt.u64.s32(sl, slot);
-        mul.lo.u64(sl, sl, slot_bytes);
-        add.u64(wbase, bank, sl);
-        mad.wide.u32(ra, row, rowb, wbase);
-        let acc: f32;
-        mov.f32(acc, 0.0);
-        for it in 0..2 {
-            let bi: u32;
-            add.u32(bi, lane, it * 32);
-            let inr: pred;
-            setp.lt.u32(inr, bi, nb);
-            if inr {
-                let ba: u64;
-                mad.wide.u32(ba, bi, 22, ra);
-                q50_block(acc, ba, bi, base);
-            }
-        }
-        warp_sum(acc);
-        let first: pred;
-        setp.eq.u32(first, lane, 0);
-        if first {
-            let (o, oa): (u32, u64);
-            mad.lo.u32(o, ke, rows, row);
-            mad.wide.u32(oa, o, 4, y);
-            st.global.f32([oa], acc);
-        }
-    }
-
-    /// shared a[i] = situ(g[i], g[n + i]) for i < n, then waits.
-    fn situ_stage(dst: u32, g: u64, n: u32, beta: f32, lb: f32) {
-        let (i, nt): (u32, u32);
-        mov.u32(i, tid.x);
-        mov.u32(nt, ntid.x);
-        let (ib, il): (f32, f32);
-        rcp.rn.f32(ib, beta);
-        rcp.rn.f32(il, lb);
-        label(top);
-        let done: pred;
-        setp.ge.u32(done, i, n);
-        if done {
-            bra(end);
-        }
-        let (ga, ua): (u64, u64);
-        let iu: u32;
-        let (gv, uv, a, sg, tu): (f32, f32, f32, f32, f32);
-        mad.wide.u32(ga, i, 4, g);
-        add.u32(iu, i, n);
-        mad.wide.u32(ua, iu, 4, g);
-        ld.global.f32(gv, [ga]);
-        ld.global.f32(uv, [ua]);
-        mul.rn.f32(a, gv, ib);
-        tanh(a, a);
-        mul.rn.f32(a, a, beta);
-        sigmoid(sg, gv);
-        mul.rn.f32(a, a, sg);
-        mul.rn.f32(tu, uv, il);
-        tanh(tu, tu);
-        mul.rn.f32(tu, tu, lb);
-        mul.rn.f32(a, a, tu);
-        let sat: u32;
-        mad.lo.u32(sat, i, 4, dst);
-        st.shared.f32([sat], a);
-        add.u32(i, i, nt);
-        bra(top);
-        label(end);
-        bar.sync(0);
-    }
-
-    /// acc += d * sum_i (q_i - 16) x_i over the Q5_0 block at `ba` (block index `bi`, x at shared `xs`).
-    fn q50_block(acc: f32, ba: u64, bi: u32, xs: u32) {
-        let (hd, h0, h1): (f16, u16, u16);
-        ld.global.nc.b16(hd, [ba]);
-        ld.global.nc.u16(h0, [ba + 2]);
-        ld.global.nc.u16(h1, [ba + 4]);
-        let (qh, qh1): (u32, u32);
-        cvt.u32.u16(qh, h0);
-        cvt.u32.u16(qh1, h1);
-        shl.b32(qh1, qh1, 16);
-        or.b32(qh, qh, qh1);
-        let d: f32;
-        cvt.f32.f16(d, hd);
-        let xo: u32;
-        shl.b32(xo, bi, 7);
-        add.u32(xo, xo, xs);
-        let (sqx, sx): (f32, f32);
-        mov.f32(sqx, 0.0);
-        mov.f32(sx, 0.0);
-        for pair in 0..8 {
-            let hw: u16;
-            ld.global.nc.u16(hw, [ba + (6 + pair * 2)]);
-            let w: u32;
-            cvt.u32.u16(w, hw);
-            for byte in 0..2 {
-                let i = pair * 2 + byte;
-                let (lo, hi, hb, q): (u32, u32, u32, u32);
-                let (f, xl, xh): (f32, f32, f32);
-                bfe.u32(lo, w, byte * 8, 4);
-                bfe.u32(hi, w, byte * 8 + 4, 4);
-                bfe.u32(hb, qh, i, 1);
-                shl.b32(hb, hb, 4);
-                or.b32(q, lo, hb);
-                cvt.rn.f32.u32(f, q);
-                ld.shared.f32(xl, [xo + (i * 4)]);
-                fma.rn.f32(sqx, f, xl, sqx);
-                add.rn.f32(sx, sx, xl);
-                bfe.u32(hb, qh, i + 16, 1);
-                shl.b32(hb, hb, 4);
-                or.b32(q, hi, hb);
-                cvt.rn.f32.u32(f, q);
-                ld.shared.f32(xh, [xo + ((i + 16) * 4)]);
-                fma.rn.f32(sqx, f, xh, sqx);
-                add.rn.f32(sx, sx, xh);
-            }
-        }
-        fma.rn.f32(sqx, sx, -16.0, sqx);
-        fma.rn.f32(acc, d, sqx, acc);
-    }
-
     /// out[c] = sum_k wts[k] * (slots[k] >= 0 ? gpu[k][c] : cpu[k][c]); `cpu` may be host-mapped memory.
     #[maxntid(256)]
     pub unsafe extern "ptx-kernel" fn moe_combine(gpu: *const f32, cpu: *const f32, slots: *const i32, wts: *const f32, out: *mut f32, n: u32) {
@@ -2005,172 +1686,6 @@ pub mod gpu {
         gemv_q8d_body(qz, dz, xqz, xdz, yz, rows, k, b);
     }
 
-    /// gate_up of the cached experts with q8_1 x: Q4_K rows in GGUF layout, 8 lanes per row (lane j takes sub-block j of
-    /// every super-block), 32 rows per block, grid.y = 8 experts.
-    #[reqntid(256)]
-    pub unsafe extern "ptx-kernel" fn moe_q4k_d(
-        bank: *const u8, slot_bytes: u64, slots: *const i32, xq: *const u8, xd: *const f32, xsum: *const f32, y: *mut f32, rows: u32, kdim: u32,
-    ) {
-        let xs: shared<[u8; 2304], 16>;
-        let dsh: shared<[f32; 72], 16>;
-        let ssh: shared<[f32; 72], 16>;
-        let ke: u32;
-        mov.u32(ke, ctaid.y);
-        let (sa, slot): (u64, s32);
-        mad.wide.u32(sa, ke, 4, slots);
-        ld.global.s32(slot, [sa]);
-        let none: pred;
-        setp.lt.s32(none, slot, 0);
-        if none {
-            ret();
-        }
-        let (xb, db, sb, nb, nb4): (u32, u32, u32, u32, u32);
-        mov.u32(xb, xs);
-        mov.u32(db, dsh);
-        mov.u32(sb, ssh);
-        shr.u32(nb, kdim, 5);
-        shl.b32(nb4, nb, 2);
-        stage_bytes(xb, xq, kdim);
-        stage_bytes(db, xd, nb4);
-        stage_bytes(sb, xsum, nb4);
-        bar.sync(0);
-        let (t, lane, w, rsub, j, row): (u32, u32, u32, u32, u32, u32);
-        mov.u32(t, tid.x);
-        and.b32(lane, t, 31);
-        shr.u32(w, t, 5);
-        shr.u32(rsub, lane, 3);
-        and.b32(j, lane, 7);
-        let bk: u32;
-        mov.u32(bk, ctaid.x);
-        shl.b32(row, bk, 5);
-        mad.lo.u32(row, w, 4, row);
-        add.u32(row, row, rsub);
-        let past: pred;
-        setp.ge.u32(past, row, rows);
-        if past {
-            ret();
-        }
-        let (nsb, rowb): (u32, u32);
-        shr.u32(nsb, kdim, 8);
-        mul.lo.u32(rowb, nsb, 144);
-        let (sl, wbase, ra): (u64, u64, u64);
-        cvt.u64.s32(sl, slot);
-        mul.lo.u64(sl, sl, slot_bytes);
-        add.u64(wbase, bank, sl);
-        mad.wide.u32(ra, row, rowb, wbase);
-        let lo4: pred;
-        setp.lt.u32(lo4, j, 4);
-        let (jj, p8, p6, p4, shift, chunk): (u32, u32, u32, u32, u32, u32);
-        and.b32(jj, j, 3);
-        shl.b32(p8, jj, 3);
-        add.u32(p6, p8, 6);
-        add.u32(p4, p8, 4);
-        and.b32(shift, j, 1);
-        shl.b32(shift, shift, 2);
-        shr.u32(chunk, j, 1);
-        shl.b32(chunk, chunk, 5);
-        add.u32(chunk, chunk, 16);
-        let acc: f32;
-        mov.f32(acc, 0.0);
-        let sbi: u32;
-        mov.u32(sbi, 0);
-        label(top);
-        let done: pred;
-        setp.ge.u32(done, sbi, nsb);
-        if done {
-            bra(end);
-        }
-        let ba: u64;
-        mad.wide.u32(ba, sbi, 144, ra);
-        let (hd, hm): (f16, f16);
-        let (d, dmin): (f32, f32);
-        ld.global.nc.b16(hd, [ba]);
-        ld.global.nc.b16(hm, [ba + 2]);
-        cvt.f32.f16(d, hd);
-        cvt.f32.f16(dmin, hm);
-        let (s0, s1, s2): (u32, u32, u32);
-        ld.global.nc.u32(s0, [ba + 4]);
-        ld.global.nc.u32(s1, [ba + 8]);
-        ld.global.nc.u32(s2, [ba + 12]);
-        let (sc_a, m_a, sc_b, m_b, hi): (u32, u32, u32, u32, u32);
-        bfe.u32(sc_a, s0, p8, 6);
-        bfe.u32(m_a, s1, p8, 6);
-        bfe.u32(sc_b, s2, p8, 4);
-        bfe.u32(hi, s0, p6, 2);
-        shl.b32(hi, hi, 4);
-        or.b32(sc_b, sc_b, hi);
-        bfe.u32(m_b, s2, p4, 4);
-        bfe.u32(hi, s1, p6, 2);
-        shl.b32(hi, hi, 4);
-        or.b32(m_b, m_b, hi);
-        let (scu, mu): (u32, u32);
-        selp.u32(scu, sc_a, sc_b, lo4);
-        selp.u32(mu, m_a, m_b, lo4);
-        let qa: u64;
-        cvt.u64.u32(qa, chunk);
-        add.u64(qa, qa, ba);
-        let (w0, w1, w2, w3, w4, w5, w6, w7): (u32, u32, u32, u32, u32, u32, u32, u32);
-        ld.global.nc.v4.u32((w0, w1, w2, w3), [qa]);
-        ld.global.nc.v4.u32((w4, w5, w6, w7), [qa + 16]);
-        let (xblk, xo): (u32, u32);
-        shl.b32(xblk, sbi, 3);
-        add.u32(xblk, xblk, j);
-        shl.b32(xo, xblk, 5);
-        add.u32(xo, xo, xb);
-        let (x0, x1, x2, x3, x4, x5, x6, x7): (u32, u32, u32, u32, u32, u32, u32, u32);
-        ld.shared.v4.u32((x0, x1, x2, x3), [xo]);
-        ld.shared.v4.u32((x4, x5, x6, x7), [xo + 16]);
-        let dot: u32;
-        mov.u32(dot, 0);
-        nib_dp4a(dot, w0, x0, shift);
-        nib_dp4a(dot, w1, x1, shift);
-        nib_dp4a(dot, w2, x2, shift);
-        nib_dp4a(dot, w3, x3, shift);
-        nib_dp4a(dot, w4, x4, shift);
-        nib_dp4a(dot, w5, x5, shift);
-        nib_dp4a(dot, w6, x6, shift);
-        nib_dp4a(dot, w7, x7, shift);
-        let (dx, sx, scf, mf, f): (f32, f32, f32, f32, f32);
-        let (dxa, sxa): (u32, u32);
-        mad.lo.u32(dxa, xblk, 4, db);
-        mad.lo.u32(sxa, xblk, 4, sb);
-        ld.shared.f32(dx, [dxa]);
-        ld.shared.f32(sx, [sxa]);
-        cvt.rn.f32.u32(scf, scu);
-        cvt.rn.f32.u32(mf, mu);
-        mul.rn.f32(scf, scf, d);
-        mul.rn.f32(scf, scf, dx);
-        mul.rn.f32(mf, mf, dmin);
-        mul.rn.f32(mf, mf, sx);
-        cvt.rn.f32.s32(f, dot);
-        fma.rn.f32(acc, scf, f, acc);
-        sub.rn.f32(acc, acc, mf);
-        add.u32(sbi, sbi, 1);
-        bra(top);
-        label(end);
-        for sh in [4, 2, 1] {
-            let o: f32;
-            shfl.sync.bfly.b32(o, acc, sh, 31, 0xffff_ffff);
-            add.rn.f32(acc, acc, o);
-        }
-        let first: pred;
-        setp.eq.u32(first, j, 0);
-        if first {
-            let (o, oa): (u32, u64);
-            mad.lo.u32(o, ke, rows, row);
-            mad.wide.u32(oa, o, 4, y);
-            st.global.f32([oa], acc);
-        }
-    }
-
-    /// dot += dp4a of the 4 nibbles at `shift` of the bytes of w, with the 4 signed bytes of x
-    fn nib_dp4a(dot: u32, w: u32, x: u32, shift: u32) {
-        let v: u32;
-        shr.u32(v, w, shift);
-        and.b32(v, v, 0x0f0f_0f0f);
-        dp4a.u32.s32(dot, v, x, dot);
-    }
-
     /// The SITU activation of the cached experts' gate_up ([8][2 nff]), quantized as q8_1: aq [8][nff], ad, as [8][nff/32].
     /// A warp per block of 32, grid.y = 8 experts.
     #[maxntid(256)]
@@ -2228,66 +1743,69 @@ pub mod gpu {
         q8_warp(a, lane, qa, da, s2);
     }
 
-    /// Repacks the down matrix of one expert from GGUF Q5_0 rows ([rows][nb] blocks of {f16 d, u32 qh, 16 qs}) to the
-    /// cache layout: qs [rows][nb][16], then qh [rows][nb] u32, then d [rows][nb] f16. A thread per block.
-    #[maxntid(256)]
-    pub unsafe extern "ptx-kernel" fn q50_repack(src: *const u8, dst: *mut u8, rows: u32, nb: u32) {
-        let (bk, nt, t, i, total): (u32, u32, u32, u32, u32);
-        mov.u32(bk, ctaid.x);
-        mov.u32(nt, ntid.x);
-        mov.u32(t, tid.x);
-        mad.lo.u32(i, bk, nt, t);
-        mul.lo.u32(total, rows, nb);
-        let past: pred;
-        setp.ge.u32(past, i, total);
-        if past {
-            ret();
+    /// The UE4M3 scale byte `b` as f32, halved as ggml decodes it: 2^(e-8) (1 + m/8), or m 2^-10 when e = 0; 0x7F is 0.
+    fn ue4m3(f: f32, b: u32) {
+        let (e, bits, m): (u32, u32, u32);
+        and.b32(e, b, 0x78);
+        and.b32(bits, b, 0x7F);
+        shl.b32(bits, bits, 20);
+        add.u32(bits, bits, 0x3B80_0000);
+        mov.b32(f, bits);
+        let (sub, nan): (pred, pred);
+        setp.eq.u32(sub, e, 0);
+        if sub {
+            let mf: f32;
+            and.b32(m, b, 7);
+            cvt.rn.f32.u32(mf, m);
+            mul.rn.f32(f, mf, 0.0009765625);
         }
-        let sa: u64;
-        mad.wide.u32(sa, i, 22, src);
-        let (d, h0, h1): (u16, u16, u16);
-        ld.global.u16(d, [sa]);
-        ld.global.u16(h0, [sa + 2]);
-        ld.global.u16(h1, [sa + 4]);
-        let (qh, hi): (u32, u32);
-        cvt.u32.u16(qh, h0);
-        cvt.u32.u16(hi, h1);
-        shl.b32(hi, hi, 16);
-        or.b32(qh, qh, hi);
-        let words: [u32; 4];
-        for k in 0..4 {
-            let (lo16, hi16): (u16, u16);
-            let (a, b2): (u32, u32);
-            ld.global.u16(lo16, [sa + (6 + k * 4)]);
-            ld.global.u16(hi16, [sa + (8 + k * 4)]);
-            cvt.u32.u16(a, lo16);
-            cvt.u32.u16(b2, hi16);
-            shl.b32(b2, b2, 16);
-            or.b32(words[k], a, b2);
+        setp.eq.u32(nan, bits, 0x4B70_0000);
+        if nan {
+            mov.f32(f, 0.0);
         }
-        let (qa, ha, da): (u64, u64, u64);
-        let (o16, o4, o2): (u32, u32, u32);
-        mad.wide.u32(qa, i, 16, dst);
-        st.global.v4.u32([qa], (words[0], words[1], words[2], words[3]));
-        mul.lo.u32(o16, total, 16);
-        mad.lo.u32(o4, i, 4, o16);
-        mad.wide.u32(ha, o4, 1, dst);
-        st.global.u32([ha], qh);
-        mul.lo.u32(o2, total, 20);
-        mad.lo.u32(o2, i, 2, o2);
-        mad.wide.u32(da, o2, 1, dst);
-        st.global.u16([da], d);
     }
 
-    /// down of the cached experts with q8_1 activations, on the repacked Q5_0 bank (see q50_repack).
-    /// 4 lanes per row, 64 rows per block, grid.y = 8 experts; nb (blocks per row) a multiple of 4.
+    /// The 4 bytes of v (each an E2M1 code 0..15) as 4 int8 of the doubled values: magnitudes from `pa`/`pb`
+    /// ({0,1,2,3}, {4,6,8,12}), negatives from `na`/`nb`, picked by bit 3.
+    fn fp4x4(out: u32, v: u32, pa: u32, pb: u32, na: u32, nb: u32) {
+        let (sl, t, pos, neg, m): (u32, u32, u32, u32, u32);
+        and.b32(sl, v, 0x0707_0707);
+        shr.u32(t, sl, 4);
+        or.b32(sl, sl, t);
+        shr.u32(t, sl, 8);
+        and.b32(t, t, 0xFF00);
+        and.b32(sl, sl, 0xFF);
+        or.b32(sl, sl, t);
+        prmt.b32(pos, pa, pb, sl);
+        prmt.b32(neg, na, nb, sl);
+        shr.u32(m, v, 3);
+        and.b32(m, m, 0x0101_0101);
+        mul.lo.u32(m, m, 0xFF);
+        xor.b32(t, pos, neg);
+        and.b32(t, t, m);
+        xor.b32(out, pos, t);
+    }
+
+    /// dot += the dp4a of the low (SH 0) or high (SH 4) nibbles of the 4 bytes of w, as FP4 values, with x.
+    fn nv4_dp4a<const SH: u32>(dot: u32, w: u32, x: u32, pa: u32, pb: u32, na: u32, nb: u32) {
+        let (v, q): (u32, u32);
+        shr.u32(v, w, SH);
+        and.b32(v, v, 0x0f0f_0f0f);
+        fp4x4(q, v, pa, pb, na, nb);
+        dp4a.s32.s32(dot, q, x, dot);
+    }
+
+    /// y = W x for the 8 experts of `slots` (grid.y) on an NVFP4 bank in the slot layout of experts.rs: rows of k/2
+    /// bytes (value j of each 64 in the low nibble of byte j, 32 + j in the high one), the UE4M3 scales (k/16 a row),
+    /// then the expert's f32 scale. x is q8_1 (int8 `xq`, `xd` per 32), the same for all experts (xstride 0) or each
+    /// expert's at xq + ke xstride. 4 lanes per row (16-byte chunks), 64 rows per block; k at most 2304, k/32 a
+    /// multiple of 4.
     #[reqntid(256)]
-    pub unsafe extern "ptx-kernel" fn moe_q50r_d(
-        bank: *const u8, slot_bytes: u64, slots: *const i32, aq: *const u8, ad: *const f32, asum: *const f32, y: *mut f32, rows: u32, kdim: u32,
+    pub unsafe extern "ptx-kernel" fn moe_nv4_d(
+        bank: *const u8, slot_bytes: u64, slots: *const i32, xq: *const u8, xd: *const f32, xstride: u32, y: *mut f32, rows: u32, kdim: u32,
     ) {
-        let xs: shared<[u8; 1152], 16>;
-        let dsh: shared<[f32; 36], 16>;
-        let ssh: shared<[f32; 36], 16>;
+        let xs: shared<[u8; 2304], 16>;
+        let dsh: shared<[f32; 72], 16>;
         let ke: u32;
         mov.u32(ke, ctaid.y);
         let (sa, slot): (u64, s32);
@@ -2298,21 +1816,18 @@ pub mod gpu {
         if none {
             ret();
         }
-        let (xb, db, sb, nb, nb4, aoff, boff): (u32, u32, u32, u32, u32, u32, u32);
+        let (xb, db, nb, nb4, aoff, boff): (u32, u32, u32, u32, u32, u32);
         mov.u32(xb, xs);
         mov.u32(db, dsh);
-        mov.u32(sb, ssh);
         shr.u32(nb, kdim, 5);
         shl.b32(nb4, nb, 2);
-        mul.lo.u32(aoff, ke, kdim);
-        mul.lo.u32(boff, ke, nb);
-        let (aqk, adk, ask): (u64, u64, u64);
-        mad.wide.u32(aqk, aoff, 1, aq);
-        mad.wide.u32(adk, boff, 4, ad);
-        mad.wide.u32(ask, boff, 4, asum);
-        stage_bytes(xb, aqk, kdim);
-        stage_bytes(db, adk, nb4);
-        stage_bytes(sb, ask, nb4);
+        mul.lo.u32(aoff, ke, xstride);
+        shr.u32(boff, aoff, 5);
+        let (xk, dk): (u64, u64);
+        mad.wide.u32(xk, aoff, 1, xq);
+        mad.wide.u32(dk, boff, 4, xd);
+        stage_bytes(xb, xk, kdim);
+        stage_bytes(db, dk, nb4);
         bar.sync(0);
         let (t, part, row): (u32, u32, u32);
         mov.u32(t, tid.x);
@@ -2326,71 +1841,201 @@ pub mod gpu {
         if past {
             ret();
         }
-        let (sl, wbase): (u64, u64);
+        let (sl, base, qrow, srow, sca): (u64, u64, u64, u64, u64);
         cvt.u64.s32(sl, slot);
         mul.lo.u64(sl, sl, slot_bytes);
-        add.u64(wbase, bank, sl);
-        let (total, qh_off, d_off): (u32, u32, u32);
-        mul.lo.u32(total, rows, nb);
-        shl.b32(qh_off, total, 4);
-        mul.lo.u32(d_off, total, 20);
+        add.u64(base, bank, sl);
+        let (half, qbytes, sbytes, o): (u32, u32, u32, u32);
+        shr.u32(half, kdim, 1);
+        mul.lo.u32(qbytes, rows, half);
+        mad.wide.u32(qrow, row, half, base);
+        shr.u32(o, kdim, 4);
+        mul.lo.u32(sbytes, rows, o);
+        mad.lo.u32(o, row, o, qbytes);
+        cvt.u64.u32(srow, o);
+        add.u64(srow, srow, base);
+        add.u32(o, qbytes, sbytes);
+        cvt.u64.u32(sca, o);
+        add.u64(sca, sca, base);
+        let (pa, pb, na, nbt): (u32, u32, u32, u32);
+        mov.u32(pa, 0x0302_0100);
+        mov.u32(pb, 0x0C08_0604);
+        mov.u32(na, 0xFDFE_FF00);
+        mov.u32(nbt, 0xF4F8_FAFC);
+        let (nc, c): (u32, u32);
+        shr.u32(nc, kdim, 5);
+        mov.u32(c, part);
         let acc: f32;
         mov.f32(acc, 0.0);
-        let b: u32;
-        mov.u32(b, part);
         label(top);
         let done: pred;
-        setp.ge.u32(done, b, nb);
+        setp.ge.u32(done, c, nc);
         if done {
             bra(end);
         }
-        let (bi, o): (u32, u32);
-        mad.lo.u32(bi, row, nb, b);
-        let (qa, ha, da): (u64, u64, u64);
-        mad.wide.u32(qa, bi, 16, wbase);
-        mad.lo.u32(o, bi, 4, qh_off);
-        mad.wide.u32(ha, o, 1, wbase);
-        mad.lo.u32(o, bi, 2, d_off);
-        mad.wide.u32(da, o, 1, wbase);
-        let (w0, w1, w2, w3, qh): (u32, u32, u32, u32, u32);
+        // chunk c: group g = c/2, h = c%2: the low nibbles are values 64g + 16h.., the high ones 64g + 32 + 16h..
+        let (g, h, qa, xo, sc4): (u32, u32, u64, u32, u32);
+        shr.u32(g, c, 1);
+        and.b32(h, c, 1);
+        mad.wide.u32(qa, c, 16, qrow);
+        let (w0, w1, w2, w3): (u32, u32, u32, u32);
         ld.global.nc.v4.u32((w0, w1, w2, w3), [qa]);
-        ld.global.nc.u32(qh, [ha]);
-        let hd: f16;
-        ld.global.nc.b16(hd, [da]);
-        let xo: u32;
-        shl.b32(xo, b, 5);
+        shl.b32(xo, g, 6);
+        mad.lo.u32(xo, h, 16, xo);
         add.u32(xo, xo, xb);
         let (x0, x1, x2, x3, x4, x5, x6, x7): (u32, u32, u32, u32, u32, u32, u32, u32);
         ld.shared.v4.u32((x0, x1, x2, x3), [xo]);
-        ld.shared.v4.u32((x4, x5, x6, x7), [xo + 16]);
-        let dot: u32;
-        mov.u32(dot, 0);
-        // elements 0..16 are the low nibbles of bytes 0..16, elements 16..32 the high ones
-        q5_dp4a::<0, 0>(dot, w0, qh, x0);
-        q5_dp4a::<0, 4>(dot, w1, qh, x1);
-        q5_dp4a::<0, 8>(dot, w2, qh, x2);
-        q5_dp4a::<0, 12>(dot, w3, qh, x3);
-        q5_dp4a::<4, 16>(dot, w0, qh, x4);
-        q5_dp4a::<4, 20>(dot, w1, qh, x5);
-        q5_dp4a::<4, 24>(dot, w2, qh, x6);
-        q5_dp4a::<4, 28>(dot, w3, qh, x7);
-        let (d, dx, sx, f, xa): (f32, f32, f32, f32, u32);
-        cvt.f32.f16(d, hd);
-        mad.lo.u32(xa, b, 4, db);
-        ld.shared.f32(dx, [xa]);
-        mad.lo.u32(xa, b, 4, sb);
-        ld.shared.f32(sx, [xa]);
-        cvt.rn.f32.s32(f, dot);
-        mul.rn.f32(f, f, dx);
-        fma.rn.f32(f, sx, -16.0, f);
-        fma.rn.f32(acc, d, f, acc);
-        add.u32(b, b, 4);
+        ld.shared.v4.u32((x4, x5, x6, x7), [xo + 32]);
+        let (dlo, dhi): (u32, u32);
+        mov.u32(dlo, 0);
+        mov.u32(dhi, 0);
+        nv4_dp4a::<0>(dlo, w0, x0, pa, pb, na, nbt);
+        nv4_dp4a::<0>(dlo, w1, x1, pa, pb, na, nbt);
+        nv4_dp4a::<0>(dlo, w2, x2, pa, pb, na, nbt);
+        nv4_dp4a::<0>(dlo, w3, x3, pa, pb, na, nbt);
+        nv4_dp4a::<4>(dhi, w0, x4, pa, pb, na, nbt);
+        nv4_dp4a::<4>(dhi, w1, x5, pa, pb, na, nbt);
+        nv4_dp4a::<4>(dhi, w2, x6, pa, pb, na, nbt);
+        nv4_dp4a::<4>(dhi, w3, x7, pa, pb, na, nbt);
+        // the weight scales of the two halves: bytes h and 2 + h of the group's 4, the x scales of blocks 2g, 2g + 1
+        let (sa4, blo, bhi, ph): (u64, u32, u32, u32);
+        mad.wide.u32(sa4, g, 4, srow);
+        ld.global.nc.u32(sc4, [sa4]);
+        shl.b32(ph, h, 3);
+        bfe.u32(blo, sc4, ph, 8);
+        add.u32(ph, ph, 16);
+        bfe.u32(bhi, sc4, ph, 8);
+        let (slo, shi, xlo, xhi, flo, fhi): (f32, f32, f32, f32, f32, f32);
+        ue4m3(slo, blo);
+        ue4m3(shi, bhi);
+        let xda: u32;
+        shl.b32(xda, g, 3);
+        add.u32(xda, xda, db);
+        ld.shared.f32(xlo, [xda]);
+        ld.shared.f32(xhi, [xda + 4]);
+        cvt.rn.f32.s32(flo, dlo);
+        cvt.rn.f32.s32(fhi, dhi);
+        mul.rn.f32(slo, slo, xlo);
+        mul.rn.f32(shi, shi, xhi);
+        fma.rn.f32(acc, flo, slo, acc);
+        fma.rn.f32(acc, fhi, shi, acc);
+        add.u32(c, c, 4);
         bra(top);
         label(end);
         for sh in [2, 1] {
-            let o2: f32;
-            shfl.sync.bfly.b32(o2, acc, sh, 31, 0xffff_ffff);
-            add.rn.f32(acc, acc, o2);
+            let o: f32;
+            shfl.sync.bfly.b32(o, acc, sh, 31, 0xffff_ffff);
+            add.rn.f32(acc, acc, o);
+        }
+        let first: pred;
+        setp.eq.u32(first, part, 0);
+        if first {
+            let (es, oi, oa): (f32, u32, u64);
+            ld.global.nc.f32(es, [sca]);
+            mul.rn.f32(acc, acc, es);
+            mad.lo.u32(oi, ke, rows, row);
+            mad.wide.u32(oa, oi, 4, y);
+            st.global.f32([oa], acc);
+        }
+    }
+
+    /// y = W x for the 8 experts of `slots` (grid.y) on a Q8_0 bank in the slot layout of experts.rs: rows of k int8,
+    /// then the f16 scales (k/32 a row). x as in moe_nv4_d. 4 lanes per row (16-byte chunks), 64 rows per block.
+    #[reqntid(256)]
+    pub unsafe extern "ptx-kernel" fn moe_q8_d(
+        bank: *const u8, slot_bytes: u64, slots: *const i32, xq: *const u8, xd: *const f32, xstride: u32, y: *mut f32, rows: u32, kdim: u32,
+    ) {
+        let xs: shared<[u8; 2304], 16>;
+        let dsh: shared<[f32; 72], 16>;
+        let ke: u32;
+        mov.u32(ke, ctaid.y);
+        let (sa, slot): (u64, s32);
+        mad.wide.u32(sa, ke, 4, slots);
+        ld.global.s32(slot, [sa]);
+        let none: pred;
+        setp.lt.s32(none, slot, 0);
+        if none {
+            ret();
+        }
+        let (xb, db, nb, nb4, aoff, boff): (u32, u32, u32, u32, u32, u32);
+        mov.u32(xb, xs);
+        mov.u32(db, dsh);
+        shr.u32(nb, kdim, 5);
+        shl.b32(nb4, nb, 2);
+        mul.lo.u32(aoff, ke, xstride);
+        shr.u32(boff, aoff, 5);
+        let (xk, dk): (u64, u64);
+        mad.wide.u32(xk, aoff, 1, xq);
+        mad.wide.u32(dk, boff, 4, xd);
+        stage_bytes(xb, xk, kdim);
+        stage_bytes(db, dk, nb4);
+        bar.sync(0);
+        let (t, part, row): (u32, u32, u32);
+        mov.u32(t, tid.x);
+        and.b32(part, t, 3);
+        let bk: u32;
+        mov.u32(bk, ctaid.x);
+        shr.u32(row, t, 2);
+        mad.lo.u32(row, bk, 64, row);
+        let past: pred;
+        setp.ge.u32(past, row, rows);
+        if past {
+            ret();
+        }
+        let (sl, base, qrow, drow): (u64, u64, u64, u64);
+        cvt.u64.s32(sl, slot);
+        mul.lo.u64(sl, sl, slot_bytes);
+        add.u64(base, bank, sl);
+        mad.wide.u32(qrow, row, kdim, base);
+        let (qbytes, o): (u32, u32);
+        mul.lo.u32(qbytes, rows, kdim);
+        shr.u32(o, kdim, 4);
+        mad.lo.u32(o, row, o, qbytes);
+        cvt.u64.u32(drow, o);
+        add.u64(drow, drow, base);
+        let (nc, c): (u32, u32);
+        shr.u32(nc, kdim, 4);
+        mov.u32(c, part);
+        let acc: f32;
+        mov.f32(acc, 0.0);
+        label(top);
+        let done: pred;
+        setp.ge.u32(done, c, nc);
+        if done {
+            bra(end);
+        }
+        // chunk c: values 16c.., in block c/2
+        let (qa, xo, blk): (u64, u32, u32);
+        mad.wide.u32(qa, c, 16, qrow);
+        let (w0, w1, w2, w3): (u32, u32, u32, u32);
+        ld.global.nc.v4.u32((w0, w1, w2, w3), [qa]);
+        shl.b32(xo, c, 4);
+        add.u32(xo, xo, xb);
+        let (x0, x1, x2, x3): (u32, u32, u32, u32);
+        ld.shared.v4.u32((x0, x1, x2, x3), [xo]);
+        let isum: u32;
+        mov.u32(isum, 0);
+        dp4a.s32.s32(isum, w0, x0, isum);
+        dp4a.s32.s32(isum, w1, x1, isum);
+        dp4a.s32.s32(isum, w2, x2, isum);
+        dp4a.s32.s32(isum, w3, x3, isum);
+        shr.u32(blk, c, 1);
+        let (da, hd, dw, dx, f, xda): (u64, f16, f32, f32, f32, u32);
+        mad.wide.u32(da, blk, 2, drow);
+        ld.global.nc.b16(hd, [da]);
+        cvt.f32.f16(dw, hd);
+        mad.lo.u32(xda, blk, 4, db);
+        ld.shared.f32(dx, [xda]);
+        mul.rn.f32(dw, dw, dx);
+        cvt.rn.f32.s32(f, isum);
+        fma.rn.f32(acc, f, dw, acc);
+        add.u32(c, c, 4);
+        bra(top);
+        label(end);
+        for sh in [2, 1] {
+            let o: f32;
+            shfl.sync.bfly.b32(o, acc, sh, 31, 0xffff_ffff);
+            add.rn.f32(acc, acc, o);
         }
         let first: pred;
         setp.eq.u32(first, part, 0);
@@ -2402,27 +2047,352 @@ pub mod gpu {
         }
     }
 
-    /// dot += dp4a of 4 Q5_0 values (nibbles at `shift` of the bytes of w, fifth bits `hb0..hb0+4` of qh) with 4 int8 of x.
-    fn q5_dp4a<const SHIFT: u32, const HB0: u32>(dot: u32, w: u32, qh: u32, x: u32) {
-        let (v, h, s): (u32, u32, u32);
-        shr.u32(v, w, SHIFT);
-        and.b32(v, v, 0x0f0f_0f0f);
-        bfe.u32(h, qh, HB0, 4);
-        // spread the 4 bits to bit 4 of each byte
-        and.b32(s, h, 1);
+    /// The (slot, count, offset) of group g and the (token, pair) of the 32 tokens of tile tz into shared `tb`:
+    /// slot, the tile's first token and its token count (nt 0: nothing to do).
+    fn group_tile(slot: u32, nt: u32, groups: u64, tb: u32) {
+        let (g, tz, t, ga, ntok, off, t0): (u32, u32, u32, u64, u32, u32, u32);
+        mov.u32(g, ctaid.y);
+        mov.u32(tz, ctaid.z);
+        mov.u32(t, tid.x);
+        mul.lo.u32(off, g, 3);
+        mad.wide.u32(ga, off, 4, groups);
+        ld.global.u32(slot, [ga]);
+        ld.global.u32(ntok, [ga + 4]);
+        ld.global.u32(off, [ga + 8]);
+        shl.b32(t0, tz, 5);
+        mov.u32(nt, 0);
+        let some: pred;
+        setp.lt.u32(some, t0, ntok);
+        if some {
+            sub.u32(nt, ntok, t0);
+            min.u32(nt, nt, 32);
+        }
+        let lt64: pred;
+        setp.lt.u32(lt64, t, 64);
+        and.pred(lt64, lt64, some);
+        if lt64 {
+            let (e, ta, v, sa2): (u32, u64, u32, u32);
+            add.u32(e, off, t0);
+            shl.b32(e, e, 1);
+            add.u32(e, e, t);
+            add.u32(e, e, 384);
+            mad.wide.u32(ta, e, 4, groups);
+            ld.global.u32(v, [ta]);
+            mad.lo.u32(sa2, t, 4, tb);
+            st.shared.u32([sa2], v);
+        }
+    }
+
+    /// Stages values step*128.. of the tile's activations (128 threads): int8 into xb at a stride of 144 bytes a
+    /// token, their 4 scales into db (4 a token). The activations of a token (BYPAIR 0) or of a pair (1).
+    fn stage128<const BYPAIR: u32>(xb: u32, db: u32, tb: u32, xq: u64, xd: u64, kdim: u32, step: u32, nt: u32) {
         let t: u32;
-        and.b32(t, h, 2);
-        shl.b32(t, t, 7);
-        or.b32(s, s, t);
-        and.b32(t, h, 4);
-        shl.b32(t, t, 14);
-        or.b32(s, s, t);
-        and.b32(t, h, 8);
-        shl.b32(t, t, 21);
-        or.b32(s, s, t);
-        shl.b32(s, s, 4);
-        or.b32(v, v, s);
-        dp4a.u32.s32(dot, v, x, dot);
+        mov.u32(t, tid.x);
+        for w8 in 0..8 {
+            let (wi, tk, wo, src, dst, xr, tka): (u32, u32, u32, u32, u32, u32, u32);
+            add.u32(wi, t, w8 * 128);
+            shr.u32(tk, wi, 5);
+            and.b32(wo, wi, 31);
+            let v: u32;
+            mov.u32(v, 0);
+            let ok: pred;
+            setp.lt.u32(ok, tk, nt);
+            mad.lo.u32(tka, tk, 8, tb);
+            ld.shared.u32(xr, [tka + (BYPAIR * 4)]);
+            mul.lo.u32(src, xr, kdim);
+            mad.lo.u32(src, step, 128, src);
+            mad.lo.u32(src, wo, 4, src);
+            let sa: u64;
+            mad.wide.u32(sa, src, 1, xq);
+            if ok {
+                ld.global.u32(v, [sa]);
+            }
+            mad.lo.u32(dst, tk, 144, xb);
+            mad.lo.u32(dst, wo, 4, dst);
+            st.shared.u32([dst], v);
+        }
+        let (tk, bo, src, dst, xr, tka, nb): (u32, u32, u32, u32, u32, u32, u32);
+        shr.u32(tk, t, 2);
+        and.b32(bo, t, 3);
+        let v: f32;
+        mov.f32(v, 0.0);
+        let ok: pred;
+        setp.lt.u32(ok, tk, nt);
+        mad.lo.u32(tka, tk, 8, tb);
+        ld.shared.u32(xr, [tka + (BYPAIR * 4)]);
+        shr.u32(nb, kdim, 5);
+        mad.lo.u32(src, xr, nb, bo);
+        mad.lo.u32(src, step, 4, src);
+        let sa: u64;
+        mad.wide.u32(sa, src, 4, xd);
+        if ok {
+            ld.global.f32(v, [sa]);
+        }
+        mad.lo.u32(dst, t, 4, db);
+        st.shared.f32([dst], v);
+    }
+
+    /// Writes the 8 sums of a thread (row, tokens cc + 4i of the tile) to y[pair][rows], times `scale`.
+    fn store8(acc: [f32; 8], cc: u32, nt: u32, tb: u32, y: u64, row: u32, rows: u32, scale: f32) {
+        let rin: pred;
+        setp.lt.u32(rin, row, rows);
+        for i in 0..8 {
+            let (tk, pair, o, tka, v): (u32, u32, u32, u32, f32);
+            add.u32(tk, cc, i * 4);
+            let tin: pred;
+            setp.lt.u32(tin, tk, nt);
+            and.pred(tin, tin, rin);
+            mad.lo.u32(tka, tk, 8, tb);
+            ld.shared.u32(pair, [tka + 4]);
+            mad.lo.u32(o, pair, rows, row);
+            let ya: u64;
+            mad.wide.u32(ya, o, 4, y);
+            mul.rn.f32(v, acc[i], scale);
+            if tin {
+                st.global.f32([ya], v);
+            }
+        }
+    }
+
+    /// Prefill: y[pair] = W x for the groups of (token, pair) of each cached expert (grid.y), on an NVFP4 bank (as
+    /// moe_nv4_d); x of the token (BYPAIR 0, gate_up) or of the pair (1, down). 32 rows (grid.x) by 32 tokens
+    /// (grid.z) a block of 128 threads: a thread takes a row and 8 tokens; k a multiple of 128.
+    #[reqntid(128)]
+    #[instances(0, 1)]
+    pub unsafe extern "ptx-kernel" fn moe_nv4_g<const BYPAIR: u32>(
+        bank: *const u8, slot_bytes: u64, groups: *const u32, xq: *const u8, xd: *const f32, y: *mut f32, rows: u32, kdim: u32,
+    ) {
+        let xsh: shared<[u8; 4608], 16>;
+        let dsh: shared<[f32; 128], 16>;
+        let tsh: shared<[u32; 64], 16>;
+        let (xb, db, tb, slot, nt): (u32, u32, u32, u32, u32);
+        mov.u32(xb, xsh);
+        mov.u32(db, dsh);
+        mov.u32(tb, tsh);
+        group_tile(slot, nt, groups, tb);
+        let none: pred;
+        setp.eq.u32(none, nt, 0);
+        if none {
+            ret();
+        }
+        bar.sync(0);
+        let (t, rr, cc, bx, row, rows1, rowc): (u32, u32, u32, u32, u32, u32, u32);
+        mov.u32(t, tid.x);
+        mov.u32(bx, ctaid.x);
+        shr.u32(rr, t, 2);
+        and.b32(cc, t, 3);
+        mad.lo.u32(row, bx, 32, rr);
+        sub.u32(rows1, rows, 1);
+        min.u32(rowc, row, rows1);
+        let (sl, base, qrow, srow, sca): (u64, u64, u64, u64, u64);
+        cvt.u64.u32(sl, slot);
+        mul.lo.u64(sl, sl, slot_bytes);
+        add.u64(base, bank, sl);
+        let (half, qbytes, sbytes, o): (u32, u32, u32, u32);
+        shr.u32(half, kdim, 1);
+        mul.lo.u32(qbytes, rows, half);
+        mad.wide.u32(qrow, rowc, half, base);
+        shr.u32(o, kdim, 4);
+        mul.lo.u32(sbytes, rows, o);
+        mad.lo.u32(o, rowc, o, qbytes);
+        cvt.u64.u32(srow, o);
+        add.u64(srow, srow, base);
+        add.u32(o, qbytes, sbytes);
+        cvt.u64.u32(sca, o);
+        add.u64(sca, sca, base);
+        let (pa, pb, na, nbt): (u32, u32, u32, u32);
+        mov.u32(pa, 0x0302_0100);
+        mov.u32(pb, 0x0C08_0604);
+        mov.u32(na, 0xFDFE_FF00);
+        mov.u32(nbt, 0xF4F8_FAFC);
+        let acc: [f32; 8];
+        for i in 0..8 {
+            mov.f32(acc[i], 0.0);
+        }
+        let (step, nsteps): (u32, u32);
+        mov.u32(step, 0);
+        shr.u32(nsteps, kdim, 7);
+        label(stop_);
+        let sdone: pred;
+        setp.ge.u32(sdone, step, nsteps);
+        if sdone {
+            bra(send_);
+        }
+        stage128::<BYPAIR>(xb, db, tb, xq, xd, kdim, step, nt);
+        bar.sync(0);
+        // the step's 8 weight scales (two groups of 64)
+        let (qa, sa, s0, s1): (u64, u64, u32, u32);
+        mad.wide.u32(qa, step, 64, qrow);
+        mad.wide.u32(sa, step, 8, srow);
+        ld.global.nc.v2.u32((s0, s1), [sa]);
+        for j in 0..4 {
+            // chunk j: group j/2 of the step, half j%2: low nibbles values 16h.. of it, high ones 32 + 16h..
+            let (blo, bhi, slo, shi): (u32, u32, f32, f32);
+            if j < 2 {
+                bfe.u32(blo, s0, (j % 2) * 8, 8);
+                bfe.u32(bhi, s0, 16 + (j % 2) * 8, 8);
+            } else {
+                bfe.u32(blo, s1, (j % 2) * 8, 8);
+                bfe.u32(bhi, s1, 16 + (j % 2) * 8, 8);
+            }
+            ue4m3(slo, blo);
+            ue4m3(shi, bhi);
+            let (w0, w1, w2, w3): (u32, u32, u32, u32);
+            ld.global.nc.v4.u32((w0, w1, w2, w3), [qa + (j * 16)]);
+            let (l0, l1, l2, l3, h0, h1, h2, h3, v): (u32, u32, u32, u32, u32, u32, u32, u32, u32);
+            and.b32(v, w0, 0x0f0f_0f0f);
+            fp4x4(l0, v, pa, pb, na, nbt);
+            and.b32(v, w1, 0x0f0f_0f0f);
+            fp4x4(l1, v, pa, pb, na, nbt);
+            and.b32(v, w2, 0x0f0f_0f0f);
+            fp4x4(l2, v, pa, pb, na, nbt);
+            and.b32(v, w3, 0x0f0f_0f0f);
+            fp4x4(l3, v, pa, pb, na, nbt);
+            shr.u32(v, w0, 4);
+            and.b32(v, v, 0x0f0f_0f0f);
+            fp4x4(h0, v, pa, pb, na, nbt);
+            shr.u32(v, w1, 4);
+            and.b32(v, v, 0x0f0f_0f0f);
+            fp4x4(h1, v, pa, pb, na, nbt);
+            shr.u32(v, w2, 4);
+            and.b32(v, v, 0x0f0f_0f0f);
+            fp4x4(h2, v, pa, pb, na, nbt);
+            shr.u32(v, w3, 4);
+            and.b32(v, v, 0x0f0f_0f0f);
+            fp4x4(h3, v, pa, pb, na, nbt);
+            for i in 0..8 {
+                let (tk, xa, da): (u32, u32, u32);
+                add.u32(tk, cc, i * 4);
+                mad.lo.u32(xa, tk, 144, xb);
+                let (x0, x1, x2, x3, x4, x5, x6, x7): (u32, u32, u32, u32, u32, u32, u32, u32);
+                ld.shared.v4.u32((x0, x1, x2, x3), [xa + ((j / 2) * 64 + (j % 2) * 16)]);
+                ld.shared.v4.u32((x4, x5, x6, x7), [xa + ((j / 2) * 64 + 32 + (j % 2) * 16)]);
+                let (dl, dh): (u32, u32);
+                mov.u32(dl, 0);
+                mov.u32(dh, 0);
+                dp4a.s32.s32(dl, l0, x0, dl);
+                dp4a.s32.s32(dl, l1, x1, dl);
+                dp4a.s32.s32(dl, l2, x2, dl);
+                dp4a.s32.s32(dl, l3, x3, dl);
+                dp4a.s32.s32(dh, h0, x4, dh);
+                dp4a.s32.s32(dh, h1, x5, dh);
+                dp4a.s32.s32(dh, h2, x6, dh);
+                dp4a.s32.s32(dh, h3, x7, dh);
+                let (xl, xh, fl, fh): (f32, f32, f32, f32);
+                mad.lo.u32(da, tk, 16, db);
+                ld.shared.f32(xl, [da + ((j / 2) * 8)]);
+                ld.shared.f32(xh, [da + ((j / 2) * 8 + 4)]);
+                mul.rn.f32(xl, xl, slo);
+                mul.rn.f32(xh, xh, shi);
+                cvt.rn.f32.s32(fl, dl);
+                cvt.rn.f32.s32(fh, dh);
+                fma.rn.f32(acc[i], fl, xl, acc[i]);
+                fma.rn.f32(acc[i], fh, xh, acc[i]);
+            }
+        }
+        bar.sync(0);
+        add.u32(step, step, 1);
+        bra(stop_);
+        label(send_);
+        let es: f32;
+        ld.global.nc.f32(es, [sca]);
+        store8(acc, cc, nt, tb, y, row, rows, es);
+    }
+
+    /// Prefill on a Q8_0 bank (as moe_q8_d), as moe_nv4_g.
+    #[reqntid(128)]
+    #[instances(0, 1)]
+    pub unsafe extern "ptx-kernel" fn moe_q8_g<const BYPAIR: u32>(
+        bank: *const u8, slot_bytes: u64, groups: *const u32, xq: *const u8, xd: *const f32, y: *mut f32, rows: u32, kdim: u32,
+    ) {
+        let xsh: shared<[u8; 4608], 16>;
+        let dsh: shared<[f32; 128], 16>;
+        let tsh: shared<[u32; 64], 16>;
+        let (xb, db, tb, slot, nt): (u32, u32, u32, u32, u32);
+        mov.u32(xb, xsh);
+        mov.u32(db, dsh);
+        mov.u32(tb, tsh);
+        group_tile(slot, nt, groups, tb);
+        let none: pred;
+        setp.eq.u32(none, nt, 0);
+        if none {
+            ret();
+        }
+        bar.sync(0);
+        let (t, rr, cc, bx, row, rows1, rowc): (u32, u32, u32, u32, u32, u32, u32);
+        mov.u32(t, tid.x);
+        mov.u32(bx, ctaid.x);
+        shr.u32(rr, t, 2);
+        and.b32(cc, t, 3);
+        mad.lo.u32(row, bx, 32, rr);
+        sub.u32(rows1, rows, 1);
+        min.u32(rowc, row, rows1);
+        let (sl, base, qrow, drow): (u64, u64, u64, u64);
+        cvt.u64.u32(sl, slot);
+        mul.lo.u64(sl, sl, slot_bytes);
+        add.u64(base, bank, sl);
+        mad.wide.u32(qrow, rowc, kdim, base);
+        let (qbytes, o): (u32, u32);
+        mul.lo.u32(qbytes, rows, kdim);
+        shr.u32(o, kdim, 4);
+        mad.lo.u32(o, rowc, o, qbytes);
+        cvt.u64.u32(drow, o);
+        add.u64(drow, drow, base);
+        let acc: [f32; 8];
+        for i in 0..8 {
+            mov.f32(acc[i], 0.0);
+        }
+        let (step, nsteps): (u32, u32);
+        mov.u32(step, 0);
+        shr.u32(nsteps, kdim, 7);
+        label(stop_);
+        let sdone: pred;
+        setp.ge.u32(sdone, step, nsteps);
+        if sdone {
+            bra(send_);
+        }
+        stage128::<BYPAIR>(xb, db, tb, xq, xd, kdim, step, nt);
+        bar.sync(0);
+        // the step's 4 f16 weight scales
+        let (qa, sa): (u64, u64);
+        mad.wide.u32(qa, step, 128, qrow);
+        mad.wide.u32(sa, step, 8, drow);
+        let dws: [f32; 4];
+        for b in 0..4 {
+            let hf: f16;
+            ld.global.nc.b16(hf, [sa + (b * 2)]);
+            cvt.f32.f16(dws[b], hf);
+        }
+        for j in 0..8 {
+            let (w0, w1, w2, w3): (u32, u32, u32, u32);
+            ld.global.nc.v4.u32((w0, w1, w2, w3), [qa + (j * 16)]);
+            for i in 0..8 {
+                let (tk, xa, da): (u32, u32, u32);
+                add.u32(tk, cc, i * 4);
+                mad.lo.u32(xa, tk, 144, xb);
+                let (x0, x1, x2, x3): (u32, u32, u32, u32);
+                ld.shared.v4.u32((x0, x1, x2, x3), [xa + (j * 16)]);
+                let isum: u32;
+                mov.u32(isum, 0);
+                dp4a.s32.s32(isum, w0, x0, isum);
+                dp4a.s32.s32(isum, w1, x1, isum);
+                dp4a.s32.s32(isum, w2, x2, isum);
+                dp4a.s32.s32(isum, w3, x3, isum);
+                let (dx, f): (f32, f32);
+                mad.lo.u32(da, tk, 16, db);
+                ld.shared.f32(dx, [da + ((j / 2) * 4)]);
+                mul.rn.f32(dx, dx, dws[j / 2]);
+                cvt.rn.f32.s32(f, isum);
+                fma.rn.f32(acc[i], f, dx, acc[i]);
+            }
+        }
+        bar.sync(0);
+        add.u32(step, step, 1);
+        bra(stop_);
+        label(send_);
+        let one: f32;
+        mov.f32(one, 1.0);
+        store8(acc, cc, nt, tb, y, row, rows, one);
     }
 
     /// Router logits: logits[e] = W[e] . x, W [n_expert][n] f32 (GGUF layout); a warp per expert.
@@ -3579,243 +3549,6 @@ pub mod gpu {
 
     // ---------------------------------------------------------------- grouped experts (prefill)
 
-    /// gate_up of the cached experts for groups of tokens: `groups` holds, per group g < 128, (slot, ntok, off) at 3g,
-    /// and at 384 + 2 (off + i) the (token, pair) of its i-th token. Tile: 32 rows x 32 tokens of a group (grid.z = token
-    /// tile); x q8_1 [token][kdim]; gu [pair][rows]. Q4_K rows in GGUF layout.
-    #[reqntid(128)]
-    pub unsafe extern "ptx-kernel" fn moe_gu_grouped(
-        bank: *const u8, slot_bytes: u64, groups: *const u32, xq: *const u8, xd: *const f32, xsum: *const f32, gu: *mut f32, rows: u32, kdim: u32,
-    ) {
-        let xsh: shared<[u8; 8704], 16>;
-        let dsh: shared<[f32; 256], 16>;
-        let ssh: shared<[f32; 256], 16>;
-        let tsh: shared<[u32; 64], 16>; // token, pair of the 32 tokens of the tile
-        let (g, tz, t, rr, cc, bx): (u32, u32, u32, u32, u32, u32);
-        mov.u32(g, ctaid.y);
-        mov.u32(tz, ctaid.z);
-        mov.u32(t, tid.x);
-        mov.u32(bx, ctaid.x);
-        shr.u32(rr, t, 2);
-        and.b32(cc, t, 3);
-        let (ga, slot, ntok, off): (u64, u32, u32, u32);
-        mul.lo.u32(off, g, 3);
-        mad.wide.u32(ga, off, 4, groups);
-        ld.global.u32(slot, [ga]);
-        ld.global.u32(ntok, [ga + 4]);
-        ld.global.u32(off, [ga + 8]);
-        let (t0, nt): (u32, u32);
-        shl.b32(t0, tz, 5);
-        let none: pred;
-        setp.ge.u32(none, t0, ntok);
-        if none {
-            ret();
-        }
-        sub.u32(nt, ntok, t0);
-        min.u32(nt, nt, 32);
-        let (xb, db, sb, tb): (u32, u32, u32, u32);
-        mov.u32(xb, xsh);
-        mov.u32(db, dsh);
-        mov.u32(sb, ssh);
-        mov.u32(tb, tsh);
-        let lt64: pred;
-        setp.lt.u32(lt64, t, 64);
-        if lt64 {
-            let (e, ta, v, sa2): (u32, u64, u32, u32);
-            add.u32(e, off, t0);
-            shl.b32(e, e, 1);
-            add.u32(e, e, t);
-            add.u32(e, e, 384);
-            mad.wide.u32(ta, e, 4, groups);
-            ld.global.u32(v, [ta]);
-            mad.lo.u32(sa2, t, 4, tb);
-            st.shared.u32([sa2], v);
-        }
-        bar.sync(0);
-        let (row, nsb, rowb, nb): (u32, u32, u32, u32);
-        mad.lo.u32(row, bx, 32, rr);
-        shr.u32(nsb, kdim, 8);
-        shr.u32(nb, kdim, 5);
-        mul.lo.u32(rowb, nsb, 144);
-        let rows1: u32;
-        sub.u32(rows1, rows, 1);
-        let rowc: u32;
-        min.u32(rowc, row, rows1);
-        let (sl, wbase, ra): (u64, u64, u64);
-        cvt.u64.u32(sl, slot);
-        mul.lo.u64(sl, sl, slot_bytes);
-        add.u64(wbase, bank, sl);
-        mad.wide.u32(ra, rowc, rowb, wbase);
-        let acc: [f32; 8];
-        for i in 0..8 {
-            mov.f32(acc[i], 0.0);
-        }
-        let sbi: u32;
-        mov.u32(sbi, 0);
-        label(stop_);
-        let sdone: pred;
-        setp.ge.u32(sdone, sbi, nsb);
-        if sdone {
-            bra(send_);
-        }
-        // stage the 256 values of super-block sbi of the tile's tokens
-        for w8 in 0..16 {
-            let (wi, tk, wo, src, dst, tok): (u32, u32, u32, u32, u32, u32);
-            add.u32(wi, t, w8 * 128);
-            shr.u32(tk, wi, 6);
-            and.b32(wo, wi, 63);
-            let v: u32;
-            mov.u32(v, 0);
-            let ok: pred;
-            setp.lt.u32(ok, tk, nt);
-            let tka: u32;
-            mad.lo.u32(tka, tk, 8, tb);
-            ld.shared.u32(tok, [tka]);
-            mul.lo.u32(src, tok, kdim);
-            shl.b32(dst, sbi, 8);
-            add.u32(src, src, dst);
-            mad.lo.u32(src, wo, 4, src);
-            let sa: u64;
-            mad.wide.u32(sa, src, 1, xq);
-            if ok {
-                ld.global.u32(v, [sa]);
-            }
-            mad.lo.u32(dst, tk, 272, xb);
-            mad.lo.u32(dst, wo, 4, dst);
-            st.shared.u32([dst], v);
-        }
-        for w2 in 0..2 {
-            let (wi, tk, bo, src, dst, tok, tka): (u32, u32, u32, u32, u32, u32, u32);
-            add.u32(wi, t, w2 * 128);
-            shr.u32(tk, wi, 3);
-            and.b32(bo, wi, 7);
-            let (v, v2): (f32, f32);
-            mov.f32(v, 0.0);
-            mov.f32(v2, 0.0);
-            let ok: pred;
-            setp.lt.u32(ok, tk, nt);
-            mad.lo.u32(tka, tk, 8, tb);
-            ld.shared.u32(tok, [tka]);
-            shl.b32(src, sbi, 3);
-            add.u32(src, src, bo);
-            mad.lo.u32(src, tok, nb, src);
-            let (sa, sa2): (u64, u64);
-            mad.wide.u32(sa, src, 4, xd);
-            mad.wide.u32(sa2, src, 4, xsum);
-            if ok {
-                ld.global.f32(v, [sa]);
-                ld.global.f32(v2, [sa2]);
-            }
-            mad.lo.u32(dst, wi, 4, db);
-            st.shared.f32([dst], v);
-            mad.lo.u32(dst, wi, 4, sb);
-            st.shared.f32([dst], v2);
-        }
-        bar.sync(0);
-        let ba: u64;
-        mad.wide.u32(ba, sbi, 144, ra);
-        let (hd, hm): (f16, f16);
-        let (d, dmin): (f32, f32);
-        ld.global.nc.b16(hd, [ba]);
-        ld.global.nc.b16(hm, [ba + 2]);
-        cvt.f32.f16(d, hd);
-        cvt.f32.f16(dmin, hm);
-        let (s0, s1, s2): (u32, u32, u32);
-        ld.global.nc.u32(s0, [ba + 4]);
-        ld.global.nc.u32(s1, [ba + 8]);
-        ld.global.nc.u32(s2, [ba + 12]);
-        for j in 0..8 {
-            // scale and min of sub-block j, known at compile time
-            let (scu, mu, hi): (u32, u32, u32);
-            if j < 4 {
-                bfe.u32(scu, s0, j * 8, 6);
-                bfe.u32(mu, s1, j * 8, 6);
-            } else {
-                bfe.u32(scu, s2, (j - 4) * 8, 4);
-                bfe.u32(hi, s0, (j - 4) * 8 + 6, 2);
-                shl.b32(hi, hi, 4);
-                or.b32(scu, scu, hi);
-                bfe.u32(mu, s2, (j - 4) * 8 + 4, 4);
-                bfe.u32(hi, s1, (j - 4) * 8 + 6, 2);
-                shl.b32(hi, hi, 4);
-                or.b32(mu, mu, hi);
-            }
-            let (scf, mf): (f32, f32);
-            cvt.rn.f32.u32(scf, scu);
-            cvt.rn.f32.u32(mf, mu);
-            mul.rn.f32(scf, scf, d);
-            mul.rn.f32(mf, mf, dmin);
-            let (w0, w1, w2, w3, w4, w5, w6, w7): (u32, u32, u32, u32, u32, u32, u32, u32);
-            ld.global.nc.v4.u32((w0, w1, w2, w3), [ba + (16 + (j / 2) * 32)]);
-            ld.global.nc.v4.u32((w4, w5, w6, w7), [ba + (32 + (j / 2) * 32)]);
-            let sh: u32;
-            mov.u32(sh, (j % 2) * 4);
-            let (n0, n1, n2, n3, n4, n5, n6, n7): (u32, u32, u32, u32, u32, u32, u32, u32);
-            nibs(n0, w0, sh);
-            nibs(n1, w1, sh);
-            nibs(n2, w2, sh);
-            nibs(n3, w3, sh);
-            nibs(n4, w4, sh);
-            nibs(n5, w5, sh);
-            nibs(n6, w6, sh);
-            nibs(n7, w7, sh);
-            for i in 0..8 {
-                let (tk, xa, sa3): (u32, u32, u32);
-                add.u32(tk, cc, i * 4);
-                mad.lo.u32(xa, tk, 272, xb);
-                let (x0, x1, x2, x3, x4, x5, x6, x7): (u32, u32, u32, u32, u32, u32, u32, u32);
-                ld.shared.v4.u32((x0, x1, x2, x3), [xa + (j * 32)]);
-                ld.shared.v4.u32((x4, x5, x6, x7), [xa + (j * 32 + 16)]);
-                let dot: u32;
-                mov.u32(dot, 0);
-                dp4a.u32.s32(dot, n0, x0, dot);
-                dp4a.u32.s32(dot, n1, x1, dot);
-                dp4a.u32.s32(dot, n2, x2, dot);
-                dp4a.u32.s32(dot, n3, x3, dot);
-                dp4a.u32.s32(dot, n4, x4, dot);
-                dp4a.u32.s32(dot, n5, x5, dot);
-                dp4a.u32.s32(dot, n6, x6, dot);
-                dp4a.u32.s32(dot, n7, x7, dot);
-                let (dx, sx, f, a): (f32, f32, f32, f32);
-                mad.lo.u32(sa3, tk, 32, db);
-                ld.shared.f32(dx, [sa3 + (j * 4)]);
-                mad.lo.u32(sa3, tk, 32, sb);
-                ld.shared.f32(sx, [sa3 + (j * 4)]);
-                cvt.rn.f32.s32(f, dot);
-                mul.rn.f32(a, scf, dx);
-                fma.rn.f32(acc[i], a, f, acc[i]);
-                mul.rn.f32(a, mf, sx);
-                sub.rn.f32(acc[i], acc[i], a);
-            }
-        }
-        bar.sync(0);
-        add.u32(sbi, sbi, 1);
-        bra(stop_);
-        label(send_);
-        let rin: pred;
-        setp.lt.u32(rin, row, rows);
-        for i in 0..8 {
-            let (tk, pair, o, tka): (u32, u32, u32, u32);
-            add.u32(tk, cc, i * 4);
-            let tin: pred;
-            setp.lt.u32(tin, tk, nt);
-            and.pred(tin, tin, rin);
-            mad.lo.u32(tka, tk, 8, tb);
-            ld.shared.u32(pair, [tka + 4]);
-            mad.lo.u32(o, pair, rows, row);
-            let ya: u64;
-            mad.wide.u32(ya, o, 4, gu);
-            if tin {
-                st.global.f32([ya], acc[i]);
-            }
-        }
-    }
-
-    /// The nibbles at `sh` of the 4 bytes of w, as 4 bytes.
-    fn nibs(v: u32, w: u32, sh: u32) {
-        shr.u32(v, w, sh);
-        and.b32(v, v, 0x0f0f_0f0f);
-    }
-
     /// The SITU activation of `gu` [pair][2 nff] for every pair (grid.y), quantized as q8_1: aq [pair][nff], ad, as [pair][nff/32].
     #[maxntid(256)]
     pub unsafe extern "ptx-kernel" fn situ_q8_n(gu: *const f32, aq: *mut u8, ad: *mut f32, asum: *mut f32, nff: u32, beta: f32, lb: f32) {
@@ -3862,220 +3595,6 @@ pub mod gpu {
         mad.wide.u32(da, gb, 4, ad);
         mad.wide.u32(s2, gb, 4, asum);
         q8_warp(a, lane, qa, da, s2);
-    }
-
-    /// down of the cached experts for groups of tokens (see moe_gu_grouped); activations q8_1 by pair, kdim <= 1152;
-    /// the repacked Q5_0 bank (see q50_repack); dn [pair][rows].
-    #[reqntid(128)]
-    pub unsafe extern "ptx-kernel" fn moe_dn_grouped(
-        bank: *const u8, slot_bytes: u64, groups: *const u32, aq: *const u8, ad: *const f32, asum: *const f32, dn: *mut f32, rows: u32, kdim: u32,
-    ) {
-        let xsh: shared<[u8; 37376], 16>; // 32 x 1168
-        let dsh: shared<[f32; 1152], 16>; // 32 x 36
-        let ssh: shared<[f32; 1152], 16>;
-        let tsh: shared<[u32; 64], 16>;
-        let (g, tz, t, rr, cc, bx): (u32, u32, u32, u32, u32, u32);
-        mov.u32(g, ctaid.y);
-        mov.u32(tz, ctaid.z);
-        mov.u32(t, tid.x);
-        mov.u32(bx, ctaid.x);
-        shr.u32(rr, t, 2);
-        and.b32(cc, t, 3);
-        let (ga, slot, ntok, off): (u64, u32, u32, u32);
-        mul.lo.u32(off, g, 3);
-        mad.wide.u32(ga, off, 4, groups);
-        ld.global.u32(slot, [ga]);
-        ld.global.u32(ntok, [ga + 4]);
-        ld.global.u32(off, [ga + 8]);
-        let (t0, nt): (u32, u32);
-        shl.b32(t0, tz, 5);
-        let none: pred;
-        setp.ge.u32(none, t0, ntok);
-        if none {
-            ret();
-        }
-        sub.u32(nt, ntok, t0);
-        min.u32(nt, nt, 32);
-        let (xb, db, sb, tb, nb, kw): (u32, u32, u32, u32, u32, u32);
-        mov.u32(xb, xsh);
-        mov.u32(db, dsh);
-        mov.u32(sb, ssh);
-        mov.u32(tb, tsh);
-        shr.u32(nb, kdim, 5);
-        shr.u32(kw, kdim, 2);
-        let lt64: pred;
-        setp.lt.u32(lt64, t, 64);
-        if lt64 {
-            let (e, v, sa2): (u32, u32, u32);
-            let ta: u64;
-            add.u32(e, off, t0);
-            shl.b32(e, e, 1);
-            add.u32(e, e, t);
-            add.u32(e, e, 384);
-            mad.wide.u32(ta, e, 4, groups);
-            ld.global.u32(v, [ta]);
-            mad.lo.u32(sa2, t, 4, tb);
-            st.shared.u32([sa2], v);
-        }
-        bar.sync(0);
-        // stage the activations of the tile's pairs: 32 x kdim bytes, and their scales
-        let wi: u32;
-        mov.u32(wi, t);
-        label(xtop);
-        let (tot, xd2): (u32, pred);
-        mul.lo.u32(tot, kw, 32);
-        setp.ge.u32(xd2, wi, tot);
-        if xd2 {
-            bra(xend);
-        }
-        let (tk, wo, pair, src, dst, tka): (u32, u32, u32, u32, u32, u32);
-        div.u32(tk, wi, kw);
-        rem.u32(wo, wi, kw);
-        let v: u32;
-        mov.u32(v, 0);
-        let ok: pred;
-        setp.lt.u32(ok, tk, nt);
-        mad.lo.u32(tka, tk, 8, tb);
-        ld.shared.u32(pair, [tka + 4]);
-        mul.lo.u32(src, pair, kdim);
-        mad.lo.u32(src, wo, 4, src);
-        let sa: u64;
-        mad.wide.u32(sa, src, 1, aq);
-        if ok {
-            ld.global.u32(v, [sa]);
-        }
-        mad.lo.u32(dst, tk, 1168, xb);
-        mad.lo.u32(dst, wo, 4, dst);
-        st.shared.u32([dst], v);
-        add.u32(wi, wi, 128);
-        bra(xtop);
-        label(xend);
-        mov.u32(wi, t);
-        label(dtop);
-        let (tot2, dd2): (u32, pred);
-        mul.lo.u32(tot2, nb, 32);
-        setp.ge.u32(dd2, wi, tot2);
-        if dd2 {
-            bra(dend);
-        }
-        let (tk2, bo, pair2, src2, dst2, tka2): (u32, u32, u32, u32, u32, u32);
-        div.u32(tk2, wi, nb);
-        rem.u32(bo, wi, nb);
-        let (v1, v2): (f32, f32);
-        mov.f32(v1, 0.0);
-        mov.f32(v2, 0.0);
-        let ok2: pred;
-        setp.lt.u32(ok2, tk2, nt);
-        mad.lo.u32(tka2, tk2, 8, tb);
-        ld.shared.u32(pair2, [tka2 + 4]);
-        mad.lo.u32(src2, pair2, nb, bo);
-        let (sa3, sa4): (u64, u64);
-        mad.wide.u32(sa3, src2, 4, ad);
-        mad.wide.u32(sa4, src2, 4, asum);
-        if ok2 {
-            ld.global.f32(v1, [sa3]);
-            ld.global.f32(v2, [sa4]);
-        }
-        mad.lo.u32(dst2, tk2, 36, bo);
-        let dst3: u32;
-        mad.lo.u32(dst3, dst2, 4, db);
-        st.shared.f32([dst3], v1);
-        mad.lo.u32(dst3, dst2, 4, sb);
-        st.shared.f32([dst3], v2);
-        add.u32(wi, wi, 128);
-        bra(dtop);
-        label(dend);
-        bar.sync(0);
-
-        let (row, rows1, rowc): (u32, u32, u32);
-        mad.lo.u32(row, bx, 32, rr);
-        sub.u32(rows1, rows, 1);
-        min.u32(rowc, row, rows1);
-        let (sl, wbase): (u64, u64);
-        cvt.u64.u32(sl, slot);
-        mul.lo.u64(sl, sl, slot_bytes);
-        add.u64(wbase, bank, sl);
-        let (total, qh_off, d_off): (u32, u32, u32);
-        mul.lo.u32(total, rows, nb);
-        shl.b32(qh_off, total, 4);
-        mul.lo.u32(d_off, total, 20);
-        let acc: [f32; 8];
-        for i in 0..8 {
-            mov.f32(acc[i], 0.0);
-        }
-        let b: u32;
-        mov.u32(b, 0);
-        label(btop);
-        let bdone: pred;
-        setp.ge.u32(bdone, b, nb);
-        if bdone {
-            bra(bend);
-        }
-        let (bi, o): (u32, u32);
-        mad.lo.u32(bi, rowc, nb, b);
-        let (qa, ha, da): (u64, u64, u64);
-        mad.wide.u32(qa, bi, 16, wbase);
-        mad.lo.u32(o, bi, 4, qh_off);
-        mad.wide.u32(ha, o, 1, wbase);
-        mad.lo.u32(o, bi, 2, d_off);
-        mad.wide.u32(da, o, 1, wbase);
-        let (w0, w1, w2, w3, qh): (u32, u32, u32, u32, u32);
-        ld.global.nc.v4.u32((w0, w1, w2, w3), [qa]);
-        ld.global.nc.u32(qh, [ha]);
-        let hd: f16;
-        let dw: f32;
-        ld.global.nc.b16(hd, [da]);
-        cvt.f32.f16(dw, hd);
-        for i in 0..8 {
-            let (tk3, xa, sa5): (u32, u32, u32);
-            add.u32(tk3, cc, i * 4);
-            mad.lo.u32(xa, tk3, 1168, xb);
-            mad.lo.u32(xa, b, 32, xa);
-            let (x0, x1, x2, x3, x4, x5, x6, x7): (u32, u32, u32, u32, u32, u32, u32, u32);
-            ld.shared.v4.u32((x0, x1, x2, x3), [xa]);
-            ld.shared.v4.u32((x4, x5, x6, x7), [xa + 16]);
-            let dot: u32;
-            mov.u32(dot, 0);
-            q5_dp4a::<0, 0>(dot, w0, qh, x0);
-            q5_dp4a::<0, 4>(dot, w1, qh, x1);
-            q5_dp4a::<0, 8>(dot, w2, qh, x2);
-            q5_dp4a::<0, 12>(dot, w3, qh, x3);
-            q5_dp4a::<4, 16>(dot, w0, qh, x4);
-            q5_dp4a::<4, 20>(dot, w1, qh, x5);
-            q5_dp4a::<4, 24>(dot, w2, qh, x6);
-            q5_dp4a::<4, 28>(dot, w3, qh, x7);
-            let (dx, sx, f): (f32, f32, f32);
-            mad.lo.u32(sa5, tk3, 36, b);
-            let sa6: u32;
-            mad.lo.u32(sa6, sa5, 4, db);
-            ld.shared.f32(dx, [sa6]);
-            mad.lo.u32(sa6, sa5, 4, sb);
-            ld.shared.f32(sx, [sa6]);
-            cvt.rn.f32.s32(f, dot);
-            mul.rn.f32(f, f, dx);
-            fma.rn.f32(f, sx, -16.0, f);
-            fma.rn.f32(acc[i], dw, f, acc[i]);
-        }
-        add.u32(b, b, 1);
-        bra(btop);
-        label(bend);
-        let rin: pred;
-        setp.lt.u32(rin, row, rows);
-        for i in 0..8 {
-            let (tk4, pair3, o2, tka3): (u32, u32, u32, u32);
-            add.u32(tk4, cc, i * 4);
-            let tin: pred;
-            setp.lt.u32(tin, tk4, nt);
-            and.pred(tin, tin, rin);
-            mad.lo.u32(tka3, tk4, 8, tb);
-            ld.shared.u32(pair3, [tka3 + 4]);
-            mad.lo.u32(o2, pair3, rows, row);
-            let ya: u64;
-            mad.wide.u32(ya, o2, 4, dn);
-            if tin {
-                st.global.f32([ya], acc[i]);
-            }
-        }
     }
 
     /// out[t][c] = sum_k wts[t][k] * (slots[t][k] >= 0 ? gpu[8t + k][c] : cpu[8t + k][c]); grid.y = token.

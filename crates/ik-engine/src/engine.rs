@@ -25,6 +25,11 @@ pub fn threads_from_env() -> Vec<Option<usize>> {
 /// Async cache uploads in flight, at most.
 const STAGES: usize = 24;
 
+/// The GPU computes the cached experts (else all experts run on the CPU, and the cache has no slots).
+const GPU_EXPERTS: bool = true;
+/// ... and in prefill too (else the prefill sends all experts to the CPU).
+const GPU_PREFILL: bool = true;
+
 /// Tokens of a prefill ubatch, at most.
 pub const T_MAX: usize = 256;
 
@@ -112,7 +117,6 @@ struct Scratch {
     pm: DevBuf,   // attention partials
     pl: DevBuf,
     pacc: DevBuf,
-    stage_down: DevBuf, // raw Q5_0 down of one expert, before the repack
 }
 
 /// Device buffers of a prefill ubatch of up to T_MAX tokens, [t][..] each.
@@ -234,8 +238,6 @@ pub struct Engine {
     ckpt_pos: Option<usize>,
     ckpt_conv: DevBuf,
     copy_s: Stream,       // async cache uploads
-    stage: Vec<DevBuf>,   // raw Q5_0 downs being uploaded, repacked into the bank after
-    stage_free: Vec<bool>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -263,7 +265,6 @@ impl Engine {
         let k = Kernels::load()?;
         let w = Weights::load(&g, &hp)?;
         let ex = Arc::new(Experts::new(&g, &hp)?);
-        let down_bytes = ex.down_bytes;
         let n_swa = hp.n_swa;
         let s = Stream::new()?;
         let n = hp.n_embd;
@@ -346,7 +347,6 @@ impl Engine {
             pm: f(8 * maxs * 3)?,
             pl: f(8 * maxs * 3)?,
             pacc: f(8 * maxs * 3 * 128)?,
-            stage_down: DevBuf::new(ex.down_bytes)?,
         };
         let bl = Blocks {
             b0: f(n)?,
@@ -416,13 +416,13 @@ impl Engine {
             host_slots: HostBuf::new(4 * tm * 8)?,
             cpu_out: HostBuf::new(4 * tm * 8 * n)?,
         };
-        // the expert cache and the full-attention KV rows share what is free once the rest exists, less the upload
-        // staging buffers and a margin for the CUDA graph and the driver (IK_VRAM_MARGIN_MIB, default 160); the KV
-        // rows take memory as the context grows and give it back when a new sequence is shorter (plan_kv)
+        // the expert cache and the full-attention KV rows share what is free once the rest exists, less a margin for
+        // the CUDA graph and the driver (IK_VRAM_MARGIN_MIB, default 160); the KV rows take memory as the context grows
+        // and give it back when a new sequence is shorter (plan_kv)
         let (free, _) = ctx.mem_info()?;
         let margin = std::env::var("IK_VRAM_MARGIN_MIB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(160) << 20;
-        let vram_budget = free.saturating_sub(STAGES * down_bytes + margin);
-        let max_slots = (vram_budget / (ex.gu_bytes + ex.down_bytes)).min(opt.cache_slots);
+        let vram_budget = free.saturating_sub(margin);
+        let max_slots = if GPU_EXPERTS { (vram_budget / (ex.gu_bytes[0] + ex.down_bytes[0])).min(opt.cache_slots) } else { 0 };
         let cache = ExpertCache::new(&ex, &hp, max_slots, ctx.device)?;
         s.sync()?;
         let job = HostBuf::new(4 * (32 + n))?;
@@ -430,7 +430,7 @@ impl Engine {
         let err = HostBuf::new(64)?;
         let cpu_out = HostBuf::new(4 * 8 * n)?;
         let threads = if opt.threads.is_empty() { vec![None] } else { opt.threads.clone() };
-        let pool = Pool::new(g.clone(), ex.clone(), &job, &ack, &cpu_out, hp.n_phys, hp.n_expert, threads);
+        let pool = Pool::new(ex.clone(), &job, &ack, &cpu_out, hp.n_phys, hp.n_expert, threads);
         let mut e = Engine {
             params: DevBuf::zeroed(16, &s)?,
             ptrs: DevBuf::zeroed(8 * 4096, &s)?,
@@ -482,8 +482,6 @@ impl Engine {
             ckpt_conv: DevBuf::new(n_slots * (2 * kv + 2 * n) * 3 * 4)?,
             snap_swa: HostBuf::new(n_slots * 2 * n_swa * kv_row())?,
             copy_s: Stream::new_nonblocking()?,
-            stage: (0..STAGES).map(|_| DevBuf::new(down_bytes)).collect::<Result<_>>()?,
-            stage_free: vec![true; STAGES],
         };
         let need = e.kv_bytes(e.n_ctx);
         if need > e.vram_budget {
@@ -514,8 +512,8 @@ impl Engine {
         if kv > self.vram_budget {
             return Err(format!("not enough VRAM for the KV cache of {rows} tokens"));
         }
-        let slots = self.cache.fit(&self.ex, self.vram_budget - kv);
-        if rows == self.kv_mapped && slots == self.cache.n_slots {
+        let slots = self.cache.fit(self.vram_budget - kv);
+        if rows == self.kv_mapped && slots == [self.cache.banks[0].n_slots, self.cache.banks[1].n_slots] {
             return Ok(());
         }
         // nothing in flight may touch the pages that go: finish the token's work and the uploads
@@ -534,7 +532,7 @@ impl Engine {
         if rows < self.kv_mapped {
             resize(self, rows)?;
         }
-        self.cache.set_slots(&self.ex, slots, &self.s)?;
+        self.cache.set_slots(slots, &self.s)?;
         if rows > self.kv_mapped {
             resize(self, rows)?;
         }
@@ -552,9 +550,8 @@ impl Engine {
             if self.cache.pending[k].ev.done() {
                 let p = self.cache.pending.swap_remove(k);
                 self.cache.slot_of[p.layer][p.e] = p.slot as i32;
-                self.cache.owner[p.slot] = (p.layer, p.e);
-                self.cache.busy[p.slot] = false;
-                self.stage_free[p.stage] = true;
+                self.cache.banks[p.bank].owner[p.slot] = (p.layer, p.e);
+                self.cache.banks[p.bank].busy[p.slot] = false;
                 changed = true;
             } else {
                 k += 1;
@@ -920,7 +917,7 @@ impl Engine {
 
     /// admit, with the decay of the usage counts once per token (`decay`), not at each layer of a prefill
     fn admit_d(&mut self, decay: bool) -> Result<()> {
-        if self.cache.n_slots == 0 {
+        if self.cache.n_slots() == 0 {
             return Ok(());
         }
         // finished uploads join the cache
@@ -955,8 +952,9 @@ impl Engine {
             if self.cache.slot_of[l][e] >= 0 || self.cache.pending.iter().any(|p| p.layer == l && p.e == e) {
                 continue;
             }
-            let Some(v) = self.cache.victim() else { break };
-            let (ol, oe) = self.cache.owner[v];
+            let bank = self.ex.fmt[l].index();
+            let Some(v) = self.cache.victim(bank) else { continue };
+            let (ol, oe) = self.cache.banks[bank].owner[v];
             let free = ol == usize::MAX;
             if !free {
                 if uploads >= self.upload_budget || f <= 1.5 * self.cache.uses[ol][oe] + 0.5 {
@@ -965,30 +963,27 @@ impl Engine {
                 uploads += 1;
             }
             if self.ex.pinned {
-                let Some(st) = self.stage_free.iter().position(|&f| f) else { break };
+                if self.cache.pending.len() >= STAGES {
+                    break;
+                }
                 // unmap the victim now; the next token's graph reads the new map
                 if !free {
                     self.cache.slot_of[ol][oe] = -1;
                     changed = true;
                 }
-                self.cache.owner[v] = (usize::MAX, usize::MAX);
-                self.cache.busy[v] = true;
-                self.stage_free[st] = false;
-                let gu = self.ex.gate_up(&self.g, l, e);
-                let dn = self.ex.down(&self.g, l, e);
-                cuda::copy_h2d_async(self.cache.gu_bank.at(v * self.ex.gu_bytes), gu.as_ptr(), gu.len(), &self.copy_s)?;
-                cuda::copy_h2d_async(self.stage[st].ptr, dn.as_ptr(), dn.len(), &self.copy_s)?;
-                let dst = self.cache.down_bank.at(v * self.ex.down_bytes);
-                self.k.q50_repack(&self.copy_s, self.stage[st].ptr, dst, self.hp.n_embd as u32, (self.hp.n_ff_exp / 32) as u32)?;
+                let b = &mut self.cache.banks[bank];
+                b.owner[v] = (usize::MAX, usize::MAX);
+                b.busy[v] = true;
+                // the host copy is in the slot layout: one copy each
+                let (gu, dn) = (self.ex.gate_up(l, e).b, self.ex.down(l, e).b);
+                cuda::copy_h2d_async(b.gu.at(v * b.gu_bytes), gu.as_ptr(), gu.len(), &self.copy_s)?;
+                cuda::copy_h2d_async(b.down.at(v * b.down_bytes), dn.as_ptr(), dn.len(), &self.copy_s)?;
                 let ev = cuda::Event::new(false)?;
                 ev.record(&self.copy_s)?;
-                self.cache.pending.push(crate::experts::Pending { slot: v, layer: l, e, stage: st, ev });
+                self.cache.pending.push(crate::experts::Pending { bank, slot: v, layer: l, e, ev });
                 self.cache.uploads += 1;
             } else {
-                self.cache.fill(&self.ex, &self.g, v, l, e, &self.sc.stage_down)?;
-                let dst = self.cache.down_bank.at(v * self.ex.down_bytes);
-                self.k.q50_repack(&self.s, self.sc.stage_down.ptr, dst, self.hp.n_embd as u32, (self.hp.n_ff_exp / 32) as u32)?;
-                self.s.sync()?;
+                self.cache.fill(&self.ex, v, l, e)?;
                 changed = true;
             }
         }
@@ -1270,9 +1265,10 @@ impl Engine {
         let mut gi: HashMap<i32, usize> = HashMap::new();
         let mut ci: HashMap<usize, usize> = HashMap::new();
         let slots_h = self.b.host_slots.as_mut_slice::<i32>();
+        let slot_of: Vec<i32> = if GPU_PREFILL { self.cache.slot_of[ip].clone() } else { vec![-1; self.hp.n_expert] };
         for (p, &e) in ids.iter().enumerate() {
             let e = e as usize;
-            let slot = self.cache.slot_of[ip][e];
+            let slot = slot_of[e];
             slots_h[p] = slot;
             let t = p / 8;
             if slot >= 0 {
@@ -1291,12 +1287,12 @@ impl Engine {
         }
         if let Ok(mut u) = self.pool.usage.lock() {
             for &e in &ids {
-                if self.cache.slot_of[ip][e as usize] >= 0 {
+                if slot_of[e as usize] >= 0 {
                     u.freq[ip][e as usize] += 1.0;
                 }
             }
-            u.hits += ids.iter().filter(|&&e| self.cache.slot_of[ip][e as usize] >= 0).count() as u64;
-            u.miss_count += ids.iter().filter(|&&e| self.cache.slot_of[ip][e as usize] < 0).count() as u64;
+            u.hits += ids.iter().filter(|&&e| slot_of[e as usize] >= 0).count() as u64;
+            u.miss_count += ids.iter().filter(|&&e| slot_of[e as usize] < 0).count() as u64;
         }
         let gh = self.b.host_groups.as_mut_slice::<u32>();
         let mut off = 0;
@@ -1312,12 +1308,14 @@ impl Engine {
         }
         let ng = gpu_groups.len();
         cuda::copy_h2d_async(self.b.slots.ptr, self.b.host_slots.ptr, nt * 8 * 4, &self.s)?;
-        if ng > 0 {
+        if ng > 0 && GPU_PREFILL {
             cuda::copy_h2d_async(self.b.groups.ptr, self.b.host_groups.ptr, (384 + 2 * off) * 4, &self.s)?;
             let tiles = gpu_groups.iter().map(|g| g.1.len()).max().unwrap_or(1).div_ceil(32) as u32;
-            self.k.moe_gu_grouped(&self.s, self.cache.gu_bank.ptr, self.ex.gu_bytes as u64, self.b.groups.ptr, self.b.xq[0].ptr, self.b.xd[0].ptr, self.b.xs[0].ptr, self.b.gu.ptr, 2 * ffu, nu, ng as u32, tiles)?;
+            let f = self.ex.fmt[ip];
+            let bk = &self.cache.banks[f.index()];
+            self.k.moe_g(&self.s, f, false, bk.gu.ptr, bk.gu_bytes as u64, self.b.groups.ptr, self.b.xq[0].ptr, self.b.xd[0].ptr, self.b.gu.ptr, 2 * ffu, nu, ng as u32, tiles)?;
             self.k.situ_q8_n(&self.s, self.b.gu.ptr, self.b.aq.ptr, self.b.ad.ptr, self.b.asum.ptr, ffu, self.ex.beta, self.ex.lb, (nt * 8) as u32)?;
-            self.k.moe_dn_grouped(&self.s, self.cache.down_bank.ptr, self.ex.down_bytes as u64, self.b.groups.ptr, self.b.aq.ptr, self.b.ad.ptr, self.b.asum.ptr, self.b.dn.ptr, nu, ffu, ng as u32, tiles)?;
+            self.k.moe_g(&self.s, f, true, bk.down.ptr, bk.down_bytes as u64, self.b.groups.ptr, self.b.aq.ptr, self.b.ad.ptr, self.b.dn.ptr, nu, ffu, ng as u32, tiles)?;
         }
         // the misses on the CPU, meanwhile
         self.stats.pf_gpu_pairs += gpu_groups.iter().map(|g| g.1.len() as u64).sum::<u64>();
@@ -1332,11 +1330,11 @@ impl Engine {
                     need[t] = true;
                 }
             }
-            let xq: Vec<crate::cpu::Q8K> = (0..nt)
+            let xq: Vec<crate::cpu::Q8_0> = (0..nt)
                 .map(|t| {
-                    let mut q = crate::cpu::Q8K { d: vec![], qs: vec![], bsums: vec![] };
+                    let mut q = crate::cpu::Q8_0::default();
                     if need[t] {
-                        crate::cpu::quantize_q8k(&xn[t * n..(t + 1) * n], &mut q);
+                        crate::cpu::quantize_q8_0(&xn[t * n..(t + 1) * n], &mut q);
                     }
                     q
                 })
@@ -1559,9 +1557,13 @@ impl Engine {
             self.params.ptr, si, ip as u32, n,
         )?;
         let ffu = self.hp.n_ff_exp as u32;
-        self.k.moe_q4k_d(&self.s, self.cache.gu_bank.ptr, self.ex.gu_bytes as u64, self.sc.slots.ptr, self.sc.xq.ptr, self.sc.xd.ptr, self.sc.xs.ptr, self.sc.gu.ptr, 2 * ffu, n)?;
-        self.k.situ_q8(&self.s, self.sc.gu.ptr, self.sc.slots.ptr, self.sc.aq.ptr, self.sc.ad.ptr, self.sc.asum.ptr, ffu, self.ex.beta, self.ex.lb)?;
-        self.k.moe_q50r_d(&self.s, self.cache.down_bank.ptr, self.ex.down_bytes as u64, self.sc.slots.ptr, self.sc.aq.ptr, self.sc.ad.ptr, self.sc.asum.ptr, self.sc.dn.ptr, n, ffu)?;
+        if GPU_EXPERTS {
+            let f = self.ex.fmt[ip];
+            let bk = &self.cache.banks[f.index()];
+            self.k.moe_d(&self.s, f, bk.gu.ptr, bk.gu_bytes as u64, self.sc.slots.ptr, self.sc.xq.ptr, self.sc.xd.ptr, 0, self.sc.gu.ptr, 2 * ffu, n)?;
+            self.k.situ_q8(&self.s, self.sc.gu.ptr, self.sc.slots.ptr, self.sc.aq.ptr, self.sc.ad.ptr, self.sc.asum.ptr, ffu, self.ex.beta, self.ex.lb)?;
+            self.k.moe_d(&self.s, f, bk.down.ptr, bk.down_bytes as u64, self.sc.slots.ptr, self.sc.aq.ptr, self.sc.ad.ptr, ffu, self.sc.dn.ptr, n, ffu)?;
+        }
         self.k.moe_wait(&self.s, self.ack.dev, self.params.ptr, si, self.err.dev, 5_000_000_000)?;
         let l = &self.w.layers[ip];
         self.k.moe_tail(&self.s, self.sc.dn.ptr, self.cpu_out.dev, self.sc.slots.ptr, self.sc.wts.ptr, l.ffn_post_conv.ptr, st_ffn, self.sc.x.ptr, n, pscale)?;
@@ -1613,9 +1615,10 @@ impl Engine {
         time!("gemv_q8d output 201024x2304", o.bytes(), self.qgemv(o, x, self.sc.logits_raw.ptr, 0, false)?);
         self.sc.slots.upload(&[0i32, 1, 2, 3, 4, 5, 6, 7])?;
         let ffu = hp.n_ff_exp as u32;
-        time!("moe_q4k_d 8 experts", 8 * self.ex.gu_bytes, self.k.moe_q4k_d(&self.s, self.cache.gu_bank.ptr, self.ex.gu_bytes as u64, self.sc.slots.ptr, self.sc.xq.ptr, self.sc.xd.ptr, self.sc.xs.ptr, self.sc.gu.ptr, 2 * ffu, n)?);
+        let (nv, b0) = (crate::experts::Fmt::Nv4, &self.cache.banks[0]);
+        time!("moe_nv4_d gate_up 8 experts", 8 * b0.gu_bytes, self.k.moe_d(&self.s, nv, b0.gu.ptr, b0.gu_bytes as u64, self.sc.slots.ptr, self.sc.xq.ptr, self.sc.xd.ptr, 0, self.sc.gu.ptr, 2 * ffu, n)?);
         time!("situ_q8 8 experts", 8 * 8 * ffu as usize, self.k.situ_q8(&self.s, self.sc.gu.ptr, self.sc.slots.ptr, self.sc.aq.ptr, self.sc.ad.ptr, self.sc.asum.ptr, ffu, 4.0, 25.0)?);
-        time!("moe_q50r_d 8 experts", 8 * self.ex.down_bytes, self.k.moe_q50r_d(&self.s, self.cache.down_bank.ptr, self.ex.down_bytes as u64, self.sc.slots.ptr, self.sc.aq.ptr, self.sc.ad.ptr, self.sc.asum.ptr, self.sc.dn.ptr, n, ffu)?);
+        time!("moe_nv4_d down 8 experts", 8 * b0.down_bytes, self.k.moe_d(&self.s, nv, b0.down.ptr, b0.down_bytes as u64, self.sc.slots.ptr, self.sc.aq.ptr, self.sc.ad.ptr, ffu, self.sc.dn.ptr, n, ffu)?);
         let maxs = self.maxs as u32;
         let mut cases = vec![(1024u32, (hp.n_swa + T_MAX) as u32, 6usize)];
         let mut keys = 4096;

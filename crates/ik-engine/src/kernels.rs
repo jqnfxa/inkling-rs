@@ -173,16 +173,6 @@ impl Kernels {
         self.run(s, "attn_decode", (n_head, 1, 1), 256, &[&q, &r, &sink, &rb, &kc, &vc, &out, &params, &ring, &extent, &group, &scale])
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn moe_q4k(&self, s: &Stream, bank: P, slot_bytes: u64, slots: P, x: P, y: P, rows: u32, k: u32) -> Result<()> {
-        self.run(s, "moe_q4k", (rows.div_ceil(8), 8, 1), 256, &[&bank, &slot_bytes, &slots, &x, &y, &rows, &k])
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn moe_q50_situ(&self, s: &Stream, bank: P, slot_bytes: u64, slots: P, gu: P, y: P, rows: u32, k: u32, beta: f32, lb: f32) -> Result<()> {
-        self.run(s, "moe_q50_situ", (rows.div_ceil(8), 8, 1), 256, &[&bank, &slot_bytes, &slots, &gu, &y, &rows, &k, &beta, &lb])
-    }
-
     pub fn moe_combine(&self, s: &Stream, gpu: P, cpu: P, slots: P, wts: P, out: P, n: u32) -> Result<()> {
         self.run(s, "moe_combine", (n.div_ceil(256), 1, 1), 256, &[&gpu, &cpu, &slots, &wts, &out, &n])
     }
@@ -225,22 +215,32 @@ impl Kernels {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn moe_q4k_d(&self, s: &Stream, bank: P, slot_bytes: u64, slots: P, xq: P, xd: P, xs: P, y: P, rows: u32, k: u32) -> Result<()> {
-        self.run(s, "moe_q4k_d", (rows.div_ceil(32), 8, 1), 256, &[&bank, &slot_bytes, &slots, &xq, &xd, &xs, &y, &rows, &k])
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub fn situ_q8(&self, s: &Stream, gu: P, slots: P, aq: P, ad: P, asum: P, nff: u32, beta: f32, lb: f32) -> Result<()> {
         self.run(s, "situ_q8", ((nff / 32).div_ceil(8), 8, 1), 256, &[&gu, &slots, &aq, &ad, &asum, &nff, &beta, &lb])
     }
 
+    /// Prefill: y[pair] = W x for each group of (token, pair) of a cached expert, on a bank of format `f` (moe_nv4_g,
+    /// moe_q8_g); x by token (`by_pair` false: gate_up) or by pair (down).
     #[allow(clippy::too_many_arguments)]
-    pub fn moe_q50r_d(&self, s: &Stream, bank: P, slot_bytes: u64, slots: P, aq: P, ad: P, asum: P, y: P, rows: u32, k: u32) -> Result<()> {
-        self.run(s, "moe_q50r_d", (rows.div_ceil(64), 8, 1), 256, &[&bank, &slot_bytes, &slots, &aq, &ad, &asum, &y, &rows, &k])
+    pub fn moe_g(&self, s: &Stream, f: crate::experts::Fmt, by_pair: bool, bank: P, slot_bytes: u64, groups: P, xq: P, xd: P, y: P, rows: u32, k: u32, ngroups: u32, tiles: u32) -> Result<()> {
+        let name = match (f, by_pair) {
+            (crate::experts::Fmt::Nv4, false) => "moe_nv4_g_0",
+            (crate::experts::Fmt::Nv4, true) => "moe_nv4_g_1",
+            (crate::experts::Fmt::Q8, false) => "moe_q8_g_0",
+            (crate::experts::Fmt::Q8, true) => "moe_q8_g_1",
+        };
+        self.run(s, name, (rows.div_ceil(32), ngroups, tiles), 128, &[&bank, &slot_bytes, &groups, &xq, &xd, &y, &rows, &k])
     }
 
-    pub fn q50_repack(&self, s: &Stream, src: P, dst: P, rows: u32, nb: u32) -> Result<()> {
-        self.run(s, "q50_repack", ((rows * nb).div_ceil(256), 1, 1), 256, &[&src, &dst, &rows, &nb])
+    /// y = W x for the 8 cached experts of `slots`, on a bank of format `f` (moe_nv4_d, moe_q8_d); x the same for all
+    /// (xstride 0) or each expert's at xq + ke xstride.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_d(&self, s: &Stream, f: crate::experts::Fmt, bank: P, slot_bytes: u64, slots: P, xq: P, xd: P, xstride: u32, y: P, rows: u32, k: u32) -> Result<()> {
+        let name = match f {
+            crate::experts::Fmt::Nv4 => "moe_nv4_d",
+            crate::experts::Fmt::Q8 => "moe_q8_d",
+        };
+        self.run(s, name, (rows.div_ceil(64), 8, 1), 256, &[&bank, &slot_bytes, &slots, &xq, &xd, &xstride, &y, &rows, &k])
     }
 
     pub fn router_logits(&self, s: &Stream, w: P, x: P, logits: P, n_expert: u32, n: u32) -> Result<()> {
@@ -366,16 +366,6 @@ impl Kernels {
         q_stride: u32, r_stride: u32, s_stride: u32, ntok: u32,
     ) -> Result<()> {
         self.run(s, "attn_prefill", (8, ntok, 1), 128, &[&q, &r, &sink, &rb, &kc, &vc, &out, &params, &ring, &window, &extent, &scale, &q_stride, &r_stride, &s_stride])
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn moe_gu_grouped(&self, s: &Stream, bank: P, slot_bytes: u64, groups: P, xq: P, xd: P, xs: P, gu: P, rows: u32, k: u32, ngroups: u32, tiles: u32) -> Result<()> {
-        self.run(s, "moe_gu_grouped", (rows.div_ceil(32), ngroups, tiles), 128, &[&bank, &slot_bytes, &groups, &xq, &xd, &xs, &gu, &rows, &k])
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn moe_dn_grouped(&self, s: &Stream, bank: P, slot_bytes: u64, groups: P, aq: P, ad: P, asum: P, dn: P, rows: u32, k: u32, ngroups: u32, tiles: u32) -> Result<()> {
-        self.run(s, "moe_dn_grouped", (rows.div_ceil(32), ngroups, tiles), 128, &[&bank, &slot_bytes, &groups, &aq, &ad, &asum, &dn, &rows, &k])
     }
 
     #[allow(clippy::too_many_arguments)]

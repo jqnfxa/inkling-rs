@@ -26,8 +26,8 @@ fn main() -> Result<(), String> {
     eprintln!(
         "n_ctx {n_ctx}: loaded in {:.1?}, {} expert cache slots ({} MiB), {} MiB VRAM free of {}",
         t0.elapsed(),
-        e.cache.n_slots,
-        (e.cache.n_slots * (e.ex.gu_bytes + e.ex.down_bytes)) >> 20,
+        e.cache.n_slots(),
+        e.cache.bytes_for([e.cache.banks[0].n_slots, e.cache.banks[1].n_slots]) >> 20,
         free >> 20,
         total >> 20
     );

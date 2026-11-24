@@ -1,27 +1,30 @@
 # inkling-rs
 
-An inference engine for [Inkling-2-Mini](https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF) on one laptop:
+An inference engine for [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), as the official
+GGUF ([unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)) holds it, on one laptop:
 RTX 3070 Ti Laptop (8 GB) + i7-12700H + 64 GB DDR4-3200. Written from scratch in Rust; the GPU kernels are written in
 [kernite](https://github.com/fxeqxmulfx/kernite). It serves an OpenAI-compatible API and llama.cpp's chat UI.
 
-The model is 15.4 GiB, a mixture of experts (128 experts, 8 per token) whose middle layers run three times per token,
-so it does not fit in 8 GB of VRAM. Decode runs at about 50 tokens/s on this laptop (llama.cpp with `--n-cpu-moe`:
-11-13 t/s).
+The model is a mixture of experts (128 experts, 8 per token) whose middle layers run three times per token; at
+UD-Q4_K_XL it is 17.6 GB, so it does not fit in 8 GB of VRAM. The speeds below were measured before the engine moved
+to the official GGUF and are to be measured again.
 
 ## Requirements
 
 - Linux on x86-64 with AVX2, FMA and F16C.
 - An NVIDIA GPU with 8 GB and a driver for CUDA 12 (tested: sm_86, driver 550). The kernels are PTX for sm_70 and
   later, built with the crate; no CUDA toolkit is needed.
-- 32 GB of RAM or more: the experts (14.8 GB) stay in page-locked host memory.
+- 32 GB of RAM or more: the experts (15.8 GB) stay in page-locked host memory.
 - Rust through rustup: `rust-toolchain.toml` pins 1.100.0, which kernite needs.
-- The model file `Inkling-2-Mini-AD-Q4_K.gguf` (16.5 GB). Other quantizations are not supported.
+- The model file `Inkling-2-Mini-UD-Q4_K_XL.gguf` (17.6 GB) from unsloth's `Mainline_Support` folder: NVFP4 experts
+  with a scale each in layers 0-19, Q8_0 experts in 20-23, Q8_0 and float small matrices. Other quantizations are not
+  supported.
 
 ## Run
 
 ```sh
-curl -L -o ~/models/Inkling-2-Mini-AD-Q4_K.gguf \
-  https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF/resolve/main/Inkling-2-Mini-AD-Q4_K.gguf
+hf download unsloth/Inkling-2-Mini-GGUF Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file --local-dir /tmp/inkling
+mv /tmp/inkling/Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file ~/models/Inkling-2-Mini-UD-Q4_K_XL.gguf
 tools/fetch-ui.sh        # llama.cpp's chat UI, into ./ui (optional)
 ./run-inkling-rs.sh      # builds, then serves on http://127.0.0.1:8080
 ```
@@ -71,8 +74,13 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, `/v1/streams/looku
 ## Design
 
 - Attention, router and output head stay on the GPU. The 3072 routed experts live in host RAM (huge pages,
-  page-locked), and a VRAM cache holds the hot ones: up to about 1260 slots, keyed by physical layer so the three loop
-  passes share them, with LFU admission and uploads on a copy stream.
+  page-locked), repacked at load into the layout the GPU kernels read, which the CPU kernels read too: NVFP4 as rows
+  of E2M1 nibbles (value j of each 64 in the low nibble of byte j, 32 + j in the high one), the UE4M3 scales and the
+  expert's scale; Q8_0 as int8 rows and f16 scales. A VRAM cache holds the hot experts, a bank of slots per format
+  (the Q8_0 bank takes `IK_Q8_SHARE`, 0.15, of it), keyed by physical layer so the three loop passes share them,
+  with LFU admission and uploads (one copy each) on a copy stream.
+- The small BF16 and F32 matrices (projections, loop gates) are quantized to Q8_0 at load, to join the Q8_0 GEMVs
+  they are stacked with.
 - Decode is one CUDA graph per token. At each MoE layer the GPU posts the routing to the CPU through pinned memory
   (`router_dispatch`), computes the cached experts while the CPU threads compute the misses (AVX2, int8), and waits on
   a flag (`moe_wait`). No host round trip per layer.
@@ -104,8 +112,9 @@ for each 8k tokens):
 | 64k | ~1036 | ~38 t/s |
 | 128k | ~800 | ~33 t/s |
 
-Measured with `ik-bench` at a short context with the slots capped, plus the attention time from `ik-kbench`; the
-server takes `--ctx` up to what the VRAM holds (about 350k tokens, with no expert cache left).
+Measured (before the move to the official GGUF) with `ik-bench` at a short context with the slots capped, plus the
+attention time from `ik-kbench`; the server takes `--ctx` up to what the VRAM holds (about 350k tokens, with no expert
+cache left).
 
 ## Tools
 
@@ -119,7 +128,8 @@ server takes `--ctx` up to what the VRAM holds (about 350k tokens, with no exper
 | `ik-rollback <model> [repeats]` | KV cache rollback against a fresh prefill |
 | `ik-branch <model> [tokens]` | a branch taken at a checkpoint and dropped, against no branch |
 | `ik-kbench`, `ik-kcmp` | GPU kernel timings; new kernels against the ones they replace |
-| `ik-cpubw <model> [threads..]` | CPU expert kernels, hot in cache and streaming from RAM |
+| `ik-cpubench <model>` | CPU expert kernels on real rows, one token and batched |
+| `ik-moecheck` | the GPU expert kernels (decode and prefill) against the CPU ones, on random banks |
 | `ik-attnmass <model> <text> <n>` | how much of the context full attention needs at depth n |
 
 `IK_FAKE_CPU=1` skips the CPU experts and so measures the GPU path alone; `IK_NO_GRAPH=1` (`ik-bench`) launches each

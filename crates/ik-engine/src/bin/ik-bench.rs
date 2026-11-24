@@ -15,7 +15,7 @@ fn main() -> Result<(), String> {
     let t0 = std::time::Instant::now();
     let mut e = Engine::new(std::path::Path::new(&a[1]), Options { n_ctx: 8192, cache_slots: slots, threads: threads_from_env(), graph: std::env::var("IK_NO_GRAPH").is_err(), upload_budget: std::env::var("IK_UPLOADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4) })?;
     let tok = Tokenizer::from_gguf(&e.g)?;
-    eprintln!("loaded in {:?}: {} MiB weights, {} cache slots, free VRAM {} MiB", t0.elapsed(), e.w.bytes >> 20, e.cache.n_slots, e.ctx.mem_info()?.0 >> 20);
+    eprintln!("loaded in {:?}: {} MiB weights, {} cache slots, free VRAM {} MiB", t0.elapsed(), e.w.bytes >> 20, e.cache.n_slots(), e.ctx.mem_info()?.0 >> 20);
     let ids = tok.encode(&prompt, true);
     let t1 = std::time::Instant::now();
     let mut logits = vec![];
@@ -56,7 +56,7 @@ fn main() -> Result<(), String> {
         f.sort_by(|a, b| b.total_cmp(a));
         let tot: f32 = f.iter().sum();
         let share = |k: usize| 100.0 * f.iter().take(k).sum::<f32>() / tot.max(1e-9);
-        eprintln!("top {} experts take {:.1}% of recent uses (top 1000: {:.1}%, top 1500: {:.1}%, top 2000: {:.1}%)", e.cache.n_slots, share(e.cache.n_slots), share(1000), share(1500), share(2000));
+        eprintln!("top {} experts take {:.1}% of recent uses (top 1000: {:.1}%, top 1500: {:.1}%, top 2000: {:.1}%)", e.cache.n_slots(), share(e.cache.n_slots()), share(1000), share(1500), share(2000));
     }
     {
         use ik_engine::cpu_pool::DEC_NS;

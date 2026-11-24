@@ -66,6 +66,9 @@ pub enum GgmlType {
     Q5_0,
     Q8_0,
     Q4K,
+    BF16,
+    /// 64 values: four UE4M3 scales (one per 16), then 32 bytes of E2M1 pairs
+    NVFP4,
     Other(u32),
 }
 
@@ -77,6 +80,8 @@ impl GgmlType {
             6 => GgmlType::Q5_0,
             8 => GgmlType::Q8_0,
             12 => GgmlType::Q4K,
+            30 => GgmlType::BF16,
+            40 => GgmlType::NVFP4,
             o => GgmlType::Other(o),
         }
     }
@@ -88,6 +93,8 @@ impl GgmlType {
             GgmlType::Q5_0 => (32, 22),
             GgmlType::Q8_0 => (32, 34),
             GgmlType::Q4K => (256, 144),
+            GgmlType::BF16 => (1, 2),
+            GgmlType::NVFP4 => (64, 36),
             GgmlType::Other(t) => panic!("unsupported ggml type {t}"),
         }
     }

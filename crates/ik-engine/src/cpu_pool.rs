@@ -7,11 +7,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
-use crate::cpu::{Q8_0, Q8K, dot_q4k, dot_q50, quantize_q8_0, quantize_q8_0_block, quantize_q8k};
-use crate::cpu_batch::{TokQ8K, TokQ8_0, q4k_dot_tokens_packed, q50_dot_tokens_packed};
+use crate::cpu::{Q8_0, dot_row, quantize_q8_0, quantize_q8_0_block};
+use crate::cpu_batch::dot_tokens;
 use crate::cuda::HostBuf;
 use crate::experts::Experts;
-use crate::gguf::Gguf;
 
 const JOB_IDS: usize = 2; // u32 index of ids
 const JOB_SLOTS: usize = 10;
@@ -54,7 +53,7 @@ unsafe impl Sync for Shared {}
 #[derive(Default)]
 pub struct BatchJob {
     pub layer: usize,
-    pub xq: Vec<Q8K>,                            // per token
+    pub xq: Vec<Q8_0>,                           // per token
     pub misses: Vec<(usize, Vec<(usize, usize)>)>, // (expert, [(token, pair)])
     pub out: usize,                              // host address of [pair][n] outputs
 }
@@ -66,7 +65,7 @@ struct Work {
     bact: Vec<Q8_0>,    // batch: quantized activation per CPU pair
     layer: usize,
     misses: Vec<(usize, usize)>, // (k, expert)
-    xq: Q8K,
+    xq: Q8_0,
     aq: Vec<Q8_0>, // quantized activations per miss, written a block per gate_up chunk
     out: usize,    // host address of cpu_out [8][n]
 }
@@ -90,7 +89,6 @@ pub struct Pool {
 }
 
 struct Ctx {
-    g: Arc<Gguf>,
     ex: Arc<Experts>,
     job: usize, // host addresses
     ack: usize,
@@ -157,14 +155,15 @@ fn run_batch(sh: &Shared, cx: &Ctx, t: usize) {
         }
         let (m, c) = (c / chunks_gu, c % chunks_gu);
         let (e, toks) = &job.misses[m];
-        let gu = ex.gate_up(&cx.g, job.layer, *e);
-        let xs: Vec<TokQ8K> = toks.iter().map(|&(tk, _)| TokQ8K::new(&job.xq[tk])).collect();
+        let gu = ex.gate_up(job.layer, *e);
+        let sg = gu.scale();
+        let xs: Vec<&Q8_0> = toks.iter().map(|&(tk, _)| &job.xq[tk]).collect();
         let mut out = vec![0f32; toks.len()];
         for r in c * ROWS..((c + 1) * ROWS).min(2 * nff) {
-            q4k_dot_tokens_packed(&gu[r * ex.gu_row..(r + 1) * ex.gu_row], &xs, &mut out);
+            dot_tokens(&gu, r, &xs, &mut out);
             for (i, &v) in out.iter().enumerate() {
                 // SAFETY: row r of pair base[m] + i is written by the thread that took the chunk
-                unsafe { *(w.bh[base[m] + i].as_ptr() as *mut f32).add(r) = v };
+                unsafe { *(w.bh[base[m] + i].as_ptr() as *mut f32).add(r) = v * sg };
             }
         }
     }
@@ -196,14 +195,15 @@ fn run_batch(sh: &Shared, cx: &Ctx, t: usize) {
         }
         let (m, c) = (c / chunks_dn, c % chunks_dn);
         let (e, toks) = &job.misses[m];
-        let dn = ex.down(&cx.g, job.layer, *e);
-        let xs: Vec<TokQ8_0> = (0..toks.len()).map(|i| TokQ8_0::new(&w.bact[base[m] + i])).collect();
+        let dn = ex.down(job.layer, *e);
+        let sd = dn.scale();
+        let xs: Vec<&Q8_0> = (0..toks.len()).map(|i| &w.bact[base[m] + i]).collect();
         let mut out = vec![0f32; toks.len()];
         for r in c * ROWS..((c + 1) * ROWS).min(n) {
-            q50_dot_tokens_packed(&dn[r * ex.down_row..(r + 1) * ex.down_row], &xs, &mut out);
+            dot_tokens(&dn, r, &xs, &mut out);
             for (i, &(_, pair)) in toks.iter().enumerate() {
                 // SAFETY: output row r of `pair` is written by the thread that took the chunk
-                unsafe { *(job.out as *mut f32).add(pair * n + r) = out[i] };
+                unsafe { *(job.out as *mut f32).add(pair * n + r) = out[i] * sd };
             }
         }
     }
@@ -282,12 +282,13 @@ fn run_decode(sh: &Shared, cx: &Ctx, t: usize, epoch: u32) {
                 // SAFETY: the epoch holds while this chunk is not done; the leader writes the job only between epochs
                 let w = unsafe { &*w };
                 let (m, blk) = (c / (nff / ACT), c % (nff / ACT));
-                let gu = ex.gate_up(&cx.g, w.layer, w.misses[m].1);
+                let gu = ex.gate_up(w.layer, w.misses[m].1);
+                let sg = gu.scale();
                 let mut act = [0f32; ACT];
                 for (i, a) in act.iter_mut().enumerate() {
                     let r = blk * ACT + i;
-                    let gv = dot_q4k(&gu[r * ex.gu_row..(r + 1) * ex.gu_row], &w.xq);
-                    let uv = dot_q4k(&gu[(nff + r) * ex.gu_row..(nff + r + 1) * ex.gu_row], &w.xq);
+                    let gv = dot_row(&gu, r, &w.xq) * sg;
+                    let uv = dot_row(&gu, nff + r, &w.xq) * sg;
                     let s = ex.beta * (gv / ex.beta).tanh() / (1.0 + (-gv).exp());
                     *a = s * ex.lb * (uv / ex.lb).tanh();
                 }
@@ -318,11 +319,12 @@ fn run_decode(sh: &Shared, cx: &Ctx, t: usize, epoch: u32) {
                 let w = unsafe { &*w };
                 let (m, blk) = (c / (n / DN_ROWS), c % (n / DN_ROWS));
                 let (k, e) = w.misses[m];
-                let dn = ex.down(&cx.g, w.layer, e);
+                let dn = ex.down(w.layer, e);
+                let sd = dn.scale();
                 // SAFETY: rows blk * DN_ROWS.. of miss k's output are written by this chunk alone
                 let out = unsafe { std::slice::from_raw_parts_mut((w.out as *mut f32).add(k * n), n) };
                 for r in blk * DN_ROWS..(blk + 1) * DN_ROWS {
-                    out[r] = dot_q50(&dn[r * ex.down_row..(r + 1) * ex.down_row], &w.aq[m]);
+                    out[r] = dot_row(&dn, r, &w.aq[m]) * sd;
                 }
                 sh.dn_done.fetch_add(1, Ordering::Release);
             }
@@ -335,7 +337,7 @@ fn run_decode(sh: &Shared, cx: &Ctx, t: usize, epoch: u32) {
 
 impl Pool {
     /// `cpus`: the CPU of each thread (the first is the leader), or None to leave them unpinned.
-    pub fn new(g: Arc<Gguf>, ex: Arc<Experts>, job: &HostBuf, ack: &HostBuf, out: &HostBuf, n_layers: usize, n_expert: usize, cpus: Vec<Option<usize>>) -> Pool {
+    pub fn new(ex: Arc<Experts>, job: &HostBuf, ack: &HostBuf, out: &HostBuf, n_layers: usize, n_expert: usize, cpus: Vec<Option<usize>>) -> Pool {
         let n = cpus.len().max(1);
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
@@ -357,7 +359,7 @@ impl Pool {
         let mut threads = vec![];
         for (t, cpu) in cpus.iter().copied().enumerate() {
             let sh = shared.clone();
-            let cx = Ctx { g: g.clone(), ex: ex.clone(), job: job.ptr as usize, ack: ack.ptr as usize, out: out.ptr as usize };
+            let cx = Ctx { ex: ex.clone(), job: job.ptr as usize, ack: ack.ptr as usize, out: out.ptr as usize };
             let usage = usage.clone();
             let busy = busy_ns.clone();
             threads.push(
@@ -478,7 +480,7 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
             w.misses.extend((0..8).filter(|&k| slots[k] < 0).map(|k| (k, ids[k])));
             // SAFETY: host-mapped memory the GPU wrote before seq
             let x = unsafe { std::slice::from_raw_parts(job.add(JOB_X) as *const f32, n) };
-            quantize_q8k(x, &mut w.xq);
+            quantize_q8_0(x, &mut w.xq);
             if w.aq.len() < n_miss {
                 w.aq.resize_with(n_miss, || Q8_0 { d: vec![0.0; nff / 32], qs: vec![0; nff], sums: vec![0; nff / 32] });
             }
