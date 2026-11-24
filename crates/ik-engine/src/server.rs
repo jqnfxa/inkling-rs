@@ -6,8 +6,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use serde_json::{Value, json};
 
@@ -55,6 +55,8 @@ pub struct Control {
     pub end_reasoning: AtomicBool,
     /// compact: compact the context now, if the model is thinking
     pub compact: AtomicBool,
+    /// the client left (or DELETE /v1/stream): stop the job at its next token
+    pub stop: AtomicBool,
 }
 
 /// The running jobs, by completion id.
@@ -408,6 +410,9 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
     let close: Vec<(u32, &str)> = [chat::END_MESSAGE, chat::MESSAGE_MODEL, chat::CONTENT_TEXT].iter().filter_map(|&s| tok.token_id(s).map(|t| (t, s))).collect();
     let mut summaries: Summaries = vec![];
     while let Ok(job) = rx.recv() {
+        if job.control.stop.load(Ordering::Relaxed) {
+            continue; // stopped while it waited
+        }
         // a chat longer than the context: its older messages summarized
         let th = std::time::Instant::now();
         let (prompt, summarized) = match compact_history(&mut eng, &tok, &job, &mut summaries) {
@@ -474,6 +479,11 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
         'tokens: loop {
             let room = eng.n_ctx.saturating_sub(eng.tokens.len() + 1);
             if n >= limit || room == 0 {
+                break;
+            }
+            // the client is gone or asked to stop (with the thinking hidden, no send would have told)
+            if job.control.stop.load(Ordering::Relaxed) {
+                finish = "abort";
                 break;
             }
             let thinking = !job.raw && !closed && parser.thinking();
@@ -639,6 +649,8 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
 struct Request {
     method: String,
     path: String,
+    /// X-Conversation-Id (the llama.cpp UI's, "<conversation>::<model>"): the stream is a resumable session
+    conv: Option<String>,
     body: Vec<u8>,
 }
 
@@ -649,6 +661,7 @@ fn read_request(s: &mut BufReader<TcpStream>) -> Option<Request> {
     let method = it.next()?.to_string();
     let path = it.next()?.to_string();
     let mut len = 0usize;
+    let mut conv = None;
     loop {
         let mut h = String::new();
         if s.read_line(&mut h).ok()? == 0 {
@@ -661,6 +674,8 @@ fn read_request(s: &mut BufReader<TcpStream>) -> Option<Request> {
         if let Some((k, v)) = h.split_once(':') {
             if k.eq_ignore_ascii_case("content-length") {
                 len = v.trim().parse().ok()?;
+            } else if k.eq_ignore_ascii_case("x-conversation-id") && !v.trim().is_empty() {
+                conv = Some(v.trim().to_string());
             }
         }
     }
@@ -669,10 +684,33 @@ fn read_request(s: &mut BufReader<TcpStream>) -> Option<Request> {
     }
     let mut body = vec![0u8; len];
     s.read_exact(&mut body).ok()?;
-    Some(Request { method, path, body })
+    Some(Request { method, path, conv, body })
 }
 
-const CORS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
+/// A query parameter, percent-decoded.
+fn query(path: &str, key: &str) -> Option<String> {
+    let q = path.split_once('?')?.1;
+    let v = q.split('&').find_map(|kv| kv.split_once('=').filter(|(k, _)| *k == key).map(|(_, v)| v))?;
+    let b = v.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = if b[i] == b'%' { b.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok()) } else { None };
+        match hex {
+            Some(c) => {
+                out.push(c);
+                i += 3;
+            }
+            None => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+const CORS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n";
 
 fn respond(s: &mut TcpStream, code: u16, body: &Value) {
     let b = body.to_string();
@@ -789,6 +827,99 @@ fn stream_write(s: &mut TcpStream, b: &[u8]) -> std::io::Result<()> {
     s.write_all(b)
 }
 
+/// A stream the llama.cpp UI can come back to (its requests carry X-Conversation-Id), after llama-server: the job runs
+/// on when the connection drops or the page reloads, its bytes are kept, `GET /v1/stream?conv_id=K&from=N` replays them
+/// from byte N and follows, `DELETE /v1/stream?conv_id=K` stops the job, `POST /v1/streams/lookup` lists them.
+struct Session {
+    key: String,
+    started: u64,
+    control: Arc<Control>,
+    /// the response body so far, and whether it ended
+    log: Mutex<(Vec<u8>, bool)>,
+    more: Condvar,
+}
+
+/// The sessions, oldest first: the running ones and the last few that ended.
+static SESSIONS: LazyLock<Mutex<Vec<Arc<Session>>>> = LazyLock::new(|| Mutex::new(vec![]));
+const KEEP_ENDED: usize = 4;
+
+impl Session {
+    fn ended(&self) -> bool {
+        self.log.lock().map_or(true, |g| g.1)
+    }
+
+    fn end(&self) {
+        if let Ok(mut g) = self.log.lock() {
+            g.1 = true;
+        }
+        self.more.notify_all();
+    }
+
+    fn find(key: &str) -> Option<Arc<Session>> {
+        SESSIONS.lock().ok()?.iter().rev().find(|s| s.key == key).cloned()
+    }
+
+    /// Adds a session: a job of the same conversation still running is stopped (a new message, or the answer asked
+    /// again), and only the last KEEP_ENDED ended sessions stay.
+    fn open(s: Arc<Session>) {
+        let Ok(mut all) = SESSIONS.lock() else { return };
+        for o in all.iter().filter(|o| o.key == s.key) {
+            o.control.stop.store(true, Ordering::Relaxed);
+        }
+        all.retain(|o| o.key != s.key);
+        let ended = all.iter().filter(|o| o.ended()).count();
+        let mut drop = ended.saturating_sub(KEEP_ENDED);
+        all.retain(|o| {
+            let gone = drop > 0 && o.ended();
+            drop -= gone as usize;
+            !gone
+        });
+        all.push(s);
+    }
+}
+
+/// The body a session's job writes: kept, and the followers woken.
+struct SessionLog<'a>(&'a Session);
+
+impl Write for SessionLog<'_> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.log.lock().map_err(|_| std::io::Error::other("poisoned"))?.0.extend_from_slice(b);
+        self.0.more.notify_all();
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Sends a session's body from byte `from`, then what comes, to its end or until the client leaves.
+fn follow(s: &mut TcpStream, ss: &Session, mut at: usize) {
+    if write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{CORS}Connection: close\r\n\r\n").is_err() {
+        return;
+    }
+    loop {
+        let (bytes, ended) = {
+            let Ok(mut g) = ss.log.lock() else { return };
+            while g.0.len() <= at && !g.1 {
+                g = match ss.more.wait(g) {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+            }
+            at = at.min(g.0.len());
+            (g.0[at..].to_vec(), g.1)
+        };
+        if !bytes.is_empty() && s.write_all(&bytes).and_then(|_| s.flush()).is_err() {
+            return;
+        }
+        at += bytes.len();
+        if ended && bytes.is_empty() {
+            return;
+        }
+    }
+}
+
 fn handle(mut stream: TcpStream, jobs: Sender<Job>, tok: Arc<Tokenizer>, model: Arc<String>, site: Arc<Site>) {
     let mut rd = BufReader::new(stream.try_clone().unwrap());
     let Some(req) = read_request(&mut rd) else { return };
@@ -799,9 +930,30 @@ fn handle(mut stream: TcpStream, jobs: Sender<Job>, tok: Arc<Tokenizer>, model: 
         }
         ("GET", "/health") | ("GET", "/v1/health") => respond(&mut stream, 200, &json!({"status": "ok"})),
         ("GET", "/props") => respond(&mut stream, 200, &site.props),
-        // llama-server's own tools (--tools), and its resumable streams: none here
+        // llama-server's own tools (--tools): none here
         ("GET", "/tools") => respond(&mut stream, 200, &json!([])),
-        ("POST", "/v1/streams/lookup") => respond(&mut stream, 200, &json!([])),
+        ("POST", "/v1/streams/lookup") => {
+            let r: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            let keys: Vec<&str> = r.get("conversation_ids").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+            let list: Vec<Value> = SESSIONS.lock().map(|all| {
+                all.iter().filter(|s| keys.contains(&s.key.as_str())).map(|s| json!({"conversation_id": s.key, "is_done": s.ended(), "started_at": s.started})).collect()
+            }).unwrap_or_default();
+            respond(&mut stream, 200, &Value::Array(list))
+        }
+        ("GET", "/v1/stream") => {
+            let from = query(&req.path, "from").and_then(|v| v.parse().ok()).unwrap_or(0);
+            match query(&req.path, "conv_id").and_then(|k| Session::find(&k)) {
+                Some(ss) => follow(&mut stream, &ss, from),
+                None => respond(&mut stream, 404, &json!({"error": {"message": "no such stream"}})),
+            }
+        }
+        ("DELETE", "/v1/stream") => match query(&req.path, "conv_id").and_then(|k| Session::find(&k)) {
+            Some(ss) => {
+                ss.control.stop.store(true, Ordering::Relaxed);
+                respond(&mut stream, 200, &json!({"success": true}))
+            }
+            None => respond(&mut stream, 404, &json!({"success": false, "error": {"message": "no such stream"}})),
+        },
         ("GET", "/v1/models") | ("GET", "/models") => respond(&mut stream, 200, &site.models),
         ("POST", "/v1/chat/completions") | ("POST", "/chat/completions") | ("POST", "/v1/completions") | ("POST", "/completions") => {
             let chat = path.contains("chat");
@@ -855,7 +1007,7 @@ fn handle(mut stream: TcpStream, jobs: Sender<Job>, tok: Arc<Tokenizer>, model: 
                 thinking_budget,
                 stop,
                 raw: !chat,
-                control,
+                control: control.clone(),
                 compaction: compaction_of(&r, &site.compaction),
                 notes,
                 progress: flag("return_progress"),
@@ -865,8 +1017,26 @@ fn handle(mut stream: TcpStream, jobs: Sender<Job>, tok: Arc<Tokenizer>, model: 
             if jobs.send(job).is_err() {
                 return respond(&mut stream, 500, &json!({"error": {"message": "the scheduler is gone"}}));
             }
+            if streaming && let Some(key) = req.conv {
+                // a session: the job writes to its log on a thread of its own, and this connection follows it
+                let ss = Arc::new(Session { key, started: now(), control, log: Mutex::new((vec![], false)), more: Condvar::new() });
+                Session::open(ss.clone());
+                let (job_ss, model) = (ss.clone(), model.clone());
+                std::thread::spawn(move || {
+                    let ss = job_ss;
+                    if !stream_body(&mut SessionLog(&ss), &rx, &id, &model, chat, &ss.control.stop) {
+                        ss.control.stop.store(true, Ordering::Relaxed);
+                    }
+                    drop(rx); // the scheduler's next send fails: a compaction or a note under way ends too
+                    ss.end();
+                    if let Ok(mut m) = RUNNING.lock() {
+                        m.remove(&id);
+                    }
+                });
+                return follow(&mut stream, &ss, 0);
+            }
             if streaming {
-                stream_reply(&mut stream, rx, &id, &model, chat);
+                stream_reply(&mut stream, rx, &id, &model, chat, &control);
             } else {
                 whole_reply(&mut stream, rx, &id, &model, chat);
             }
@@ -922,13 +1092,43 @@ fn chunk(id: &str, model: &str, chat: bool, delta: Value, finish: Option<&str>) 
     }
 }
 
-fn stream_reply(s: &mut TcpStream, rx: Receiver<Event>, id: &str, model: &str, chat: bool) {
-    if write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{CORS}Connection: close\r\n\r\n").is_err() {
-        return;
+fn stream_reply(s: &mut TcpStream, rx: Receiver<Event>, id: &str, model: &str, chat: bool, control: &Control) {
+    let head = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{CORS}Connection: close\r\n\r\n");
+    if head.is_err() || !stream_body(s, &rx, id, model, chat, &control.stop) {
+        // the client left: the scheduler stops the job at its next token
+        control.stop.store(true, Ordering::Relaxed);
     }
-    let mut send = |v: &Value| write!(s, "data: {v}\n\n").and_then(|_| s.flush()).is_ok();
-    if chat && !send(&chunk(id, model, chat, json!({"role": "assistant", "content": ""}), None)) {
-        return;
+}
+
+/// An SSE comment when nothing else went out for this long (thinking hidden behind notes, a compaction, a long
+/// prefill): the llama.cpp UI, when its tab comes back, takes 3 s without a byte for a lost connection.
+const KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A writer that knows when it last wrote.
+struct Timed<'a> {
+    w: &'a mut dyn Write,
+    last: std::time::Instant,
+}
+
+impl Write for Timed<'_> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.last = std::time::Instant::now();
+        self.w.write(b)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.w.flush()
+    }
+}
+
+/// A job's events as server-sent events: true at the end of the reply, false if a write failed, the job was stopped or
+/// the scheduler dropped it.
+fn stream_body(s: &mut dyn Write, rx: &Receiver<Event>, id: &str, model: &str, chat: bool, stop: &AtomicBool) -> bool {
+    let s = &mut Timed { w: s, last: std::time::Instant::now() };
+    let put = |s: &mut dyn Write, b: &[u8]| s.write_all(b).and_then(|_| s.flush()).is_ok();
+    let send = |s: &mut dyn Write, v: &Value| put(s, format!("data: {v}\n\n").as_bytes());
+    if chat && !send(s, &chunk(id, model, chat, json!({"role": "assistant", "content": ""}), None)) {
+        return false;
     }
     let mut ntool = 0;
     // the timings of the last token (when asked for), on each chunk as llama-server puts them
@@ -939,30 +1139,49 @@ fn stream_reply(s: &mut TcpStream, rx: Receiver<Event>, id: &str, model: &str, c
         }
         c
     };
-    for ev in rx {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        // at most KEEPALIVE after the last write, whatever came between
+        let wait = KEEPALIVE.saturating_sub(s.last.elapsed()).max(std::time::Duration::from_millis(10));
+        let ev = match rx.recv_timeout(wait) {
+            Ok(ev) => ev,
+            Err(RecvTimeoutError::Timeout) => {
+                if s.last.elapsed() >= KEEPALIVE && !put(s, b": keepalive\n\n") {
+                    return false;
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => return false,
+        };
+        // events that write nothing (the timings of hidden thinking tokens) come too often for the timeout
+        if s.last.elapsed() >= KEEPALIVE && !put(s, b": keepalive\n\n") {
+            return false;
+        }
         let ok = match ev {
             Event::PromptProgress { processed, total, cache, ms } => {
                 let mut c = chunk(id, model, chat, json!({}), None);
                 c["prompt_progress"] = json!({"total": total, "cache": cache, "processed": processed, "time_ms": ms});
-                send(&c)
+                send(s, &c)
             }
             Event::Tick { prompt_n, cache_n, prompt_s, n, decode_s } => {
                 tick = Some(timings(prompt_n + cache_n, n, cache_n, prompt_s, decode_s));
                 true
             }
-            Event::Delta(Delta::Content(c)) => send(&with_tick(chunk(id, model, chat, json!({"content": c}), None), &tick)),
-            Event::Delta(Delta::Reasoning(r)) => send(&with_tick(chunk(id, model, chat, json!({"reasoning_content": r}), None), &tick)),
+            Event::Delta(Delta::Content(c)) => send(s, &with_tick(chunk(id, model, chat, json!({"content": c}), None), &tick)),
+            Event::Delta(Delta::Reasoning(r)) => send(s, &with_tick(chunk(id, model, chat, json!({"reasoning_content": r}), None), &tick)),
             Event::Delta(Delta::ToolCall(name, args)) => {
                 ntool += 1;
                 let c = chunk(id, model, chat, json!({"tool_calls": [{"index": ntool - 1, "id": format!("call_{ntool}"), "type": "function", "function": {"name": name, "arguments": args}}]}), None);
-                send(&with_tick(c, &tick))
+                send(s, &with_tick(c, &tick))
             }
             Event::Compaction { stage, done, total } => {
                 let mut c = chunk(id, model, chat, json!({}), None);
                 c["compaction"] = json!({"stage": stage, "done": done, "total": total});
-                send(&c)
+                send(s, &c)
             }
-            Event::Note(t) => send(&with_tick(chunk(id, model, chat, json!({"reasoning_summary": t}), None), &tick)),
+            Event::Note(t) => send(s, &with_tick(chunk(id, model, chat, json!({"reasoning_summary": t}), None), &tick)),
             Event::Done { finish, prompt_tokens, completion_tokens, reused, prefill_s, decode_s, aside } => {
                 let finish = if ntool > 0 && finish == "stop" { "tool_calls" } else { finish };
                 let mut last = chunk(id, model, chat, json!({}), Some(finish));
@@ -977,17 +1196,14 @@ fn stream_reply(s: &mut TcpStream, rx: Receiver<Event>, id: &str, model: &str, c
                     last["timings"]["notes"] = json!(notes);
                     last["timings"]["notes_ms"] = json!(notes_s * 1e3);
                 }
-                send(&last);
-                let _ = write!(s, "data: [DONE]\n\n");
-                return;
+                return send(s, &last) && put(s, b"data: [DONE]\n\n");
             }
             Event::Error(e) => {
-                send(&json!({"error": {"message": e}}));
-                return;
+                return send(s, &json!({"error": {"message": e}}));
             }
         };
         if !ok {
-            return; // the client left: dropping rx makes the scheduler stop the job
+            return false;
         }
     }
 }

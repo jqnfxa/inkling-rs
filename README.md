@@ -35,7 +35,7 @@ Open http://127.0.0.1:8080 to chat. `run-inkling-rs.sh` reads `MODEL`, `CTX` (13
 ## API
 
 `/v1/chat/completions` (streaming, `reasoning_content`, tool calls), `/v1/completions`, `/v1/models`, `/health`, and the
-llama-server endpoints the chat UI reads (`/props`, `/tools`, `/v1/streams/lookup`).
+llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable streams below).
 
 - `reasoning_effort`: `none`, `minimal`, `low`, `medium`, `high` (the default), `xhigh`, `max`.
   `chat_template_kwargs.enable_thinking: false` is `none`.
@@ -68,6 +68,13 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, `/v1/streams/looku
   branch of the cache that is dropped after (its own context keeps the raw thinking); about 2.4 s each. Stream chunks
   carry each note in `delta.reasoning_summary` too, and `timings` report `notes` and `notes_ms`.
 - `timings_per_token` puts `timings` on every chunk of a stream; `return_progress` adds `prompt_progress`.
+- Streams send an SSE comment (`: keepalive`) after a second without data (thinking hidden behind notes, a compaction):
+  the chat UI takes 3 s of silence, when its tab comes back, for a lost connection.
+- Resumable streams, as llama-server's: a streaming request with an `X-Conversation-Id` header (the chat UI sends one)
+  runs on when its connection drops or the page reloads. `GET /v1/stream?conv_id=ID&from=N` sends its bytes from byte N
+  and follows, `DELETE /v1/stream?conv_id=ID` stops it (the UI's Stop button), `POST /v1/streams/lookup
+  {"conversation_ids": [...]}` lists them; a new request in the same conversation stops the one before. Without the
+  header, a client that leaves stops its request at the next token.
 - The KV cache is reused when a prompt extends the previous one. When a chat UI sends the history again, the cache is
   rolled back to the end of the last prompt.
 
