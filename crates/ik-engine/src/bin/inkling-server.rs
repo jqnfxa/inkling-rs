@@ -1,4 +1,5 @@
-//! The Inkling-2-Mini server: `inkling-server <model.gguf> [--host 127.0.0.1] [--port 8080] [--ctx 16384] [--slots N] [--ui DIR]`
+//! The Inkling-2-Mini server: `inkling-server <model.gguf> [--host 127.0.0.1] [--port 8080] [--ctx 16384] [--slots N] [--ui DIR]
+//! [--compact-reserve 16384] [--compact-keep 20000] [--compact-max 8] [--no-compact]`
 //! OpenAI-compatible: /v1/chat/completions, /v1/completions, /v1/models, /health; /props as llama-server answers it, and
 //! with --ui the files of a browser UI at / (the llama.cpp chat UI: tools/fetch-ui.sh).
 #![recursion_limit = "256"]
@@ -21,6 +22,18 @@ fn main() -> Result<(), String> {
     let n_ctx: usize = arg(&a, "--ctx").and_then(|v| v.parse().ok()).unwrap_or(16384);
     let slots: usize = arg(&a, "--slots").and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
     let ui = arg(&a, "--ui").map(std::path::PathBuf::from);
+    let num = |k: &str, d: usize| -> Result<usize, String> { arg(&a, k).map_or(Ok(d), |v| v.parse().map_err(|_| format!("{k} {v}: not a number"))) };
+    let d = ik_engine::compact::Settings::default();
+    let compaction = ik_engine::compact::Settings {
+        enabled: !a.iter().any(|x| x == "--no-compact"),
+        reserve: num("--compact-reserve", d.reserve)?,
+        keep: num("--compact-keep", d.keep)?,
+        max: num("--compact-max", d.max)?,
+        summary_tokens: d.summary_tokens,
+    };
+    if compaction.enabled && compaction.reserve >= n_ctx / 2 {
+        return Err(format!("--compact-reserve {} must be under half of --ctx {n_ctx}", compaction.reserve));
+    }
     if let Some(d) = &ui
         && !d.join("index.html").is_file()
     {
@@ -31,7 +44,7 @@ fn main() -> Result<(), String> {
     let tok = Arc::new(Tokenizer::from_gguf(&eng.g)?);
     let name = eng.g.str("general.name").unwrap_or("inkling").to_string();
     eprintln!("{name}: loaded in {:.1}s on {}, context {n_ctx}, {} expert cache slots (fewer as the context fills)", t0.elapsed().as_secs_f64(), eng.ctx.name, eng.cache.n_slots);
-    let site = site(&eng, &model, &name, n_ctx, ui.clone());
+    let site = site(&eng, &model, &name, n_ctx, ui.clone(), compaction);
     let (tx, rx) = std::sync::mpsc::channel();
     let addr = format!("{host}:{port}");
     let tok2 = tok.clone();
@@ -51,7 +64,7 @@ fn main() -> Result<(), String> {
 }
 
 /// /props and /v1/models in the form llama-server gives them, for the llama.cpp chat UI.
-fn site(eng: &Engine, path: &str, name: &str, n_ctx: usize, ui: Option<std::path::PathBuf>) -> server::Site {
+fn site(eng: &Engine, path: &str, name: &str, n_ctx: usize, ui: Option<std::path::PathBuf>, compaction: ik_engine::compact::Settings) -> server::Site {
     use serde_json::json;
     let d = ik_engine::sampler::SamplingParams::default();
     let template = eng.g.str("tokenizer.chat_template").unwrap_or("").to_string();
@@ -103,5 +116,5 @@ fn site(eng: &Engine, path: &str, name: &str, n_ctx: usize, ui: Option<std::path
             "meta": {"n_ctx": n_ctx, "n_ctx_train": 1048576, "n_vocab": eng.hp.n_vocab, "n_embd": eng.hp.n_embd}
         }]
     });
-    server::Site { props, models, ui }
+    server::Site { props, models, ui, compaction }
 }

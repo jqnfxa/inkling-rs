@@ -40,6 +40,18 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, `/v1/streams/looku
 - The server ends a thinking block (it writes the tokens that close it, then the model answers) at
   `thinking_budget_tokens`, when a finite `max_tokens` has a quarter (at most 1024) left for the answer, or on
   `POST /v1/chat/completions/control {"action": "reasoning_end", "id": <completion id>}`.
+- Compaction, after [Pi](https://docs.pi.dev/latest/compaction): when the thinking of an answer comes within
+  `reserve_tokens` (16384) of the context size, the model writes a summary of its reasoning on the cache it has (task,
+  constraints, established facts, approaches tried, current approach, next steps, code), and the sequence is rebuilt as
+  the prompt, the summary and the last `keep_recent_tokens` (20000) of the thinking, cut at a line start. The rebuilt
+  sequence takes at most half the context before the reserve. The reply stays one message: the summary and a marker
+  `[context compacted: ...]` go to `reasoning_content`, and stream chunks carry `compaction: {stage, done, total}`
+  while it runs. At most `max_compactions` (8) per answer; then, or when a summary cannot fit, the thinking is closed at
+  the reserve and the model answers. `timings` leave compaction out of the decode time and report `compactions` and
+  `compact_ms`. Request field `compaction`: `false`, or `{enabled, reserve_tokens, keep_recent_tokens,
+  max_compactions, summary_tokens}`; server flags `--compact-reserve N`, `--compact-keep N`, `--compact-max N`,
+  `--no-compact`. `POST /v1/chat/completions/control {"action": "compact", "id": ...}` compacts now (also with
+  automatic compaction off). `IK_COMPACT_ROLE=system` asks for the summary in a system message instead of a user one.
 - `timings_per_token` puts `timings` on every chunk of a stream; `return_progress` adds `prompt_progress`.
 - The KV cache is reused when a prompt extends the previous one. When a chat UI sends the history again, the cache is
   rolled back to the end of the last prompt.

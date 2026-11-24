@@ -649,6 +649,28 @@ impl Engine {
         Ok((logits, reuse))
     }
 
+    /// Appends tokens to the sequence in ubatches, as a prompt is fed, but keeps the snapshot where it is (the end of
+    /// the last prompt). `progress(pos)` after each ubatch. Returns the logits after the last token.
+    pub fn extend(&mut self, toks: &[u32], progress: &mut dyn FnMut(usize)) -> Result<Vec<f32>> {
+        let mut logits = vec![];
+        for chunk in toks.chunks(T_MAX) {
+            logits = if chunk.len() == 1 { self.decode(chunk[0])? } else { self.prefill(chunk)? };
+            progress(self.pos);
+        }
+        Ok(logits)
+    }
+
+    /// Rolls the sequence back to the end of the last prompt, and gives the KV memory past it and `upcoming` more tokens
+    /// back to the expert cache. Returns that position.
+    pub fn rollback(&mut self, upcoming: usize) -> Result<usize> {
+        let p = self.snap_pos.filter(|&p| p <= self.tokens.len()).ok_or_else(|| "no prompt to roll back to".to_string())?;
+        self.restore(p)?;
+        if self.kv_mapped > p + upcoming + 2 * KV_STEP {
+            self.plan_kv(p + upcoming + 1)?;
+        }
+        Ok(p)
+    }
+
     /// The rows of the SWA ring that the positions max(0, pos - n_swa)..pos use: (first row, count) ranges.
     fn window_rows(&self, ring: usize) -> Vec<(usize, usize, usize)> {
         let pos = self.pos;
