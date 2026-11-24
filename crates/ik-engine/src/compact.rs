@@ -1,6 +1,10 @@
-//! Context compaction inside one answer, after Pi (docs.pi.dev, compaction): when the thinking fills the context, the
-//! model summarizes its reasoning on the cache it has, and the sequence is rebuilt as the prompt, the start of the
-//! thinking, the summary, and the last part of the thinking kept verbatim. The pieces that need no engine live here.
+//! Summaries of the thinking. Compaction inside one answer, after Pi (docs.pi.dev, compaction): when the thinking fills
+//! the context, the model summarizes its reasoning on the cache it has, and the sequence is rebuilt as the prompt, the
+//! start of the thinking, the summary, and the last part of the thinking kept verbatim. Progress notes, as chat apps
+//! show while a model thinks: now and then the model writes a few lines on what it is doing, on a branch of the cache
+//! that is dropped after. Compaction between turns, after Pi too: when a chat no longer fits, its older messages are
+//! summarized (serialized as plain text, without the thinking) and replaced by one system message. The pieces that
+//! need no engine live here.
 
 use crate::chat::{CONTENT_TEXT, END_MESSAGE, MESSAGE_MODEL, MESSAGE_SYSTEM, MESSAGE_USER};
 
@@ -21,6 +25,173 @@ impl Default for Settings {
     fn default() -> Self {
         Settings { enabled: true, reserve: 16384, keep: 20000, max: 8, summary_tokens: 3072 }
     }
+}
+
+/// A message as the summarizer of a conversation reads it: `[User]: ...`, `[Assistant]: ...`, `[Assistant tool calls]:
+/// ...`, `[Tool result]: ...` (cut to 2000 characters); the thinking is left out.
+pub fn serialize(m: &serde_json::Value) -> String {
+    use serde_json::Value;
+    let role = m.get("role").and_then(Value::as_str).unwrap_or("");
+    let text = match m.get("content") {
+        Some(Value::String(c)) => c.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.as_str().map(String::from).or_else(|| p.get("text").and_then(Value::as_str).map(String::from)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    let mut out = vec![];
+    match role {
+        "tool" => {
+            let t: String = text.chars().take(2000).collect();
+            let more = if text.chars().count() > 2000 { " [...]" } else { "" };
+            out.push(format!("[Tool result]: {t}{more}"));
+        }
+        "user" => out.push(format!("[User]: {text}")),
+        "system" => out.push(format!("[System]: {text}")),
+        _ => {
+            if !text.is_empty() {
+                out.push(format!("[Assistant]: {text}"));
+            }
+            let calls: Vec<String> = m
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|c| {
+                    let f = c.get("function").unwrap_or(c);
+                    let args = match f.get("arguments") {
+                        Some(Value::String(a)) => a.clone(),
+                        Some(a) => a.to_string(),
+                        None => "{}".into(),
+                    };
+                    format!("{}({args})", f.get("name").and_then(Value::as_str).unwrap_or("?"))
+                })
+                .collect();
+            if !calls.is_empty() {
+                out.push(format!("[Assistant tool calls]: {}", calls.join("; ")));
+            }
+        }
+    }
+    out.join("\n")
+}
+
+/// What identifies a message for the cache of summaries: what a chat UI sends again unchanged (the thinking, which
+/// some send and some do not, is left out).
+pub fn message_key(m: &serde_json::Value) -> String {
+    let g = |k: &str| m.get(k).map(|v| v.to_string()).unwrap_or_default();
+    format!("{}\0{}\0{}\0{}\0{}", g("role"), g("content"), g("tool_calls"), g("name"), g("tool_call_id"))
+}
+
+/// Where the kept messages start: the last ones that fit in `keep` tokens (the last message always), from `start` on,
+/// never with a tool result first (its call goes with it). None if nothing before it would be summarized.
+pub fn cut_point(sizes: &[usize], roles: &[&str], start: usize, keep: usize) -> Option<usize> {
+    let n = sizes.len();
+    if n == 0 {
+        return None;
+    }
+    let (mut cut, mut acc) = (n, 0);
+    for i in (start..n).rev() {
+        if acc + sizes[i] > keep && i < n - 1 {
+            break;
+        }
+        acc += sizes[i];
+        cut = i;
+    }
+    while cut > start && cut < n && roles[cut] == "tool" {
+        cut -= 1;
+    }
+    (cut > start).then_some(cut)
+}
+
+/// The summarizer's request for the conversation `conversation` (serialized), updating `previous` if there is one:
+/// system and user messages.
+pub fn history_request(conversation: &str, previous: Option<&str>, words: usize) -> Vec<serde_json::Value> {
+    let system = "You summarize a conversation between a user and an AI assistant, so that the assistant can continue it from your summary and the latest messages alone: the older messages will be gone. You do not take part in the conversation: do not answer or continue anything in it.";
+    let ask = match previous {
+        Some(p) => format!("<previous-summary>\n{p}\n</previous-summary>\n\nThe conversation above comes after what the previous summary covers. Write an updated summary that replaces it: keep what still holds, add what is new, drop what was settled otherwise."),
+        None => "Write the summary of the conversation above.".into(),
+    };
+    let user = format!(
+        "<conversation>\n{conversation}\n</conversation>\n\n{ask}\n\nUse these sections:\n\n## Goal\nWhat the user is trying to do.\n\n## Constraints and preferences\nRequirements and preferences the user stated.\n\n## Progress\n### Done\n### In progress\n### Blocked\n\n## Key decisions\nWhat was decided, and why.\n\n## Next steps\nWhat comes next, in order.\n\n## Critical context\nFacts, names, numbers, file paths, code and errors the assistant needs exactly as they were.\n\nKeep names, numbers and code exact. {words} words at most."
+    );
+    vec![serde_json::json!({"role": "system", "content": system}), serde_json::json!({"role": "user", "content": user})]
+}
+
+/// The system message that stands for the summarized messages.
+pub fn history_message(summary: &str) -> serde_json::Value {
+    serde_json::json!({"role": "system", "content": format!("Summary of the earlier conversation (its older messages were compacted to save context):\n\n{summary}")})
+}
+
+/// Progress notes on the thinking: off, between the raw thinking (inline), or in its place (only).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NoteMode {
+    Off,
+    Inline,
+    Only,
+}
+
+#[derive(Debug, Clone)]
+pub struct Notes {
+    pub mode: NoteMode,
+    /// a note every this many tokens of thinking (the first after a quarter of it)
+    pub every: usize,
+}
+
+impl Default for Notes {
+    fn default() -> Self {
+        Notes { mode: NoteMode::Off, every: 1024 }
+    }
+}
+
+impl NoteMode {
+    /// `reasoning_summary` as a request or a flag gives it: off/none, inline, only (auto, concise and detailed, as in
+    /// OpenAI's API, are only), or a boolean.
+    pub fn parse(v: &serde_json::Value) -> Option<NoteMode> {
+        match v {
+            serde_json::Value::Bool(b) => Some(if *b { NoteMode::Only } else { NoteMode::Off }),
+            serde_json::Value::String(s) => match s.as_str() {
+                "off" | "none" | "" => Some(NoteMode::Off),
+                "inline" => Some(NoteMode::Inline),
+                "only" | "auto" | "concise" | "detailed" => Some(NoteMode::Only),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+/// How a note starts: its answer is begun with it, so that it opens with a bold title.
+pub const NOTE_START: &str = "**";
+
+/// The request for a progress note, after the thinking so far. It does not show the last note (shown one, or its
+/// title, the model copied it), nor call it a note (the model made "Progress note" its title).
+pub fn note_request(system: bool) -> String {
+    let role = if system { MESSAGE_SYSTEM } else { MESSAGE_USER };
+    format!(
+        "{END_MESSAGE}{role}{CONTENT_TEXT}Pause for a moment. For the user, write a bold title of three to six words that names what you are doing in the latest part of your reasoning, then on the next line one or two plain sentences about it in the first person, 50 words at most. No formulas or code; do not solve anything here.{END_MESSAGE}{MESSAGE_MODEL}{CONTENT_TEXT}{NOTE_START}"
+    )
+}
+
+/// A note as the model wrote it, without a label it may put first ("Progress note:").
+pub fn clean_note(text: &str) -> String {
+    let t = text.trim();
+    let marker: String = t.chars().take_while(|&c| c == '*' || c == '_').collect();
+    let bare = &t[marker.len()..];
+    if bare.get(..13).is_some_and(|p| p.eq_ignore_ascii_case("progress note")) {
+        let mut rest = &bare[13..];
+        rest = rest.strip_prefix(':').unwrap_or(rest);
+        rest = rest.strip_prefix(marker.as_str()).unwrap_or(rest);
+        rest = rest.strip_prefix(':').unwrap_or(rest);
+        return rest.trim_start().to_string();
+    }
+    t.to_string()
+}
+
+/// A note shown between the raw thinking: a quote block.
+pub fn quote(note: &str) -> String {
+    note.lines().map(|l| if l.trim().is_empty() { ">".to_string() } else { format!("> {}", l.trim_end()) }).collect::<Vec<_>>().join("\n")
 }
 
 /// What the summary is put between, in the rebuilt thinking.
@@ -195,6 +366,44 @@ mod tests {
         let mut l = Lines::default();
         assert_eq!(l.push(0, "ok\nok\n"), None);
         assert_eq!(l.push(1, "ok\n"), None); // short lines repeat freely
+    }
+
+    #[test]
+    fn history() {
+        use serde_json::json;
+        // sizes of: user, assistant (tool call), tool, assistant, user
+        let roles = ["user", "assistant", "tool", "assistant", "user"];
+        assert_eq!(cut_point(&[100, 50, 300, 80, 40], &roles, 0, 200), Some(3)); // 40 + 80 fit, 300 does not
+        assert_eq!(cut_point(&[100, 50, 300, 80, 40], &roles, 0, 500), Some(1)); // the tool result would start: its call too
+        assert_eq!(cut_point(&[100, 50, 300, 80, 40], &roles, 0, 10), Some(4)); // the last message always
+        assert_eq!(cut_point(&[100, 50, 300, 80, 40], &roles, 0, 1000), None); // all fits: nothing to summarize
+        assert_eq!(cut_point(&[100, 50, 300, 80, 40], &roles, 3, 10), Some(4));
+        assert_eq!(cut_point(&[100, 50, 300, 80, 40], &roles, 4, 10), None);
+        let a = json!({"role": "assistant", "content": "", "reasoning_content": "hmm", "tool_calls": [{"function": {"name": "ls", "arguments": "{\"d\":\"/\"}"}}]});
+        assert_eq!(serialize(&a), "[Assistant tool calls]: ls({\"d\":\"/\"})");
+        let t = json!({"role": "tool", "content": "x".repeat(2500)});
+        assert_eq!(serialize(&t).len(), "[Tool result]: ".len() + 2000 + " [...]".len());
+        assert_eq!(serialize(&json!({"role": "user", "content": [{"type": "text", "text": "hi"}]})), "[User]: hi");
+        assert_eq!(message_key(&a), message_key(&json!({"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "ls", "arguments": "{\"d\":\"/\"}"}}]})));
+        let r = history_request("[User]: hi", Some("old"), 300);
+        assert!(r[1]["content"].as_str().unwrap().contains("<previous-summary>\nold\n</previous-summary>"));
+    }
+
+    #[test]
+    fn notes() {
+        let r = note_request(false);
+        assert!(r.starts_with("<|end_message|><|message_user|><|content_text|>Pause"));
+        assert!(r.ends_with("<|end_message|><|message_model|><|content_text|>**"));
+        assert_eq!(clean_note("**Progress note:** I'm analyzing."), "I'm analyzing.");
+        assert_eq!(clean_note("Progress note: **Analyzing it**\n\nText"), "**Analyzing it**\n\nText");
+        assert_eq!(clean_note("**Analyzing it**"), "**Analyzing it**");
+        assert_eq!(clean_note("**Progress note**: x"), "x");
+        assert_eq!(clean_note("Прогресс: да"), "Прогресс: да");
+        assert!(note_request(true).contains("<|message_system|>"));
+        assert_eq!(quote("**T**\n\nText."), "> **T**\n>\n> Text.");
+        assert_eq!(NoteMode::parse(&serde_json::json!("auto")), Some(NoteMode::Only));
+        assert_eq!(NoteMode::parse(&serde_json::json!(false)), Some(NoteMode::Off));
+        assert_eq!(NoteMode::parse(&serde_json::json!("bogus")), None);
     }
 
     #[test]

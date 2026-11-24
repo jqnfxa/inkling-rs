@@ -40,18 +40,30 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, `/v1/streams/looku
 - The server ends a thinking block (it writes the tokens that close it, then the model answers) at
   `thinking_budget_tokens`, when a finite `max_tokens` has a quarter (at most 1024) left for the answer, or on
   `POST /v1/chat/completions/control {"action": "reasoning_end", "id": <completion id>}`.
-- Compaction, after [Pi](https://docs.pi.dev/latest/compaction): when the thinking of an answer comes within
-  `reserve_tokens` (16384) of the context size, the model writes a summary of its reasoning on the cache it has (task,
-  constraints, established facts, approaches tried, current approach, next steps, code), and the sequence is rebuilt as
-  the prompt, the summary and the last `keep_recent_tokens` (20000) of the thinking, cut at a line start. The rebuilt
-  sequence takes at most half the context before the reserve. The reply stays one message: the summary and a marker
-  `[context compacted: ...]` go to `reasoning_content`, and stream chunks carry `compaction: {stage, done, total}`
-  while it runs. At most `max_compactions` (8) per answer; then, or when a summary cannot fit, the thinking is closed at
-  the reserve and the model answers. `timings` leave compaction out of the decode time and report `compactions` and
-  `compact_ms`. Request field `compaction`: `false`, or `{enabled, reserve_tokens, keep_recent_tokens,
+- Compaction, after [Pi](https://docs.pi.dev/latest/compaction), inside an answer: when the thinking comes within
+  `reserve_tokens` (16384, or an eighth of a smaller `--ctx`) of the context size, the model writes a summary of its
+  reasoning on the cache it has (task, constraints, established facts, approaches tried, current approach, next steps,
+  code), and the sequence is rebuilt as the prompt, the summary and the last `keep_recent_tokens` (20000) of the
+  thinking, cut at a line start; it takes at most half the context before the reserve. The reply stays one message: the
+  summary and a marker `[context compacted: ...]` go to `reasoning_content`, and stream chunks carry
+  `compaction: {stage, done, total}` while it runs. At most `max_compactions` (8) per answer; then, or when a summary
+  cannot fit, the thinking is closed at the reserve and the model answers.
+- Compaction between turns: when a chat's prompt and the reserve do not fit, its older messages are serialized
+  (`[User]: ...`, `[Assistant]: ...`, tool calls and results, without the thinking), summarized in a separate
+  generation (in chunks, each updating the summary, when they are longer than the context), and replaced by one system
+  message; the last messages up to `keep_recent_tokens` stay, never split from a tool call. Summaries are kept by a hash
+  of the messages they cover, so the next turn of the same chat reuses the summary and the KV cache.
+- Compaction settings: request field `compaction`: `false`, or `{enabled, reserve_tokens, keep_recent_tokens,
   max_compactions, summary_tokens}`; server flags `--compact-reserve N`, `--compact-keep N`, `--compact-max N`,
-  `--no-compact`. `POST /v1/chat/completions/control {"action": "compact", "id": ...}` compacts now (also with
-  automatic compaction off). `IK_COMPACT_ROLE=system` asks for the summary in a system message instead of a user one.
+  `--no-compact`. `POST /v1/chat/completions/control {"action": "compact", "id": ...}` compacts the thinking now (also
+  with automatic compaction off). `timings` leave compaction out of the decode time and report `compactions` and
+  `compact_ms`. Summaries are asked for in a system message (`IK_COMPACT_ROLE=user`: a user message).
+- Progress notes, as chat apps show while a model thinks: `reasoning_summary`: `only` (also `auto`, `concise`,
+  `detailed`, as in OpenAI's API) sends notes in place of the raw thinking, `inline` between it, `off` (the default;
+  server flag `--reasoning-summary`). Every `reasoning_summary_interval` (1024; `--summary-every`) tokens of thinking,
+  the first after a quarter of it, the model writes a bold title and one or two sentences on what it is doing, on a
+  branch of the cache that is dropped after (its own context keeps the raw thinking); about 2.4 s each. Stream chunks
+  carry each note in `delta.reasoning_summary` too, and `timings` report `notes` and `notes_ms`.
 - `timings_per_token` puts `timings` on every chunk of a stream; `return_progress` adds `prompt_progress`.
 - The KV cache is reused when a prompt extends the previous one. When a chat UI sends the history again, the cache is
   rolled back to the end of the last prompt.
@@ -105,6 +117,7 @@ server takes `--ctx` up to what the VRAM holds (about 350k tokens, with no exper
 | `ik-check <model> <ref.bin> [slots]` | compares every tensor with a llama.cpp dump from `tools/refdump.cpp` |
 | `ik-pfcheck <model> <text> [n]` | prefill against decode |
 | `ik-rollback <model> [repeats]` | KV cache rollback against a fresh prefill |
+| `ik-branch <model> [tokens]` | a branch taken at a checkpoint and dropped, against no branch |
 | `ik-kbench`, `ik-kcmp` | GPU kernel timings; new kernels against the ones they replace |
 | `ik-cpubw <model> [threads..]` | CPU expert kernels, hot in cache and streaming from RAM |
 | `ik-attnmass <model> <text> <n>` | how much of the context full attention needs at depth n |

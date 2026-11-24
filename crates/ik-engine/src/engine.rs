@@ -230,6 +230,9 @@ pub struct Engine {
     snap_pos: Option<usize>,
     snap_conv: DevBuf,
     snap_swa: HostBuf,
+    /// a checkpoint to come back to after a short branch: its position and conv states
+    ckpt_pos: Option<usize>,
+    ckpt_conv: DevBuf,
     copy_s: Stream,       // async cache uploads
     stage: Vec<DevBuf>,   // raw Q5_0 downs being uploaded, repacked into the bank after
     stage_free: Vec<bool>,
@@ -475,6 +478,8 @@ impl Engine {
             pass_bank_t: (vec![], 0),
             snap_pos: None,
             snap_conv: DevBuf::new(n_slots * (2 * kv + 2 * n) * 3 * 4)?,
+            ckpt_pos: None,
+            ckpt_conv: DevBuf::new(n_slots * (2 * kv + 2 * n) * 3 * 4)?,
             snap_swa: HostBuf::new(n_slots * 2 * n_swa * kv_row())?,
             copy_s: Stream::new_nonblocking()?,
             stage: (0..STAGES).map(|_| DevBuf::new(down_bytes)).collect::<Result<_>>()?,
@@ -617,6 +622,7 @@ impl Engine {
         self.s.sync()?;
         self.pos = 0;
         self.tokens.clear();
+        self.ckpt_pos = None;
         Ok(())
     }
 
@@ -672,6 +678,35 @@ impl Engine {
             self.plan_kv(p + upcoming + 1)?;
         }
         Ok(p)
+    }
+
+    /// Marks the current position to come back to after a branch of at most T_MAX tokens (back_to_checkpoint). Only
+    /// the conv states are saved: the SWA rings hold T_MAX rows past the window, so such a branch does not overwrite
+    /// the rows the checkpoint's window needs, and the full-attention rows before it stay as they are.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        let per = self.conv[0].len;
+        for (il, c) in self.conv.iter().enumerate() {
+            cuda::copy_d2d(self.ckpt_conv.at(il * per), c.ptr, per, &self.s)?;
+        }
+        self.s.sync()?;
+        self.ckpt_pos = Some(self.pos);
+        Ok(())
+    }
+
+    /// Goes back to the checkpoint, dropping the branch after it.
+    pub fn back_to_checkpoint(&mut self) -> Result<()> {
+        let c = self.ckpt_pos.take().ok_or_else(|| "no checkpoint".to_string())?;
+        if c > self.pos || self.pos - c > T_MAX {
+            return Err(format!("a branch of {} tokens is too long to come back from", self.pos.saturating_sub(c)));
+        }
+        let per = self.conv[0].len;
+        for (il, c) in self.conv.iter().enumerate() {
+            cuda::copy_d2d(c.ptr, self.ckpt_conv.at(il * per), per, &self.s)?;
+        }
+        self.s.sync()?;
+        self.pos = c;
+        self.tokens.truncate(c);
+        Ok(())
     }
 
     /// The rows of the SWA ring that the positions max(0, pos - n_swa)..pos use: (first row, count) ranges.
@@ -737,6 +772,7 @@ impl Engine {
         }
         self.pos = p;
         self.tokens.truncate(p);
+        self.ckpt_pos = None;
         let w = self.hp.n_swa;
         for il in 0..self.kcache.len() {
             let ring = self.ring[il] as usize;

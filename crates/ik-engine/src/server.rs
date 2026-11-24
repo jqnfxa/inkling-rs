@@ -13,12 +13,21 @@ use serde_json::{Value, json};
 
 use crate::chat::{self, Delta, Parser};
 use crate::compact;
-use crate::engine::Engine;
+use crate::engine::{Engine, T_MAX};
 use crate::sampler::{Sampler, SamplingParams};
 use crate::tokenizer::Tokenizer;
 
+/// A chat request as it came, to render again with its older messages summarized (compaction between turns).
+pub struct ChatIn {
+    pub messages: Vec<Value>,
+    pub tools: Option<Value>,
+    pub effort: Option<Value>,
+}
+
 pub struct Job {
     pub prompt: Vec<u32>,
+    /// the chat the prompt was rendered from (None for a raw completion)
+    pub chat: Option<ChatIn>,
     pub params: SamplingParams,
     /// at most this many tokens, or until the context is full
     pub max_tokens: Option<usize>,
@@ -31,6 +40,8 @@ pub struct Job {
     pub control: Arc<Control>,
     /// compaction of the thinking when it fills the context
     pub compaction: compact::Settings,
+    /// progress notes on the thinking (reasoning_summary)
+    pub notes: compact::Notes,
     /// stream the prompt's progress (return_progress) and the timings of each token (timings_per_token)
     pub progress: bool,
     pub timings: bool,
@@ -59,8 +70,10 @@ pub enum Event {
     Delta(Delta),
     /// a compaction under way: the summary's tokens so far ("summary"), or the tokens of the rebuilt context ("rebuild")
     Compaction { stage: &'static str, done: usize, total: usize },
-    /// decode_s leaves out the compactions, which took compact_s
-    Done { finish: &'static str, prompt_tokens: usize, completion_tokens: usize, reused: usize, prefill_s: f64, decode_s: f64, compactions: usize, compact_s: f64 },
+    /// a progress note on the thinking
+    Note(String),
+    /// decode_s leaves out the compactions and the notes, which took aside.1 and aside.3
+    Done { finish: &'static str, prompt_tokens: usize, completion_tokens: usize, reused: usize, prefill_s: f64, decode_s: f64, aside: Aside },
     Error(String),
 }
 
@@ -93,10 +106,192 @@ impl Utf8Buf {
     }
 }
 
+/// Work beside the answer's decoding: compactions and their seconds, notes and their seconds.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Aside(pub usize, pub f64, pub usize, pub f64);
+
+/// The progress notes of one answer.
+struct Noter {
+    cfg: compact::Notes,
+    system: bool,
+    /// tokens of thinking since the last note
+    since: usize,
+    /// tokens waited for the end of a line
+    wait: usize,
+    count: usize,
+    secs: f64,
+}
+
+impl Noter {
+    /// A note is due: the first after a quarter of the interval, then one each interval.
+    fn due(&self) -> bool {
+        self.cfg.mode != compact::NoteMode::Off && self.since >= if self.count == 0 { (self.cfg.every / 4).max(64) } else { self.cfg.every.max(64) }
+    }
+
+    /// When the thinking ends: a last note on what came after the one before, if notes are all the client sees.
+    fn last_due(&self) -> bool {
+        self.cfg.mode == compact::NoteMode::Only && self.since >= 128
+    }
+}
+
+/// Generates text after `logits` until a control token or `cap` tokens; the last is not decoded, so the sequence
+/// grows by `cap` tokens at most. Sampled as the request asks but no hotter than 0.6 (at 1.0 a summary went on solving,
+/// at 0.3 it looped); a line that repeats an earlier one is dropped, and after 4 such the text ends. `on(piece, tokens
+/// kept so far)` sees each piece; false from it (the client left) stops it: Ok(None).
+fn generate(eng: &mut Engine, tok: &Tokenizer, mut logits: Vec<f32>, cap: usize, params: &SamplingParams, on: &mut dyn FnMut(&str, usize) -> bool) -> Result<Option<Vec<u32>>, String> {
+    let mut sampler = Sampler::new(SamplingParams { temperature: params.temperature.min(0.6), ..params.clone() });
+    let (mut out, mut utf8, mut lines) = (vec![], Utf8Buf::default(), compact::Lines::default());
+    for step in 1..=cap {
+        let t = sampler.sample(&logits, &eng.tokens, &[]);
+        if tok.is_control(t) || tok.eos.contains(&t) {
+            break;
+        }
+        out.push(t);
+        let piece = utf8.push(&tok.piece_bytes(t, false));
+        if let Some(at) = lines.push(out.len() - 1, &piece) {
+            out.truncate(at);
+        }
+        if !on(&piece, out.len()) {
+            return Ok(None);
+        }
+        if step == cap || lines.repeats >= 4 {
+            break;
+        }
+        logits = eng.decode(t)?;
+    }
+    Ok(Some(out))
+}
+
+/// Takes a progress note on a branch of the cache: the thinking ends, the request follows, the model writes the note,
+/// and the sequence goes back to the checkpoint, so the logits the caller holds stay right. Streams it; returns
+/// whether the client is still there.
+fn take_note(eng: &mut Engine, tok: &Tokenizer, nt: &mut Noter, params: &SamplingParams, tx: &Sender<Event>) -> Result<bool, String> {
+    let t0 = std::time::Instant::now();
+    nt.since = 0;
+    nt.wait = 0;
+    let req = tok.encode(&compact::note_request(nt.system), true);
+    // the branch stays within T_MAX tokens, which the checkpoint can come back from
+    if req.len() + 24 > T_MAX || eng.tokens.len() + T_MAX >= eng.n_ctx {
+        return Ok(true);
+    }
+    eng.checkpoint()?;
+    let logits = eng.extend(&req, &mut |_| {})?;
+    let out = generate(eng, tok, logits, T_MAX - req.len(), params, &mut |_, _| true)?.unwrap_or_default();
+    eng.back_to_checkpoint()?;
+    nt.secs += t0.elapsed().as_secs_f64();
+    let text = compact::clean_note(&format!("{}{}", compact::NOTE_START, tok.decode(&out, false)));
+    if text.is_empty() {
+        return Ok(true);
+    }
+    nt.count += 1;
+    let shown = if nt.cfg.mode == compact::NoteMode::Only { format!("{text}\n\n") } else { format!("\n\n{}\n\n", compact::quote(&text)) };
+    Ok(tx.send(Event::Note(text)).is_ok() && tx.send(Event::Delta(Delta::Reasoning(shown))).is_ok())
+}
+
+/// Summaries of the older messages of chats: (hash of the messages summarized, how many, the summary). The latest
+/// few, so that a chat UI that sends the whole history at each turn finds the summary made at an earlier turn.
+type Summaries = Vec<(u64, usize, String)>;
+
+/// The hash of each prefix of the messages: h[n] for messages[..n].
+fn prefix_hashes(msgs: &[Value]) -> Vec<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut h = vec![0u64];
+    for m in msgs {
+        let mut st = std::hash::DefaultHasher::new();
+        h.last().unwrap().hash(&mut st);
+        compact::message_key(m).hash(&mut st);
+        h.push(st.finish());
+    }
+    h
+}
+
+/// Compaction between turns, after Pi: when a chat's prompt and the reserve do not fit, the older messages are
+/// replaced by a summary (made now, in chunks if they are longer than the context, or made at an earlier turn of the
+/// same chat), and the last ones kept. Returns the new prompt and how many messages a new summary covers (0: a
+/// summary from before); None to keep the prompt there is.
+fn compact_history(eng: &mut Engine, tok: &Tokenizer, job: &Job, cache: &mut Summaries) -> Result<Option<(Vec<u32>, usize)>, String> {
+    let (Some(ch), cfg) = (&job.chat, &job.compaction) else { return Ok(None) };
+    let fits = |len: usize| len + cfg.reserve <= eng.n_ctx;
+    if !cfg.enabled || fits(job.prompt.len()) {
+        return Ok(None);
+    }
+    let msgs = &ch.messages;
+    let role = |m: &Value| m.get("role").and_then(Value::as_str).unwrap_or("").to_string();
+    let lead = msgs.iter().take_while(|m| role(m) == "system").count();
+    let render = |ms: &[Value], tools: bool| -> Result<Vec<u32>, String> { Ok(tok.encode(&chat::render(ms, if tools { ch.tools.as_ref() } else { None }, ch.effort.as_ref())?, true)) };
+    let with = |n: usize, summary: &str| -> Vec<Value> {
+        msgs[..lead].iter().cloned().chain(std::iter::once(compact::history_message(summary))).chain(msgs[n..].iter().cloned()).collect()
+    };
+    let h = prefix_hashes(msgs);
+    // a summary made at an earlier turn of this chat: the same prompt as then, so the KV cache is reused too
+    let cached = cache.iter().filter(|(hh, n, _)| *n > lead && *n < msgs.len() && h[*n] == *hh).max_by_key(|e| e.1).cloned();
+    if let Some((_, n, sum)) = &cached {
+        let p = render(&with(*n, sum), true)?;
+        if fits(p.len()) {
+            return Ok(Some((p, 0)));
+        }
+    }
+    // a new one, of the messages after the cached summary's (updating it) up to the ones kept
+    let (start, mut prev) = cached.map_or((lead, None), |(_, n, s)| (n, Some(s)));
+    let budget = cfg.summary_tokens.max(768);
+    let empty = render(&[], false)?.len();
+    let sizes: Vec<usize> = msgs.iter().map(|m| render(std::slice::from_ref(m), false).map(|p| p.len().saturating_sub(empty))).collect::<Result<_, _>>()?;
+    let roles: Vec<String> = msgs.iter().map(role).collect();
+    let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
+    let head = render(&msgs[..lead], true)?.len();
+    let keep = cfg.keep.min((eng.n_ctx.saturating_sub(cfg.reserve) / 2).saturating_sub(head + budget));
+    let Some(cut) = compact::cut_point(&sizes, &roles, start, keep) else { return Ok(None) };
+    // the summarized messages in chunks that fit with the request, the previous summary and the new one
+    let room = eng.n_ctx.saturating_sub(3 * budget + 1024).max(1024);
+    let mut chunks: Vec<Vec<String>> = vec![vec![]];
+    let mut used = 0;
+    for m in &msgs[start..cut] {
+        let mut text = compact::serialize(m);
+        let mut n = tok.encode(&text, false).len();
+        if n > room {
+            // one message larger than a chunk: its start and its end
+            let c: Vec<char> = text.chars().collect();
+            let k = c.len() * room / n / 2;
+            text = format!("{} [...] {}", c[..k].iter().collect::<String>(), c[c.len() - k..].iter().collect::<String>());
+            n = room;
+        }
+        if used + n > room && !chunks.last().unwrap().is_empty() {
+            chunks.push(vec![]);
+            used = 0;
+        }
+        chunks.last_mut().unwrap().push(text);
+        used += n;
+    }
+    let none = Value::String("none".into());
+    let (nchunks, total) = (chunks.len(), cut - start);
+    for c in chunks {
+        let req = compact::history_request(&c.join("\n\n"), prev.as_deref(), budget * 3 / 5);
+        let ids = tok.encode(&(chat::render(&req, None, Some(&none))? + chat::MESSAGE_MODEL + chat::CONTENT_TEXT), true);
+        let n_ids = ids.len();
+        let (logits, _) = eng.feed_progress(&ids, &mut |done, _| {
+            let _ = job.tx.send(Event::Compaction { stage: "history", done, total: n_ids });
+        })?;
+        let cap = budget.min(eng.n_ctx.saturating_sub(n_ids + 1));
+        let out = generate(eng, tok, logits, cap, &job.params, &mut |_, _| true)?.unwrap_or_default();
+        let text = tok.decode(&out, false).trim().to_string();
+        if text.is_empty() {
+            return Err("the summary of the earlier conversation came out empty".into());
+        }
+        prev = Some(text);
+    }
+    let summary = prev.unwrap_or_default();
+    eprintln!("history: {} messages summarized in {} chunks into {} chars, {} kept", total, nchunks, summary.len(), msgs.len() - cut);
+    cache.push((h[cut], cut, summary.clone()));
+    if cache.len() > 16 {
+        cache.remove(0);
+    }
+    Ok(Some((render(&with(cut, &summary), true)?, total)))
+}
+
 /// The compactions of one answer.
 struct Compactor {
     cfg: compact::Settings,
-    /// ask for the summary in a system message rather than a user one (IK_COMPACT_ROLE=system)
+    /// ask for the summary in a system message rather than a user one (unless IK_COMPACT_ROLE=user)
     system: bool,
     /// the end of the model's thinking tag in the sequence, once found
     open_end: Option<usize>,
@@ -126,7 +321,7 @@ enum Compacted {
 /// Compacts the thinking that fills the context: asks the model for a summary on the cache it has, then rebuilds the
 /// sequence as the prompt, the model's message up to its thinking tag, the summary, and the end of the thinking.
 /// The prompt ends at `prompt_end`, where the engine's snapshot is.
-fn compact(eng: &mut Engine, tok: &Tokenizer, c: &mut Compactor, prompt_end: usize, params: &SamplingParams, tx: &Sender<Event>) -> Compacted {
+fn compact(eng: &mut Engine, tok: &Tokenizer, c: &mut Compactor, prompt_end: usize, params: &SamplingParams, show: bool, tx: &Sender<Event>) -> Compacted {
     let think = tok.token_id(chat::CONTENT_THINKING);
     let open_end = match c.open_end.or_else(|| eng.tokens[prompt_end..].iter().position(|&t| Some(t) == think).map(|i| prompt_end + i + 1)) {
         Some(e) => e,
@@ -151,40 +346,22 @@ fn compact(eng: &mut Engine, tok: &Tokenizer, c: &mut Compactor, prompt_end: usi
     let gone = |ev: Event| tx.send(ev).is_err();
 
     // the summary, on the cache: the thinking ends, the request follows, and the model answers it in plain text
-    if gone(Event::Delta(Delta::Reasoning(format!("\n\n{}", compact::SUMMARY_HEAD)))) {
+    if show && gone(Event::Delta(Delta::Reasoning(format!("\n\n{}", compact::SUMMARY_HEAD)))) {
         return Compacted::Gone;
     }
-    let mut logits = match eng.extend(&req, &mut |_| {}) {
+    let logits = match eng.extend(&req, &mut |_| {}) {
         Ok(l) => l,
         Err(e) => return Compacted::Error(e),
     };
-    // sampled as the answer is but no hotter than 0.6 (at 1.0 it went on solving, at 0.3 it looped); a line that
-    // repeats an earlier one is left out of it
-    let mut sampler = Sampler::new(SamplingParams { temperature: params.temperature.min(0.6), ..params.clone() });
-    let mut summary = vec![];
-    let mut utf8 = Utf8Buf::default();
-    let mut lines = compact::Lines::default();
-    while summary.len() < cap && lines.repeats < 4 {
-        let t = sampler.sample(&logits, &eng.tokens, &[]);
-        if tok.is_control(t) || tok.eos.contains(&t) {
-            break;
-        }
-        summary.push(t);
-        let piece = utf8.push(&tok.piece_bytes(t, false));
-        if let Some(at) = lines.push(summary.len() - 1, &piece) {
-            summary.truncate(at);
-        }
-        if !piece.is_empty() && gone(Event::Delta(Delta::Reasoning(piece))) {
-            return Compacted::Gone;
-        }
-        if summary.len() % 32 == 0 && gone(Event::Compaction { stage: "summary", done: summary.len(), total: cap }) {
-            return Compacted::Gone;
-        }
-        logits = match eng.decode(t) {
-            Ok(l) => l,
-            Err(e) => return Compacted::Error(e),
-        };
-    }
+    let r = generate(eng, tok, logits, cap, params, &mut |piece, n| {
+        (!show || piece.is_empty() || tx.send(Event::Delta(Delta::Reasoning(piece.to_string()))).is_ok())
+            && (n % 32 != 0 || tx.send(Event::Compaction { stage: "summary", done: n, total: cap }).is_ok())
+    });
+    let summary = match r {
+        Ok(Some(s)) => s,
+        Ok(None) => return Compacted::Gone,
+        Err(e) => return Compacted::Error(e),
+    };
 
     // the rebuilt sequence; a summary of almost nothing is left out, and as much of the thinking kept as fits
     let pieces: Vec<Vec<u8>> = body.iter().map(|&t| tok.piece_bytes(t, true)).collect();
@@ -222,16 +399,32 @@ fn compact(eng: &mut Engine, tok: &Tokenizer, c: &mut Compactor, prompt_end: usi
 /// The scheduler: owns the engine, runs the jobs in order, and keeps the cached sequence for the next prompt.
 pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
     let end_sampling = tok.token_id(chat::END_SAMPLING);
+    let end_message = tok.token_id(chat::END_MESSAGE);
     let eot = tok.token_id("<|endoftext|>");
-    let system_role = std::env::var("IK_COMPACT_ROLE").is_ok_and(|v| v == "system");
+    // the summary and note requests come as system messages (IK_COMPACT_ROLE=user: as user messages); on two traces
+    // of 6k tokens the system role's summaries listed more of the approaches tried, and no contradictions
+    let system_role = std::env::var("IK_COMPACT_ROLE").map_or(true, |v| v != "user");
     // what the model writes to close its thinking and begin the answer
     let close: Vec<(u32, &str)> = [chat::END_MESSAGE, chat::MESSAGE_MODEL, chat::CONTENT_TEXT].iter().filter_map(|&s| tok.token_id(s).map(|t| (t, s))).collect();
+    let mut summaries: Summaries = vec![];
     while let Ok(job) = rx.recv() {
+        // a chat longer than the context: its older messages summarized
+        let th = std::time::Instant::now();
+        let (prompt, summarized) = match compact_history(&mut eng, &tok, &job, &mut summaries) {
+            Ok(Some((p, n))) => (p, n),
+            Ok(None) => (job.prompt.clone(), 0),
+            Err(e) => {
+                let _ = job.tx.send(Event::Error(e));
+                let _ = eng.reset();
+                continue;
+            }
+        };
+        let hist_s = if summarized > 0 { th.elapsed().as_secs_f64() } else { 0.0 };
         let t0 = std::time::Instant::now();
-        let total = job.prompt.len();
+        let total = prompt.len();
         let tx = job.tx.clone();
         let progress = job.progress;
-        let fed = eng.feed_progress(&job.prompt, &mut |processed, cache| {
+        let fed = eng.feed_progress(&prompt, &mut |processed, cache| {
             if progress {
                 let _ = tx.send(Event::PromptProgress { processed, total, cache, ms: t0.elapsed().as_secs_f64() * 1e3 });
             }
@@ -245,6 +438,9 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
             }
         };
         let prefill_s = t0.elapsed().as_secs_f64();
+        if summarized > 0 {
+            let _ = job.tx.send(Event::Delta(Delta::Reasoning(format!("[earlier conversation compacted: {summarized} messages summarized]\n\n"))));
+        }
         let t1 = std::time::Instant::now();
         // no more than the context holds; a finite max_tokens keeps a quarter (up to 1024) for the answer after thinking
         let limit = job.max_tokens.unwrap_or(usize::MAX);
@@ -260,7 +456,13 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
         let mut finish = "length";
         let banned: Vec<u32> = vec![];
         let mut comp = Compactor { cfg: job.compaction.clone(), system: system_role, open_end: None, body: 0, count: 0, failed: false, secs: 0.0, wait: 0 };
+        let mut notes = Noter { cfg: job.notes.clone(), system: system_role, since: 0, wait: 0, count: 0, secs: 0.0 };
+        // notes in place of the thinking: the raw thinking is not sent
+        let hide = notes.cfg.mode == compact::NoteMode::Only;
         let send = |d: Delta, text: &mut String, stop_hit: &mut bool| -> bool {
+            if hide && matches!(d, Delta::Reasoning(_)) {
+                return true;
+            }
             if let Delta::Content(c) = &d {
                 *text += c;
                 if job.stop.iter().any(|s| !s.is_empty() && text.contains(s.as_str())) {
@@ -287,7 +489,7 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
                     comp.wait = 0;
                     job.control.compact.store(false, Ordering::Relaxed);
                     let tc = std::time::Instant::now();
-                    let r = compact(&mut eng, &tok, &mut comp, total, &job.params, &job.tx);
+                    let r = compact(&mut eng, &tok, &mut comp, total, &job.params, !hide, &job.tx);
                     comp.secs += tc.elapsed().as_secs_f64();
                     match r {
                         Compacted::Done(l) => {
@@ -311,9 +513,47 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
                     comp.wait += 1;
                 }
                 full = full && (comp.failed || comp.count >= comp.cfg.max);
+                // a progress note, at the end of a line (up to 64 tokens later)
+                if notes.due() {
+                    if line_end || notes.wait >= 64 {
+                        match take_note(&mut eng, &tok, &mut notes, &job.params, &job.tx) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                finish = "abort";
+                                break;
+                            }
+                            Err(e) => {
+                                let _ = job.tx.send(Event::Error(e));
+                                let _ = eng.reset();
+                                finish = "error";
+                                break;
+                            }
+                        }
+                    } else {
+                        notes.wait += 1;
+                    }
+                }
             }
             // the thinking is over its budget, or the user ended it: close it as the model would, and let it answer
-            if thinking && (full || n_think >= budget || job.control.end_reasoning.load(Ordering::Relaxed)) {
+            let closing = thinking && (full || n_think >= budget || job.control.end_reasoning.load(Ordering::Relaxed));
+            let t = if closing { None } else { Some(sampler.sample(&logits, &eng.tokens, &banned)) };
+            // the thinking ends (closed, or the model ends it): the last note, before the end goes into the cache
+            if thinking && notes.last_due() && (closing || t == end_message) {
+                match take_note(&mut eng, &tok, &mut notes, &job.params, &job.tx) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        finish = "abort";
+                        break;
+                    }
+                    Err(e) => {
+                        let _ = job.tx.send(Event::Error(e));
+                        let _ = eng.reset();
+                        finish = "error";
+                        break;
+                    }
+                }
+            }
+            let Some(t) = t else {
                 closed = true;
                 if n + close.len() >= limit || close.len() >= room {
                     break;
@@ -338,11 +578,11 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
                     };
                 }
                 continue;
-            }
-            let t = sampler.sample(&logits, &eng.tokens, &banned);
+            };
             n += 1;
             if parser.thinking() {
                 n_think += 1;
+                notes.since += 1;
             }
             if Some(t) == end_sampling || Some(t) == eot || tok.eos.contains(&t) {
                 // the end of the reply is part of the sequence, so the next turn continues it
@@ -351,7 +591,7 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
                 break;
             }
             if job.timings {
-                let decode_s = t1.elapsed().as_secs_f64() - comp.secs;
+                let decode_s = t1.elapsed().as_secs_f64() - comp.secs - notes.secs;
                 let _ = job.tx.send(Event::Tick { prompt_n: total - reused, cache_n: reused, prompt_s: prefill_s, n, decode_s });
             }
             let piece = utf8.push(&tok.piece_bytes(t, true));
@@ -386,13 +626,12 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
         }
         let _ = job.tx.send(Event::Done {
             finish,
-            prompt_tokens: job.prompt.len(),
+            prompt_tokens: total,
             completion_tokens: n,
             reused,
             prefill_s,
-            decode_s: t1.elapsed().as_secs_f64() - comp.secs,
-            compactions: comp.count,
-            compact_s: comp.secs,
+            decode_s: t1.elapsed().as_secs_f64() - comp.secs - notes.secs,
+            aside: Aside(comp.count + (summarized > 0) as usize, comp.secs + hist_s, notes.count, notes.secs),
         });
     }
 }
@@ -476,6 +715,20 @@ pub struct Site {
     pub ui: Option<std::path::PathBuf>,
     /// compaction unless a request says otherwise
     pub compaction: compact::Settings,
+    /// progress notes unless a request says otherwise
+    pub notes: compact::Notes,
+}
+
+/// The request's `reasoning_summary` (or `reasoning.summary`) and `reasoning_summary_interval` over the server's.
+fn notes_of(r: &Value, d: &compact::Notes) -> Result<compact::Notes, String> {
+    let mut n = d.clone();
+    if let Some(v) = r.get("reasoning_summary").or_else(|| r.pointer("/reasoning/summary")) {
+        n.mode = compact::NoteMode::parse(v).ok_or_else(|| format!("reasoning_summary {v}: off, inline or only"))?;
+    }
+    if let Some(e) = r.get("reasoning_summary_interval").and_then(Value::as_u64) {
+        n.every = e as usize;
+    }
+    Ok(n)
 }
 
 /// The request's `compaction` (`false`, or {enabled, reserve_tokens, keep_recent_tokens, max_compactions,
@@ -556,6 +809,7 @@ fn handle(mut stream: TcpStream, jobs: Sender<Job>, tok: Arc<Tokenizer>, model: 
                 Ok(v) => v,
                 Err(e) => return respond(&mut stream, 400, &json!({"error": {"message": format!("bad JSON: {e}")}})),
             };
+            let mut chat_in = None;
             let prompt = if chat {
                 let msgs = r.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
                 // thinking switched off (the llama.cpp UI sends enable_thinking: false): the lowest effort
@@ -563,10 +817,12 @@ fn handle(mut stream: TcpStream, jobs: Sender<Job>, tok: Arc<Tokenizer>, model: 
                 let effort = r.get("reasoning_effort").or_else(|| r.pointer("/chat_template_kwargs/reasoning_effort")).or_else(|| {
                     (r.pointer("/chat_template_kwargs/enable_thinking") == Some(&Value::Bool(false))).then_some(&off)
                 });
-                match chat::render(&msgs, r.get("tools"), effort) {
+                let p = match chat::render(&msgs, r.get("tools"), effort) {
                     Ok(p) => p,
                     Err(e) => return respond(&mut stream, 400, &json!({"error": {"message": e}})),
-                }
+                };
+                chat_in = Some(ChatIn { messages: msgs.clone(), tools: r.get("tools").cloned(), effort: effort.cloned() });
+                p
             } else {
                 r.get("prompt").and_then(Value::as_str).unwrap_or("").to_string()
             };
@@ -581,6 +837,10 @@ fn handle(mut stream: TcpStream, jobs: Sender<Job>, tok: Arc<Tokenizer>, model: 
             let thinking_budget = r.get("thinking_budget_tokens").and_then(Value::as_i64).filter(|&b| b >= 0).map(|b| b as usize);
             let streaming = r.get("stream").and_then(Value::as_bool).unwrap_or(false);
             let flag = |k: &str| streaming && r.get(k).and_then(Value::as_bool).unwrap_or(false);
+            let notes = match notes_of(&r, &site.notes) {
+                Ok(n) => n,
+                Err(e) => return respond(&mut stream, 400, &json!({"error": {"message": e}})),
+            };
             let id = format!("{}-{}{:03}", if chat { "chatcmpl" } else { "cmpl" }, now(), NEXT_ID.fetch_add(1, Ordering::Relaxed) % 1000);
             let control = Arc::new(Control::default());
             if let Ok(mut m) = RUNNING.lock() {
@@ -589,6 +849,7 @@ fn handle(mut stream: TcpStream, jobs: Sender<Job>, tok: Arc<Tokenizer>, model: 
             let (tx, rx) = channel();
             let job = Job {
                 prompt: ids,
+                chat: chat_in,
                 params: params_of(&r),
                 max_tokens,
                 thinking_budget,
@@ -596,6 +857,7 @@ fn handle(mut stream: TcpStream, jobs: Sender<Job>, tok: Arc<Tokenizer>, model: 
                 raw: !chat,
                 control,
                 compaction: compaction_of(&r, &site.compaction),
+                notes,
                 progress: flag("return_progress"),
                 timings: flag("timings_per_token"),
                 tx,
@@ -632,7 +894,8 @@ fn handle(mut stream: TcpStream, jobs: Sender<Job>, tok: Arc<Tokenizer>, model: 
     }
 }
 
-fn usage(p: usize, c: usize, reused: usize, prefill_s: f64, decode_s: f64, compactions: usize, compact_s: f64) -> Value {
+fn usage(p: usize, c: usize, reused: usize, prefill_s: f64, decode_s: f64, aside: Aside) -> Value {
+    let Aside(compactions, compact_s, notes, notes_s) = aside;
     let mut u = json!({
         "prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c,
         "prompt_tokens_details": {"cached_tokens": reused},
@@ -641,6 +904,10 @@ fn usage(p: usize, c: usize, reused: usize, prefill_s: f64, decode_s: f64, compa
     if compactions > 0 {
         u["timings"]["compactions"] = json!(compactions);
         u["timings"]["compact_s"] = json!(compact_s);
+    }
+    if notes > 0 {
+        u["timings"]["notes"] = json!(notes);
+        u["timings"]["notes_s"] = json!(notes_s);
     }
     u
 }
@@ -695,14 +962,20 @@ fn stream_reply(s: &mut TcpStream, rx: Receiver<Event>, id: &str, model: &str, c
                 c["compaction"] = json!({"stage": stage, "done": done, "total": total});
                 send(&c)
             }
-            Event::Done { finish, prompt_tokens, completion_tokens, reused, prefill_s, decode_s, compactions, compact_s } => {
+            Event::Note(t) => send(&with_tick(chunk(id, model, chat, json!({"reasoning_summary": t}), None), &tick)),
+            Event::Done { finish, prompt_tokens, completion_tokens, reused, prefill_s, decode_s, aside } => {
                 let finish = if ntool > 0 && finish == "stop" { "tool_calls" } else { finish };
                 let mut last = chunk(id, model, chat, json!({}), Some(finish));
-                last["usage"] = usage(prompt_tokens, completion_tokens, reused, prefill_s, decode_s, compactions, compact_s);
+                last["usage"] = usage(prompt_tokens, completion_tokens, reused, prefill_s, decode_s, aside);
                 last["timings"] = timings(prompt_tokens, completion_tokens, reused, prefill_s, decode_s);
+                let Aside(compactions, compact_s, notes, notes_s) = aside;
                 if compactions > 0 {
                     last["timings"]["compactions"] = json!(compactions);
                     last["timings"]["compact_ms"] = json!(compact_s * 1e3);
+                }
+                if notes > 0 {
+                    last["timings"]["notes"] = json!(notes);
+                    last["timings"]["notes_ms"] = json!(notes_s * 1e3);
                 }
                 send(&last);
                 let _ = write!(s, "data: [DONE]\n\n");
@@ -736,23 +1009,27 @@ fn timings(prompt_tokens: usize, completion_tokens: usize, reused: usize, prefil
 }
 
 fn whole_reply(s: &mut TcpStream, rx: Receiver<Event>, id: &str, model: &str, chat: bool) {
-    let (mut content, mut reasoning) = (String::new(), String::new());
+    let (mut content, mut reasoning, mut summary) = (String::new(), String::new(), vec![]);
     let mut tools = vec![];
     for ev in rx {
         match ev {
             Event::PromptProgress { .. } | Event::Tick { .. } | Event::Compaction { .. } => {}
             Event::Delta(Delta::Content(c)) => content += &c,
             Event::Delta(Delta::Reasoning(r)) => reasoning += &r,
+            Event::Note(t) => summary.push(t),
             Event::Delta(Delta::ToolCall(name, args)) => {
                 tools.push(json!({"id": format!("call_{}", tools.len() + 1), "type": "function", "function": {"name": name, "arguments": args}}))
             }
-            Event::Done { finish, prompt_tokens, completion_tokens, reused, prefill_s, decode_s, compactions, compact_s } => {
+            Event::Done { finish, prompt_tokens, completion_tokens, reused, prefill_s, decode_s, aside } => {
                 let finish = if !tools.is_empty() && finish == "stop" { "tool_calls" } else { finish };
-                let u = usage(prompt_tokens, completion_tokens, reused, prefill_s, decode_s, compactions, compact_s);
+                let u = usage(prompt_tokens, completion_tokens, reused, prefill_s, decode_s, aside);
                 let body = if chat {
                     let mut msg = json!({"role": "assistant", "content": content});
                     if !reasoning.is_empty() {
                         msg["reasoning_content"] = Value::String(reasoning.clone());
+                    }
+                    if !summary.is_empty() {
+                        msg["reasoning_summary"] = Value::String(summary.join("\n\n"));
                     }
                     if !tools.is_empty() {
                         msg["tool_calls"] = Value::Array(tools.clone());
