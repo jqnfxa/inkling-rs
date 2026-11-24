@@ -10,6 +10,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 MODEL="${MODEL:-$HOME/models/Inkling-2-Mini-UD-Q4_K_XL.gguf}"
 BIN=target/release/inkling-server
+if [[ ! -f "$MODEL" ]]; then
+  echo "no model at $MODEL; download the official one (or set MODEL=path):" >&2
+  echo "  hf download unsloth/Inkling-2-Mini-GGUF Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file --local-dir ~/models/unsloth" >&2
+  echo "  mv ~/models/unsloth/Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file ~/models/Inkling-2-Mini-UD-Q4_K_XL.gguf" >&2
+  echo "the engine takes NVFP4/Q8_0 experts only (older Q4_K GGUFs run on commit 040bdfd)" >&2
+  exit 1
+fi
 # rebuild if the sources changed (a no-op otherwise); CPU features are detected at run time
 cargo build --release -q -p ik-engine --bin inkling-server
 # the browser UI: llama.cpp's chat app in ./ui (tools/fetch-ui.sh downloads it); API only without it
