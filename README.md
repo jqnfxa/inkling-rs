@@ -23,8 +23,7 @@ to the official GGUF and are to be measured again.
 ## Run
 
 ```sh
-hf download unsloth/Inkling-2-Mini-GGUF Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file --local-dir /tmp/inkling
-mv /tmp/inkling/Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file ~/models/Inkling-2-Mini-UD-Q4_K_XL.gguf
+tools/fetch-model.sh     # the model, into ~/models/unsloth/ (resumes after a dropped connection)
 tools/fetch-ui.sh        # llama.cpp's chat UI, into ./ui (optional)
 ./run-inkling-rs.sh      # builds, then serves on http://127.0.0.1:8080
 ```
@@ -49,8 +48,26 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
   code), and the sequence is rebuilt as the prompt, the summary and the last `keep_recent_tokens` (20000) of the
   thinking, cut at a line start; it takes at most half the context before the reserve. The reply stays one message: the
   summary and a marker `[context compacted: ...]` go to `reasoning_content`, and stream chunks carry
-  `compaction: {stage, done, total}` while it runs. At most `max_compactions` (8) per answer; then, or when a summary
-  cannot fit, the thinking is closed at the reserve and the model answers.
+  `compaction: {stage, done, total}` while it runs (`summary`, then `rebuild`). At most `max_compactions` (8) per
+  answer; then, or when a summary cannot fit, the thinking is closed at the reserve (a chunk with stage `closed`) and
+  the model answers.
+- In a tool-using turn the compaction covers the whole turn, everything after the last user message: the model's
+  earlier messages of the turn with their thinking, its tool calls and their results, and the thinking under way. The
+  sequence is rebuilt as the prompt up to the turn, then one model message whose thinking is the summary and the
+  turn's last `keep_recent_tokens` kept verbatim (tool calls and results in it as they were); a later compaction of
+  the turn updates that summary. When a request's prompt and the reserve do not fit and the overflow is in its current
+  turn, the prompt is fed up to the threshold (cut at a line end or between messages), the turn compacted the same
+  way, and the rest fed after it, as often as it takes (stages `summary` and `rebuild` too, before the reply's text).
+- Replies the server ended (stop or tool calls) are kept as the token sequence the cache holds, by a hash of the
+  messages they stand for: the request's and the reply as a client sends it back (tool-call ids, content and
+  arguments; the thinking, which may hold summaries, does not count). When the next request is that history plus
+  messages that are not the user's (tool results), its prompt is the kept sequence and the new messages rendered after
+  it: the cache is reused to the token (the model's own tokenization, which a new rendering of its text need not
+  give), and a compacted turn stays compacted. The latest 16 are kept. A history that matches none (other ids, an
+  edited message, a restarted server) is rendered as it is.
+- Tool-call ids are unique (`call_<completion>_<n>`); a tool result's name is its nearest call with that id. Tool-call
+  arguments come back as they were written: JSON objects as their text, arguments that do not parse verbatim (a
+  malformed call the model wrote renders back as it was, instead of failing the request).
 - Compaction between turns: when a chat's prompt and the reserve do not fit, its older messages are serialized
   (`[User]: ...`, `[Assistant]: ...`, tool calls and results, without the thinking), summarized in a separate
   generation (in chunks, each updating the summary, when they are longer than the context), and replaced by one system
@@ -138,6 +155,10 @@ cache left).
 | `ik-cpubench <model>` | CPU expert kernels on real rows, one token and batched |
 | `ik-moecheck` | the GPU expert kernels (decode and prefill) against the CPU ones, on random banks |
 | `ik-attnmass <model> <text> <n>` | how much of the context full attention needs at depth n |
+
+`tools/agentic-check.py [--url U] [--until 90000]` drives one long tool-using turn against a running server and
+checks that it compacts without closing the thinking, that each call after the first reuses 95% of its prompt from the
+cache, and that a malformed tool call in the history is accepted.
 
 `IK_FAKE_CPU=1` skips the CPU experts and so measures the GPU path alone; `IK_NO_GRAPH=1` (`ik-bench`) launches each
 kernel instead of one CUDA graph per token.

@@ -25,6 +25,8 @@ pub struct ChatIn {
 }
 
 pub struct Job {
+    /// the completion id (the ids of its tool calls derive from it)
+    pub id: String,
     pub prompt: Vec<u32>,
     /// the chat the prompt was rendered from (None for a raw completion)
     pub chat: Option<ChatIn>,
@@ -194,19 +196,6 @@ fn take_note(eng: &mut Engine, tok: &Tokenizer, nt: &mut Noter, params: &Samplin
 /// few, so that a chat UI that sends the whole history at each turn finds the summary made at an earlier turn.
 type Summaries = Vec<(u64, usize, String)>;
 
-/// The hash of each prefix of the messages: h[n] for messages[..n].
-fn prefix_hashes(msgs: &[Value]) -> Vec<u64> {
-    use std::hash::{Hash, Hasher};
-    let mut h = vec![0u64];
-    for m in msgs {
-        let mut st = std::hash::DefaultHasher::new();
-        h.last().unwrap().hash(&mut st);
-        compact::message_key(m).hash(&mut st);
-        h.push(st.finish());
-    }
-    h
-}
-
 /// Compaction between turns, after Pi: when a chat's prompt and the reserve do not fit, the older messages are
 /// replaced by a summary (made now, in chunks if they are longer than the context, or made at an earlier turn of the
 /// same chat), and the last ones kept. Returns the new prompt and how many messages a new summary covers (0: a
@@ -224,7 +213,7 @@ fn compact_history(eng: &mut Engine, tok: &Tokenizer, job: &Job, cache: &mut Sum
     let with = |n: usize, summary: &str| -> Vec<Value> {
         msgs[..lead].iter().cloned().chain(std::iter::once(compact::history_message(summary))).chain(msgs[n..].iter().cloned()).collect()
     };
-    let h = prefix_hashes(msgs);
+    let h = compact::prefix_hashes(compact::render_seed(ch.tools.as_ref(), ch.effort.as_ref()), msgs);
     // a summary made at an earlier turn of this chat: the same prompt as then, so the KV cache is reused too
     let cached = cache.iter().filter(|(hh, n, _)| *n > lead && *n < msgs.len() && h[*n] == *hh).max_by_key(|e| e.1).cloned();
     if let Some((_, n, sum)) = &cached {
@@ -295,11 +284,11 @@ struct Compactor {
     cfg: compact::Settings,
     /// ask for the summary in a system message rather than a user one (unless IK_COMPACT_ROLE=user)
     system: bool,
-    /// the end of the model's thinking tag in the sequence, once found
-    open_end: Option<usize>,
-    /// where the thinking kept verbatim begins, after the last summary
+    /// where the thinking kept verbatim begins, after the last summary (0 until a compaction of this answer)
     body: usize,
     count: usize,
+    /// of which while the prompt was fed (they do not count against cfg.max)
+    at_prompt: usize,
     /// a compaction did not fit: the thinking is closed at the reserve instead
     failed: bool,
     secs: f64,
@@ -320,34 +309,40 @@ enum Compacted {
     Error(String),
 }
 
-/// Compacts the thinking that fills the context: asks the model for a summary on the cache it has, then rebuilds the
-/// sequence as the prompt, the model's message up to its thinking tag, the summary, and the end of the thinking.
-/// The prompt ends at `prompt_end`, where the engine's snapshot is.
-fn compact(eng: &mut Engine, tok: &Tokenizer, c: &mut Compactor, prompt_end: usize, params: &SamplingParams, show: bool, tx: &Sender<Event>) -> Compacted {
-    let think = tok.token_id(chat::CONTENT_THINKING);
-    let open_end = match c.open_end.or_else(|| eng.tokens[prompt_end..].iter().position(|&t| Some(t) == think).map(|i| prompt_end + i + 1)) {
-        Some(e) => e,
-        None => return Compacted::NoRoom,
-    };
-    c.open_end = Some(open_end);
-    c.body = c.body.max(open_end);
-    let len = eng.tokens.len();
-    // the summary's length: a third of what it replaces, within 768..summary_tokens; the model is told it in words
-    let budget = ((len - open_end.min(len)) / 3).clamp(768, c.cfg.summary_tokens.max(768));
-    let req = tok.encode(&compact::request(c.count > 0, c.system, budget * 3 / 5), true);
+/// Compacts the turn that fills the context: everything after position `t`, where the turn starts (after the last
+/// user message, or the prompt's end): the model's earlier messages of the turn with their thinking, its tool calls
+/// and their results, and the thinking under way. Asks the model for a summary on the cache it has, then rebuilds the
+/// sequence as the tokens before `t`, and one model message whose thinking is the summary and the end of the turn
+/// kept verbatim (tool calls and results in it as they are). `close`: a section is open at the end of the sequence
+/// (false when a prompt fed in parts was cut between messages).
+fn compact(eng: &mut Engine, tok: &Tokenizer, c: &mut Compactor, t: usize, params: &SamplingParams, show: bool, tx: &Sender<Event>, close: bool) -> Compacted {
+    let open = tok.encode(&format!("{}{}", chat::MESSAGE_MODEL, chat::CONTENT_THINKING), true);
     let (head, tail) = (tok.encode(compact::SUMMARY_HEAD, false), tok.encode(compact::SUMMARY_TAIL, false));
-    // the rebuilt sequence takes half the context before the reserve at most, so that the next compaction is far
-    let target = eng.n_ctx.saturating_sub(c.cfg.reserve) / 2;
-    let fixed = open_end + head.len() + tail.len();
-    let cap = budget.min(c.cfg.summary_tokens).min(eng.n_ctx.saturating_sub(len + req.len() + 1)).min(target.saturating_sub(fixed));
-    if cap < 256 || len <= c.body {
+    let len = eng.tokens.len();
+    if t + open.len() >= len {
         return Compacted::NoRoom;
     }
-    let body: Vec<u32> = eng.tokens[c.body..len].to_vec();
-    let open: Vec<u32> = eng.tokens[prompt_end..open_end].to_vec();
+    let turn = &eng.tokens[t..len];
+    // a turn that begins with an earlier summary: it is updated
+    let again = turn.starts_with(&[open.as_slice(), head.as_slice()].concat());
+    let b = if c.body > t { c.body } else { t + compact::body_start(turn, &open, &head, &tail) };
+    let tools = tok.token_id(chat::CONTENT_TOOL_JSON).is_some_and(|j| turn.contains(&j));
+    let start = t + open.len();
+    // the summary's length: a third of what it replaces, within 768..summary_tokens; the model is told it in words
+    let budget = ((len - start) / 3).clamp(768, c.cfg.summary_tokens.max(768));
+    let req = tok.encode(&compact::request(again, c.system, budget * 3 / 5, close, tools), true);
+    // the rebuilt sequence takes half the context before the reserve at most, so that the next compaction is far
+    let target = eng.n_ctx.saturating_sub(c.cfg.reserve) / 2;
+    let fixed = start + head.len() + tail.len();
+    let cap = budget.min(c.cfg.summary_tokens).min(eng.n_ctx.saturating_sub(len + req.len() + 1)).min(target.saturating_sub(fixed));
+    if cap < 256 || len <= b {
+        return Compacted::NoRoom;
+    }
+    let body: Vec<u32> = eng.tokens[b..len].to_vec();
+    let base: Vec<u32> = eng.tokens[..t].to_vec();
     let gone = |ev: Event| tx.send(ev).is_err();
 
-    // the summary, on the cache: the thinking ends, the request follows, and the model answers it in plain text
+    // the summary, on the cache: the section ends, the request follows, and the model answers it in plain text
     if show && gone(Event::Delta(Delta::Reasoning(format!("\n\n{}", compact::SUMMARY_HEAD)))) {
         return Compacted::Gone;
     }
@@ -365,21 +360,29 @@ fn compact(eng: &mut Engine, tok: &Tokenizer, c: &mut Compactor, prompt_end: usi
         Err(e) => return Compacted::Error(e),
     };
 
-    // the rebuilt sequence; a summary of almost nothing is left out, and as much of the thinking kept as fits
+    // the rebuilt sequence; a summary of almost nothing is left out, and as much of the turn kept as fits
     let pieces: Vec<Vec<u8>> = body.iter().map(|&t| tok.piece_bytes(t, true)).collect();
     let failed = summary.len() < 32;
     let (seq, kept) = if failed {
-        compact::rebuild(&open, &[], &[], &[], &body, &pieces, target.saturating_sub(open_end))
+        compact::rebuild(&open, &[], &[], &[], &body, &pieces, target.saturating_sub(start))
     } else {
         compact::rebuild(&open, &head, &summary, &tail, &body, &pieces, c.cfg.keep.min(target.saturating_sub(fixed + summary.len())))
     };
+    let mut left = false;
+    // the state at the turn's start: the snapshot is there (the prompt ended there), or the tokens before it are fed
+    // again, which puts the snapshot there for the next compaction
+    let rebase = if eng.snapshot_pos() == Some(t) { 0 } else { base.len() };
+    let total = rebase + seq.len();
+    if rebase > 0 {
+        if let Err(e) = eng.feed_progress(&base, &mut |pos, _| left |= tx.send(Event::Compaction { stage: "rebuild", done: pos, total }).is_err()) {
+            return Compacted::Error(e);
+        }
+    }
     let p = match eng.rollback(seq.len()) {
         Ok(p) => p,
         Err(e) => return Compacted::Error(e),
     };
-    let total = seq.len();
-    let mut left = false;
-    let rebuilt = eng.extend(&seq, &mut |pos| left |= tx.send(Event::Compaction { stage: "rebuild", done: pos - p, total }).is_err());
+    let rebuilt = eng.extend(&seq, &mut |pos| left |= tx.send(Event::Compaction { stage: "rebuild", done: rebase + pos - p, total }).is_err());
     let logits = match rebuilt {
         Ok(l) => l,
         Err(e) => return Compacted::Error(e),
@@ -387,15 +390,90 @@ fn compact(eng: &mut Engine, tok: &Tokenizer, c: &mut Compactor, prompt_end: usi
     c.body = p + seq.len() - kept;
     c.count += 1;
     let note = if failed {
-        format!("\n[context compacted: no summary came, {} tokens of reasoning dropped, the last {kept} kept]\n\n", len - open_end - kept)
+        format!("\n[context compacted: no summary came, {} tokens of reasoning dropped, the last {kept} kept]\n\n", len - start - kept)
     } else {
-        format!("\n[context compacted: {} tokens of reasoning summarized in {}, the last {kept} kept]\n\n", len - open_end, summary.len())
+        format!("\n[context compacted: {} tokens of reasoning summarized in {}, the last {kept} kept]\n\n", len - start, summary.len())
     };
     if left || gone(Event::Delta(Delta::Reasoning(note))) {
         return Compacted::Gone;
     }
-    eprintln!("compaction {}: {} -> {} tokens ({} summary, {kept} kept)", c.count, len, eng.tokens.len(), summary.len());
+    eprintln!("compaction {}: {} -> {} tokens ({} summary, {kept} kept, turn at {t}{})", c.count, len, eng.tokens.len(), summary.len(), if rebase > 0 { ", fed again before it" } else { "" });
     Compacted::Done(logits)
+}
+
+/// The structure of tokens, for feed_cut.
+fn tags(tok: &Tokenizer, ids: &[u32]) -> Vec<compact::Tag> {
+    use compact::Tag;
+    let id = |s: &str| tok.token_id(s);
+    let opens: Vec<u32> = [chat::CONTENT_TEXT, chat::CONTENT_THINKING, chat::CONTENT_TOOL_JSON, chat::CONTENT_XML].iter().filter_map(|s| id(s)).collect();
+    let ends: Vec<u32> = [chat::END_MESSAGE, chat::END_SAMPLING].iter().filter_map(|s| id(s)).collect();
+    let heads: Vec<u32> = [chat::MESSAGE_MODEL, chat::MESSAGE_USER, chat::MESSAGE_SYSTEM, chat::MESSAGE_TOOL].iter().filter_map(|s| id(s)).collect();
+    ids.iter().map(|t| if opens.contains(t) { Tag::Open } else if ends.contains(t) { Tag::End } else if heads.contains(t) { Tag::Header } else { Tag::Text }).collect()
+}
+
+/// Feeds a prompt too long for the context whose overflow is in the current turn (it starts at `t`): up to the
+/// compaction threshold, cut at a line end or between messages; then the turn is compacted as during generation and
+/// the rest of the prompt follows, as many times as it takes. Returns the logits and the tokens reused.
+fn feed_turn(eng: &mut Engine, tok: &Tokenizer, c: &mut Compactor, prompt: &[u32], t: usize, params: &SamplingParams, show: bool, tx: &Sender<Event>, progress: &mut dyn FnMut(usize, usize)) -> Result<Option<(Vec<f32>, usize)>, String> {
+    let limit = eng.n_ctx.saturating_sub(c.cfg.reserve);
+    let tags = tags(tok, prompt);
+    let ends_line = |i: usize| tok.piece_bytes(prompt[i], true).last() == Some(&b'\n');
+    let (cut, mut close) = compact::feed_cut(&tags, &ends_line, t, limit.min(prompt.len()), 2048);
+    // the cache extended as it is when the prompt continues it past the turn's start; else the part before the turn
+    // first, so that the snapshot is where the compactions rebuild from
+    let extends = eng.tokens.len() > t && cut > eng.tokens.len() && prompt[..cut].starts_with(&eng.tokens);
+    let (mut logits, reused) = if extends {
+        eng.feed_progress(&prompt[..cut], progress)?
+    } else {
+        let (l, r) = eng.feed_progress(&prompt[..t], progress)?;
+        (if cut > t { eng.extend(&prompt[t..cut], &mut |pos| progress(pos, r))? } else { l }, r)
+    };
+    let mut fed = cut;
+    while fed < prompt.len() {
+        if c.at_prompt >= 64 {
+            return Err("the prompt does not fit in the context even compacted".into());
+        }
+        let tc = std::time::Instant::now();
+        let r = compact(eng, tok, c, t, params, show, tx, close);
+        c.secs += tc.elapsed().as_secs_f64();
+        c.at_prompt += 1;
+        match r {
+            Compacted::Done(_) => {}
+            Compacted::NoRoom => return Err(format!("the prompt ({} tokens) does not fit in the context, and its turn could not be compacted", prompt.len())),
+            Compacted::Gone => return Ok(None),
+            Compacted::Error(e) => return Err(e),
+        }
+        let room = limit.saturating_sub(eng.tokens.len());
+        if room < 1024 {
+            return Err("no room left after a compaction of the prompt".into());
+        }
+        // the rest when it fits, else up to the threshold again
+        let (next, cl) = if fed + room >= prompt.len() { (prompt.len(), true) } else { compact::feed_cut(&tags, &ends_line, fed, fed + room, 2048) };
+        // progress in the prompt's own positions: the compacted sequence is shorter than what was fed
+        let before = eng.tokens.len();
+        logits = eng.extend(&prompt[fed..next], &mut |pos| progress(fed + pos - before, reused))?;
+        (fed, close) = (next, cl);
+    }
+    Ok(Some((logits, reused)))
+}
+
+/// The prompt of a chat request: the sequence a stored reply ended with (an agentic client sending the history
+/// again, with the tool results after it) and the new messages rendered after it, or the request as rendered. Also
+/// where its turn starts (the end of the last user message), and the prefix hashes of its messages.
+fn prepare(tok: &Tokenizer, ch: &ChatIn, rendered: &[u32], seqs: &compact::Sequences) -> Result<(Vec<u32>, Option<usize>, Vec<u64>, bool), String> {
+    let (tools, effort) = (ch.tools.as_ref(), ch.effort.as_ref());
+    let h = compact::prefix_hashes(compact::render_seed(tools, effort), &ch.messages);
+    let roles: Vec<&str> = ch.messages.iter().map(|m| m.get("role").and_then(Value::as_str).unwrap_or("")).collect();
+    if let Some((k, s)) = seqs.find(&h, &roles) {
+        let mut p = s.tokens.clone();
+        p.extend(tok.encode(&chat::render_from(&ch.messages, k, tools, effort)?, true));
+        return Ok((p, Some(s.turn), h, true));
+    }
+    let turn = match roles.iter().rposition(|r| *r == "user") {
+        Some(u) => Some(tok.encode(&chat::render(&ch.messages[..=u], tools, effort)?, true).len()),
+        None => None,
+    };
+    Ok((rendered.to_vec(), turn, h, false))
 }
 
 /// The scheduler: owns the engine, runs the jobs in order, and keeps the cached sequence for the next prompt.
@@ -409,31 +487,66 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
     // what the model writes to close its thinking and begin the answer
     let close: Vec<(u32, &str)> = [chat::END_MESSAGE, chat::MESSAGE_MODEL, chat::CONTENT_TEXT].iter().filter_map(|&s| tok.token_id(s).map(|t| (t, s))).collect();
     let mut summaries: Summaries = vec![];
+    let mut seqs = compact::Sequences::default();
     while let Ok(job) = rx.recv() {
         if job.control.stop.load(Ordering::Relaxed) {
             continue; // stopped while it waited
         }
-        // a chat longer than the context: its older messages summarized
-        let th = std::time::Instant::now();
-        let (prompt, summarized) = match compact_history(&mut eng, &tok, &job, &mut summaries) {
-            Ok(Some((p, n))) => (p, n),
-            Ok(None) => (job.prompt.clone(), 0),
-            Err(e) => {
-                let _ = job.tx.send(Event::Error(e));
-                let _ = eng.reset();
-                continue;
-            }
+        let mut comp = Compactor { cfg: job.compaction.clone(), system: system_role, body: 0, count: 0, at_prompt: 0, failed: false, secs: 0.0, wait: 0 };
+        // notes in place of the thinking: the raw thinking is not sent
+        let hide = job.notes.mode == compact::NoteMode::Only;
+        // the prompt: the continuation of a stored sequence (a tool result after a reply of this server), or as
+        // rendered; and where the current turn starts
+        let (prompt, mut turn, hashes) = match &job.chat {
+            Some(ch) => match prepare(&tok, ch, &job.prompt, &seqs) {
+                Ok((p, t, h, _)) => (p, t, Some(h)),
+                Err(e) => {
+                    let _ = job.tx.send(Event::Error(e));
+                    continue;
+                }
+            },
+            None => (job.prompt.clone(), None, None),
         };
-        let hist_s = if summarized > 0 { th.elapsed().as_secs_f64() } else { 0.0 };
-        let t0 = std::time::Instant::now();
         let total = prompt.len();
+        let over = comp.cfg.enabled && total + comp.cfg.reserve > eng.n_ctx;
+        // the overflow is in the current turn when what comes before it leaves room for a compacted turn
+        let in_turn = turn.is_some_and(|t| t + 4096 <= eng.n_ctx.saturating_sub(comp.cfg.reserve) / 2);
+        let t0 = std::time::Instant::now();
         let tx = job.tx.clone();
         let progress = job.progress;
-        let fed = eng.feed_progress(&prompt, &mut |processed, cache| {
+        let mut on_progress = |processed: usize, cache: usize| {
             if progress {
                 let _ = tx.send(Event::PromptProgress { processed, total, cache, ms: t0.elapsed().as_secs_f64() * 1e3 });
             }
-        });
+        };
+        let (fed, prompt, summarized, hist_s) = if over && in_turn {
+            match feed_turn(&mut eng, &tok, &mut comp, &prompt, turn.unwrap(), &job.params, !hide, &job.tx, &mut on_progress) {
+                // the client left during a compaction: the cache stays as it is for the next request
+                Ok(None) => continue,
+                r => (r.map(Option::unwrap), prompt, 0, 0.0),
+            }
+        } else {
+            // a chat longer than the context, before its current turn: its older messages summarized
+            let th = std::time::Instant::now();
+            let (prompt, summarized) = if over {
+                match compact_history(&mut eng, &tok, &job, &mut summaries) {
+                    Ok(Some((p, n))) => {
+                        turn = None;
+                        (p, n)
+                    }
+                    Ok(None) => (prompt, 0),
+                    Err(e) => {
+                        let _ = job.tx.send(Event::Error(e));
+                        let _ = eng.reset();
+                        continue;
+                    }
+                }
+            } else {
+                (prompt, 0)
+            };
+            let hist_s = if summarized > 0 { th.elapsed().as_secs_f64() } else { 0.0 };
+            (eng.feed_progress(&prompt, &mut on_progress), prompt, summarized, hist_s)
+        };
         let (mut logits, reused) = match fed {
             Ok(r) => r,
             Err(e) => {
@@ -442,7 +555,11 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
                 continue;
             }
         };
-        let prefill_s = t0.elapsed().as_secs_f64();
+        // where a compaction rebuilds from: the turn's start, or the prompt's end
+        let turn_start = turn.unwrap_or(prompt.len()).min(prompt.len());
+        // compactions while the prompt was fed count as compaction time
+        let prefill_s = t0.elapsed().as_secs_f64() - comp.secs;
+        let comp0 = comp.secs;
         if summarized > 0 {
             let _ = job.tx.send(Event::Delta(Delta::Reasoning(format!("[earlier conversation compacted: {summarized} messages summarized]\n\n"))));
         }
@@ -460,11 +577,13 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
         let (mut n, mut n_think, mut closed, mut line_end) = (0, 0, false, true);
         let mut finish = "length";
         let banned: Vec<u32> = vec![];
-        let mut comp = Compactor { cfg: job.compaction.clone(), system: system_role, open_end: None, body: 0, count: 0, failed: false, secs: 0.0, wait: 0 };
         let mut notes = Noter { cfg: job.notes.clone(), system: system_role, since: 0, wait: 0, count: 0, secs: 0.0 };
-        // notes in place of the thinking: the raw thinking is not sent
-        let hide = notes.cfg.mode == compact::NoteMode::Only;
+        // the reply's tool calls (name, arguments), to store the sequence by the message a client sends back
+        let calls = std::cell::RefCell::new(Vec::<(String, String)>::new());
         let send = |d: Delta, text: &mut String, stop_hit: &mut bool| -> bool {
+            if let Delta::ToolCall(name, args) = &d {
+                calls.borrow_mut().push((name.clone(), args.clone()));
+            }
             if hide && matches!(d, Delta::Reasoning(_)) {
                 return true;
             }
@@ -494,12 +613,12 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
             if thinking {
                 full = comp.cfg.enabled && eng.tokens.len() + comp.cfg.reserve >= eng.n_ctx;
                 let asked = job.control.compact.load(Ordering::Relaxed);
-                let can = !comp.failed && comp.count < comp.cfg.max;
+                let can = !comp.failed && comp.count - comp.at_prompt < comp.cfg.max;
                 if (full || asked) && can && (line_end || comp.wait >= LINE_WAIT.min(comp.cfg.reserve / 4)) {
                     comp.wait = 0;
                     job.control.compact.store(false, Ordering::Relaxed);
                     let tc = std::time::Instant::now();
-                    let r = compact(&mut eng, &tok, &mut comp, total, &job.params, !hide, &job.tx);
+                    let r = compact(&mut eng, &tok, &mut comp, turn_start, &job.params, !hide, &job.tx, true);
                     comp.secs += tc.elapsed().as_secs_f64();
                     match r {
                         Compacted::Done(l) => {
@@ -522,7 +641,7 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
                 } else if (full || asked) && can {
                     comp.wait += 1;
                 }
-                full = full && (comp.failed || comp.count >= comp.cfg.max);
+                full = full && (comp.failed || comp.count - comp.at_prompt >= comp.cfg.max);
                 // a progress note, at the end of a line (up to 64 tokens later)
                 if notes.due() {
                     if line_end || notes.wait >= 64 {
@@ -546,6 +665,10 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
             }
             // the thinking is over its budget, or the user ended it: close it as the model would, and let it answer
             let closing = thinking && (full || n_think >= budget || job.control.end_reasoning.load(Ordering::Relaxed));
+            if closing && full {
+                // the thinking is closed at the reserve, uncompacted (no room for a summary, or max_compactions reached)
+                let _ = job.tx.send(Event::Compaction { stage: "closed", done: comp.count, total: comp.cfg.max });
+            }
             let t = if closing { None } else { Some(sampler.sample(&logits, &eng.tokens, &banned)) };
             // the thinking ends (closed, or the model ends it): the last note, before the end goes into the cache
             if thinking && notes.last_due() && (closing || t == end_message) {
@@ -601,7 +724,7 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
                 break;
             }
             if job.timings {
-                let decode_s = t1.elapsed().as_secs_f64() - comp.secs - notes.secs;
+                let decode_s = t1.elapsed().as_secs_f64() - (comp.secs - comp0) - notes.secs;
                 let _ = job.tx.send(Event::Tick { prompt_n: total - reused, cache_n: reused, prompt_s: prefill_s, n, decode_s });
             }
             let piece = utf8.push(&tok.piece_bytes(t, true));
@@ -634,13 +757,21 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
                 }
             };
         }
+        // a reply that ended as the model ends one: its sequence, for the client's next request in the same turn
+        if let (Some(h), Some(_)) = (&hashes, turn) {
+            if finish == "stop" && end_sampling.is_some() && eng.tokens.last() == end_sampling.as_ref() {
+                let reply = compact::reply_message(&job.id, &text, &calls.borrow());
+                let hash = compact::prefix_hashes(*h.last().unwrap(), std::slice::from_ref(&reply))[1];
+                seqs.put(compact::Sequence { hash, tokens: eng.tokens.clone(), turn: turn_start });
+            }
+        }
         let _ = job.tx.send(Event::Done {
             finish,
             prompt_tokens: total,
             completion_tokens: n,
             reused,
             prefill_s,
-            decode_s: t1.elapsed().as_secs_f64() - comp.secs - notes.secs,
+            decode_s: t1.elapsed().as_secs_f64() - (comp.secs - comp0) - notes.secs,
             aside: Aside(comp.count + (summarized > 0) as usize, comp.secs + hist_s, notes.count, notes.secs),
         });
     }
@@ -1000,6 +1131,7 @@ fn handle(mut stream: TcpStream, jobs: Sender<Job>, tok: Arc<Tokenizer>, model: 
             }
             let (tx, rx) = channel();
             let job = Job {
+                id: id.clone(),
                 prompt: ids,
                 chat: chat_in,
                 params: params_of(&r),
@@ -1173,7 +1305,7 @@ fn stream_body(s: &mut dyn Write, rx: &Receiver<Event>, id: &str, model: &str, c
             Event::Delta(Delta::Reasoning(r)) => send(s, &with_tick(chunk(id, model, chat, json!({"reasoning_content": r}), None), &tick)),
             Event::Delta(Delta::ToolCall(name, args)) => {
                 ntool += 1;
-                let c = chunk(id, model, chat, json!({"tool_calls": [{"index": ntool - 1, "id": format!("call_{ntool}"), "type": "function", "function": {"name": name, "arguments": args}}]}), None);
+                let c = chunk(id, model, chat, json!({"tool_calls": [{"index": ntool - 1, "id": compact::tool_call_id(id, ntool - 1), "type": "function", "function": {"name": name, "arguments": args}}]}), None);
                 send(s, &with_tick(c, &tick))
             }
             Event::Compaction { stage, done, total } => {
@@ -1234,7 +1366,7 @@ fn whole_reply(s: &mut TcpStream, rx: Receiver<Event>, id: &str, model: &str, ch
             Event::Delta(Delta::Reasoning(r)) => reasoning += &r,
             Event::Note(t) => summary.push(t),
             Event::Delta(Delta::ToolCall(name, args)) => {
-                tools.push(json!({"id": format!("call_{}", tools.len() + 1), "type": "function", "function": {"name": name, "arguments": args}}))
+                tools.push(json!({"id": compact::tool_call_id(id, tools.len()), "type": "function", "function": {"name": name, "arguments": args}}))
             }
             Event::Done { finish, prompt_tokens, completion_tokens, reused, prefill_s, decode_s, aside } => {
                 let finish = if !tools.is_empty() && finish == "stop" { "tool_calls" } else { finish };

@@ -666,6 +666,11 @@ impl Engine {
         Ok(logits)
     }
 
+    /// Where the snapshot that rollback goes back to is: the end of the last prompt fed.
+    pub fn snapshot_pos(&self) -> Option<usize> {
+        self.snap_pos
+    }
+
     /// Rolls the sequence back to the end of the last prompt, and gives the KV memory past it and `upcoming` more tokens
     /// back to the expert cache. Returns that position.
     pub fn rollback(&mut self, upcoming: usize) -> Result<usize> {
