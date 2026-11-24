@@ -28,6 +28,9 @@ const STAGES: usize = 24;
 /// Tokens of a prefill ubatch, at most.
 pub const T_MAX: usize = 256;
 
+/// The expert usage counts decay by this much at each token: an expert that every token uses counts about 100.
+const DECAY: f32 = 0.99;
+
 /// Bytes of a row (position) of the int8 KV cache: 8 kv heads of 128 int8, and a f16 scale per 32.
 const KV_ROW: usize = 1024 + 64;
 
@@ -871,6 +874,14 @@ impl Engine {
         self.admit_d(true)
     }
 
+    /// Multiplies the expert usage counts by k.
+    fn scale_usage(&self, k: f32) {
+        let mut u = self.pool.usage.lock().unwrap();
+        for f in u.freq.iter_mut().flatten() {
+            *f *= k;
+        }
+    }
+
     /// admit, with the decay of the usage counts once per token (`decay`), not at each layer of a prefill
     fn admit_d(&mut self, decay: bool) -> Result<()> {
         if self.cache.n_slots == 0 {
@@ -884,7 +895,7 @@ impl Engine {
             if decay {
                 for l in u.freq.iter_mut() {
                     for f in l.iter_mut() {
-                        *f *= 0.99;
+                        *f *= DECAY;
                     }
                 }
             }
@@ -962,6 +973,12 @@ impl Engine {
         if self.pos + nt > self.n_ctx {
             return Err(format!("context of {} tokens is full", self.n_ctx));
         }
+        // the usage counts as decode leaves them: each token decays them once, and the ubatch's uses count at their
+        // mean weight over it. With a decay per ubatch, a long prompt's experts counted thousands and held their slots
+        // for hundreds of tokens of decode after it.
+        let d = DECAY.powi(nt as i32);
+        let wt = (1.0 - d) / (nt as f32 * (1.0 - DECAY));
+        self.scale_usage(d / wt);
         if self.pos + nt > self.kv_mapped {
             self.plan_kv(self.pos + nt)?;
         }
@@ -1015,7 +1032,8 @@ impl Engine {
         self.pos += nt;
         self.tokens.extend_from_slice(toks);
         self.stats.tokens += nt as u64;
-        self.admit()?;
+        self.scale_usage(wt);
+        self.admit_d(false)?;
         Ok(logits)
     }
 

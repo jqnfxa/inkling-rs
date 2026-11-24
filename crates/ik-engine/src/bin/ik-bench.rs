@@ -1,5 +1,5 @@
 //! Decode speed: `ik-bench <model.gguf> [n_gen] [cache_slots] [prompt]`; IK_THREADS sets the expert threads, IK_NO_GRAPH
-//! launches each kernel instead of one CUDA graph per token.
+//! launches each kernel instead of one CUDA graph per token, IK_PREFILL prefills the prompt (else it is decoded).
 use ik_engine::engine::{Engine, Options, threads_from_env};
 use ik_engine::tokenizer::Tokenizer;
 
@@ -19,10 +19,15 @@ fn main() -> Result<(), String> {
     let ids = tok.encode(&prompt, true);
     let t1 = std::time::Instant::now();
     let mut logits = vec![];
-    for &t in &ids {
-        logits = e.decode(t)?;
+    let prefill = std::env::var("IK_PREFILL").is_ok();
+    if prefill {
+        logits = e.feed(&ids)?.0;
+    } else {
+        for &t in &ids {
+            logits = e.decode(t)?;
+        }
     }
-    eprintln!("prompt: {} tokens in {:?} ({:.1} t/s, one at a time)", ids.len(), t1.elapsed(), ids.len() as f64 / t1.elapsed().as_secs_f64());
+    eprintln!("prompt: {} tokens in {:?} ({:.1} t/s, {})", ids.len(), t1.elapsed(), ids.len() as f64 / t1.elapsed().as_secs_f64(), if prefill { "prefilled" } else { "one at a time" });
     let mut out = vec![];
     let t2 = std::time::Instant::now();
     let mut lap = std::time::Instant::now();
