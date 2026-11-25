@@ -1581,20 +1581,12 @@ pub mod gpu {
     }
 
     /// y[r] = W x for a repacked Q8_0 matrix (`qs` [rows][k] int8, `dw` [rows][k/32] f16) and q8_1 x (`xq`, `xd`).
-    /// k is a multiple of 32 and at most 4608. A half warp per row, 16 rows per block.
+    /// k is a multiple of 32 (x read through L1). A half warp per row, 16 rows per block.
     /// The body of gemv_q8d, for block b.
     fn gemv_q8d_body(qs: u64, dw: u64, xq: u64, xd: u64, y: u64, rows: u32, k: u32, b: u32) {
-        let xs: shared<[u8; 4608], 16>;
-        let ds: shared<[f32; 144], 16>;
-        let (xb, db, nb): (u32, u32, u32);
-        mov.u32(xb, xs);
-        mov.u32(db, ds);
+        // x straight from global memory: every block reads it, L1 keeps it
+        let nb: u32;
         shr.u32(nb, k, 5);
-        stage_bytes(xb, xq, k);
-        let nb4: u32;
-        shl.b32(nb4, nb, 2);
-        stage_bytes(db, xd, nb4);
-        bar.sync(0);
         let (t, hl, hw, row): (u32, u32, u32, u32);
         mov.u32(t, tid.x);
         and.b32(hl, t, 15);
@@ -1624,10 +1616,10 @@ pub mod gpu {
         mad.wide.u32(at, i, 1, qs);
         let (w0, w1, w2, w3): (u32, u32, u32, u32);
         ld.global.nc.v4.u32((w0, w1, w2, w3), [at]);
-        let xa: u32;
-        add.u32(xa, xb, c);
+        let xa: u64;
+        mad.wide.u32(xa, c, 1, xq);
         let (x0, x1, x2, x3): (u32, u32, u32, u32);
-        ld.shared.v4.u32((x0, x1, x2, x3), [xa]);
+        ld.global.nc.v4.u32((x0, x1, x2, x3), [xa]);
         let isum: s32;
         mov.s32(isum, 0);
         dp4a.s32.s32(isum, w0, x0, isum);
@@ -1635,14 +1627,14 @@ pub mod gpu {
         dp4a.s32.s32(isum, w2, x2, isum);
         dp4a.s32.s32(isum, w3, x3, isum);
         shr.u32(j, c, 5);
-        let (h, ja, dxa): (f16, u32, u32);
+        let (h, ja, dxa): (f16, u32, u64);
         add.u32(ja, j, rowd);
         mad.wide.u32(dat, ja, 2, dw);
         ld.global.nc.b16(h, [dat]);
         let (sw, sx, f): (f32, f32, f32);
         cvt.f32.f16(sw, h);
-        mad.lo.u32(dxa, j, 4, db);
-        ld.shared.f32(sx, [dxa]);
+        mad.wide.u32(dxa, j, 4, xd);
+        ld.global.nc.f32(sx, [dxa]);
         mul.rn.f32(sw, sw, sx);
         cvt.rn.f32.s32(f, isum);
         fma.rn.f32(acc, f, sw, acc);
