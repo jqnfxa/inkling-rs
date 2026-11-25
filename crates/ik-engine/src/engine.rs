@@ -44,6 +44,19 @@ fn kv_f16() -> bool {
     std::env::var("IK_KV_F16").is_ok()
 }
 
+/// Whether the full-attention KV caches are int4 (K and V, the default) or int8 (IK_KV=8); the sliding-window rings
+/// stay int8. Perplexity over 16k tokens of the model's reasoning: 1.6984 int8, 1.7058 int4 (+0.44%); the caches take
+/// 576 bytes a row and layer pass instead of 1088, and full attention over 131k keys 519 us instead of 727.
+fn kv_int4_env() -> bool {
+    !kv_f16() && std::env::var("IK_KV").as_deref() != Ok("8")
+}
+
+/// Bytes a row of the 4 parts of a full-attention cache take: K values, K scales, V values, V scales.
+fn kv_widths(int4: bool) -> [usize; 4] {
+    let v = if int4 { 512 } else { 1024 };
+    [v, 64, v, 64]
+}
+
 /// Bytes of a KV cache row.
 fn kv_row() -> usize {
     if kv_f16() { 2048 } else { KV_ROW }
@@ -53,7 +66,7 @@ const KV_STEP: usize = 2048;
 
 /// Decode attention: keys per chunk, log2, of the sliding window layers and of the full ones.
 const CS_SWA: u32 = 6;
-const CS_FULL: u32 = 7;
+const CS_FULL: u32 = 8;
 
 pub struct Options {
     pub n_ctx: usize,
@@ -198,6 +211,8 @@ pub struct Engine {
     /// the full-attention caches: int8 K, its scales, int8 V, its scales, at addresses for n_ctx rows; memory for kv_mapped
     kv_vm: Vec<Option<[VmBuf; 4]>>,
     kv_mapped: usize,
+    /// the full-attention caches are int4 (kv_int4_env)
+    kv_int4: bool,
     /// VRAM for the expert cache and the mapped rows of kv_vm together
     vram_budget: usize,
     kv_rows: Vec<usize>,
@@ -275,6 +290,7 @@ impl Engine {
         let mut kcache = vec![];
         let mut vcache = vec![];
         let mut kv_vm = vec![];
+        let kv_int4 = kv_int4_env();
         let mut kv_rows = vec![];
         let mut ring = vec![];
         let mut conv = vec![];
@@ -290,7 +306,8 @@ impl Engine {
                 let r = |b: usize| VmBuf::reserve(rows.div_ceil(KV_STEP) * KV_STEP * b, ctx.device);
                 kcache.push(None);
                 vcache.push(None);
-                kv_vm.push(Some([r(1024)?, r(64)?, r(1024)?, r(64)?]));
+                let [kw, ksw, vw, vsw] = kv_widths(kv_int4);
+                kv_vm.push(Some([r(kw)?, r(ksw)?, r(vw)?, r(vsw)?]));
             }
             kv_rows.push(rows);
             ring.push(if hp.is_swa[ip] { (hp.n_swa + T_MAX) as u32 } else { 0 });
@@ -463,6 +480,7 @@ impl Engine {
             kcache,
             vcache,
             kv_vm,
+            kv_int4,
             kv_mapped: 0,
             vram_budget,
             kv_rows,
@@ -500,7 +518,7 @@ impl Engine {
 
     /// Bytes of the full-attention KV caches with `rows` rows mapped.
     fn kv_bytes(&self, rows: usize) -> usize {
-        self.kv_vm.iter().flatten().map(|b| b.iter().zip([1024, 64, 1024, 64]).map(|(v, w)| v.pages_for(rows * w)).sum::<usize>()).sum()
+        self.kv_vm.iter().flatten().map(|b| b.iter().zip(kv_widths(self.kv_int4)).map(|(v, w)| v.pages_for(rows * w)).sum::<usize>()).sum()
     }
 
     /// Gives the full-attention KV caches memory for `rows` positions (rounded up to KV_STEP) and the expert cache the
@@ -521,8 +539,9 @@ impl Engine {
         self.copy_s.sync()?;
         self.join_uploads();
         let resize = |e: &mut Engine, rows: usize| -> Result<()> {
+            let widths = kv_widths(e.kv_int4);
             for b in e.kv_vm.iter_mut().flatten() {
-                for (v, w) in b.iter_mut().zip([1024, 64, 1024, 64]) {
+                for (v, w) in b.iter_mut().zip(widths) {
                     v.resize(rows * w, &e.s)?;
                 }
             }
@@ -718,6 +737,11 @@ impl Engine {
         let (start, count) = (q0 % ring, pos - q0);
         // (ring row, offset in the window, rows)
         if start + count <= ring { vec![(start, 0, count)] } else { vec![(start, 0, ring - start), (0, ring - start, count - (ring - start))] }
+    }
+
+    /// Whether slot il's KV cache is int4: the full-attention ones with kv_int4; the sliding-window rings are int8.
+    fn int4_at(&self, il: usize) -> bool {
+        self.kv_int4 && self.kv_vm[il].is_some()
     }
 
     /// The int8 values and the scales of slot il's K and V caches.
@@ -1202,7 +1226,11 @@ impl Engine {
         if kv_f16() {
             self.k.kv_store_t(&self.s, self.b.k.ptr, self.b.v.ptr, kv8[0], kv8[2], self.params.ptr, ring, kv as u32, kv as u32, kv as u32, ntu)?;
         } else {
-            self.k.kv_store8_t(&self.s, self.b.k.ptr, self.b.v.ptr, kv8, self.params.ptr, ring, kv as u32, kv as u32, ntu)?;
+            if self.int4_at(il) {
+                self.k.kv_store4_t(&self.s, self.b.k.ptr, self.b.v.ptr, kv8, self.params.ptr, kv as u32, kv as u32, ntu)?;
+            } else {
+                self.k.kv_store8_t(&self.s, self.b.k.ptr, self.b.v.ptr, kv8, self.params.ptr, ring, kv as u32, kv as u32, ntu)?;
+            }
         }
         let extent = if swa { hp.n_swa } else { hp.rel_extent } as u32;
         let window = if swa { hp.n_swa as u32 } else { u32::MAX };
@@ -1210,7 +1238,9 @@ impl Engine {
         if kv_f16() {
             self.k.attn_prefill(&self.s, self.b.q.ptr, self.b.r.ptr, sink, l.rel_bias.ptr, kv8[0], kv8[2], self.b.att.ptr, self.params.ptr, ring, window, extent, scale, nh as u32, nhd * nr, g0r, ntu)?;
         } else {
-            self.k.attn_prefill8(&self.s, self.b.q.ptr, self.b.r.ptr, sink, l.rel_bias.ptr, kv8, self.b.att.ptr, self.params.ptr, ring, window, extent, scale, nh as u32, nhd * nr, g0r, ntu)?;
+            let int4 = self.int4_at(il);
+            let l = &self.w.layers[ip];
+            self.k.attn_prefill8(&self.s, self.b.q.ptr, self.b.r.ptr, sink, l.rel_bias.ptr, kv8, self.b.att.ptr, self.params.ptr, ring, window, extent, scale, nh as u32, nhd * nr, g0r, ntu, int4)?;
         }
         self.probe("kqv_out", il, self.b.att.ptr, nt * nh)?;
         let gate = self.b.g0.at(nh * 4);
@@ -1485,7 +1515,10 @@ impl Engine {
         if kv_f16() {
             self.k.kv_prep(&self.s, !swa, self.sc.gk.ptr, self.sc.gv.ptr, l.k_conv.ptr, l.v_conv.ptr, st_k, self.sc.k.ptr, self.sc.v.ptr, kv8[0], kv8[2], p_pos, ring, cscale, hp.qk_clip, hp.eps)?;
         } else {
-            self.k.kv_prep8(&self.s, !swa, self.sc.gk.ptr, self.sc.gv.ptr, l.k_conv.ptr, l.v_conv.ptr, st_k, self.sc.k.ptr, self.sc.v.ptr, kv8, p_pos, ring, cscale, hp.qk_clip, hp.eps)?;
+            match self.int4_at(il) {
+                false => self.k.kv_prep8(&self.s, !swa, self.sc.gk.ptr, self.sc.gv.ptr, l.k_conv.ptr, l.v_conv.ptr, st_k, self.sc.k.ptr, self.sc.v.ptr, kv8, p_pos, ring, cscale, hp.qk_clip, hp.eps)?,
+                true => self.k.kv_prep4(&self.s, self.sc.gk.ptr, self.sc.gv.ptr, l.k_conv.ptr, l.v_conv.ptr, st_k, self.sc.k.ptr, self.sc.v.ptr, kv8, p_pos, cscale, hp.qk_clip, hp.eps)?,
+            }
         }
 
         // Q and R clip, scaled by tau on full attention
@@ -1511,7 +1544,9 @@ impl Engine {
             self.k.attn_part(&self.s, self.sc.q.ptr, self.sc.r.ptr, sink, l.rel_bias.ptr, kv8[0], kv8[2], self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, p_pos, ring, extent, scale, maxs, nsplit, window)?;
             self.k.attn_reduce(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, p_pos, window, maxs, hp.n_head as u32)?;
         } else {
-            self.k.attn_part8(&self.s, self.sc.q.ptr, self.sc.r.ptr, sink, l.rel_bias.ptr, kv8, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, p_pos, ring, extent, scale, maxs, nsplit, window, cs)?;
+            let int4 = self.int4_at(il);
+            let l = &self.w.layers[ip];
+            self.k.attn_part8(&self.s, self.sc.q.ptr, self.sc.r.ptr, sink, l.rel_bias.ptr, kv8, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, p_pos, ring, extent, scale, maxs, nsplit, window, cs, int4)?;
             if !swa {
                 // the per-chunk max and sum of each head: [kv head][chunk][3]
                 self.probe("attn_pm", il, self.sc.pm.ptr, 8 * maxs as usize * 3)?;
@@ -1638,8 +1673,10 @@ impl Engine {
             let nsplit = if ring != 0 { (hp.n_swa >> CS_SWA) as u32 } else { self.n_ctx.div_ceil(1 << CS_FULL) as u32 };
             let kv8 = self.kv8(kvi);
             let lr = &self.w.layers[kvi];
-            time!(format!("attn part+reduce {keys} keys"), keys as usize * KV_ROW * 2, {
-                self.k.attn_part8(&self.s, self.sc.q.ptr, self.sc.r.ptr, self.sc.g0.ptr, lr.rel_bias.ptr, kv8, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.params.ptr, ring, 1024, 0.088, maxs, nsplit, window, cs)?;
+            let int4 = self.int4_at(kvi);
+            let row: usize = if ring != 0 { KV_ROW * 2 } else { kv_widths(int4).iter().sum() };
+            time!(format!("attn part+reduce {keys} keys"), keys as usize * row, {
+                self.k.attn_part8(&self.s, self.sc.q.ptr, self.sc.r.ptr, self.sc.g0.ptr, lr.rel_bias.ptr, kv8, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.params.ptr, ring, 1024, 0.088, maxs, nsplit, window, cs, int4)?;
                 self.k.attn_reduce8(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, self.params.ptr, window, maxs, cs, hp.n_head as u32)?
             });
         }

@@ -116,8 +116,13 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
   quantizes its block for the down projection.
 - Prefill runs ubatches of 256 tokens: dp4a GEMMs, flash-style attention, and experts grouped so each is read once per
   ubatch (grouped GEMMs on the GPU, batched int8 kernels on the CPU).
-- The KV cache is int8 with an f16 scale per 32 values, as q8_0: 1088 bytes per position and layer pass. Perplexity over
-  1984 tokens is 6.4237, against 6.4402 with an f16 cache (`IK_KV_F16=1`).
+- The KV caches: the sliding-window passes' are int8 with an f16 scale per 32 values, as q8_0 (1088 bytes per position
+  and layer pass); the full-attention passes' are int4 (symmetric, stored plus 8, the same scales: 576 bytes).
+  Perplexity over 16k tokens of the model's own reasoning: 1.6984 with int8 full-attention caches (`IK_KV=8`), 1.7058
+  with int4 (+0.44%); over 1984 tokens, int8 against f16 (`IK_KV_F16=1`): 6.4237 against 6.4402.
+- Decode attention splits the keys into chunks of 256, a block per (kv head, chunk): the query quantized to int8 per 32
+  for dp4a scores, the values converted without `cvt` (each byte into the low byte of 2^23), 16-byte loads in the V
+  pass. Full attention over 131k keys takes 507 us per layer pass with int4 caches, 746 with int8 (831 before).
 - Kernels follow Marlin where it applies at these batch sizes: weights repacked into aligned layouts, 16-byte loads,
   int8 activations, one pass over each weight byte.
 - Serving follows mini-SGLang: HTTP front end, chat template and tokenizer, a scheduler thread that owns the engine, an
@@ -126,23 +131,25 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
 ## Context
 
 The model has 8 full-attention layer passes per token; the other 40 use a sliding window of 1024 tokens. The full
-passes' KV cache takes 17 KiB per token. It has addresses for all of `--ctx` from the start but memory only for the
-tokens in use, mapped in 2 MiB pages (CUDA virtual memory) as the context grows: the expert cache gets the rest, so a
-short chat runs with the whole budget (about 1260 slots) whatever `--ctx` is, and each 2048 tokens of context take
-about 7 slots back. A new chat that is shorter than the last gives the pages back to the expert cache.
+passes' KV cache takes 9 KiB per token (int4; 17 KiB with `IK_KV=8`). It has addresses for all of `--ctx` from the start
+but memory only for the tokens in use, mapped in 2 MiB pages (CUDA virtual memory) as the context grows: the expert
+cache gets the rest, so a short chat runs with the whole budget (about 1260 slots) whatever `--ctx` is, and each 2048
+tokens of context take about 4 slots back (7 with int8). A new chat that is shorter than the last gives the pages back
+to the expert cache.
 
-Decode slows as the context fills, from fewer expert slots and from attention over more keys (about 0.4 ms per token
+Decode slows as the context fills, from fewer expert slots and from attention over more keys (about 0.22 ms per token
 for each 8k tokens):
 
-| Context in use | Expert slots | Decode |
-|---|---|---|
-| short | 1260 | 50 t/s |
-| 64k | ~1036 | ~38 t/s |
-| 128k | ~800 | ~33 t/s |
+| Context in use | Expert slots | Decode | Prefill |
+|---|---|---|---|
+| 1k | 1267 | 51 t/s | |
+| 16k | 1238 | 44 t/s | 94 t/s |
+| 32k | 1203 | 38 t/s | 113 t/s |
+| 98k | 1079 | 40 t/s | 82 t/s |
 
-Measured (before the move to the official GGUF) with `ik-bench` at a short context with the slots capped, plus the
-attention time from `ik-kbench`; the server takes `--ctx` up to what the VRAM holds (about 350k tokens, with no expert
-cache left).
+Measured with `ik-ctx` on one long text (code and the model's reasoning), 512 tokens decoded at each depth, prefill
+the average up to it; the hit rate changes with the text, and runs vary 10-20% with load and heat. The server takes
+`--ctx` up to what the VRAM holds (by the cache size, about 650k tokens with no expert cache left).
 
 ## Tools
 
