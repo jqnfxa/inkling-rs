@@ -1,6 +1,9 @@
 //! The Inkling-2-Mini server: `inkling-server <model.gguf> [--host 127.0.0.1] [--port 8080] [--ctx 16384] [--slots N] [--ui DIR]
 //! [--compact-reserve min(16384, ctx/8)] [--compact-keep 20000] [--compact-max 8] [--no-compact]
-//! [--reasoning-summary off|inline|only] [--summary-every 1024]`
+//! [--reasoning-summary off|inline|only] [--summary-every 1024]
+//! [--temp 1.0] [--top-k 40] [--top-p 0.95] [--min-p 0.05] [--repeat-penalty 1.0] [--presence-penalty 0.0]
+//! [--frequency-penalty 0.0] [--repeat-last-n 64]`
+//! The sampling flags set the defaults; a request's own temperature, top_k, ... take precedence.
 //! OpenAI-compatible: /v1/chat/completions, /v1/completions, /v1/models, /health; /props as llama-server answers it, and
 //! with --ui the files of a browser UI at / (the llama.cpp chat UI: tools/fetch-ui.sh).
 #![recursion_limit = "256"]
@@ -36,6 +39,19 @@ fn main() -> Result<(), String> {
     if let Some(m) = arg(&a, "--reasoning-summary") {
         notes.mode = ik_engine::compact::NoteMode::parse(&serde_json::Value::String(m.clone())).ok_or(format!("--reasoning-summary {m}: off, inline or only"))?;
     }
+    let s = ik_engine::sampler::SamplingParams::default();
+    let real = |k: &str, d: f32| -> Result<f32, String> { arg(&a, k).map_or(Ok(d), |v| v.parse().map_err(|_| format!("{k} {v}: not a number"))) };
+    let sampling = ik_engine::sampler::SamplingParams {
+        temperature: real("--temp", s.temperature)?,
+        top_k: num("--top-k", s.top_k)?,
+        top_p: real("--top-p", s.top_p)?,
+        min_p: real("--min-p", s.min_p)?,
+        repeat_penalty: real("--repeat-penalty", s.repeat_penalty)?,
+        presence_penalty: real("--presence-penalty", s.presence_penalty)?,
+        frequency_penalty: real("--frequency-penalty", s.frequency_penalty)?,
+        repeat_last_n: num("--repeat-last-n", s.repeat_last_n)?,
+        seed: 0,
+    };
     if compaction.enabled && compaction.reserve >= n_ctx / 2 {
         return Err(format!("--compact-reserve {} must be under half of --ctx {n_ctx}", compaction.reserve));
     }
@@ -49,7 +65,8 @@ fn main() -> Result<(), String> {
     let tok = Arc::new(Tokenizer::from_gguf(&eng.g)?);
     let name = eng.g.str("general.name").unwrap_or("inkling").to_string();
     eprintln!("{name}: loaded in {:.1}s on {}, context {n_ctx}, {} expert cache slots (fewer as the context fills)", t0.elapsed().as_secs_f64(), eng.ctx.name, eng.cache.n_slots());
-    let site = site(&eng, &model, &name, n_ctx, ui.clone(), compaction, notes);
+    eprintln!("sampling unless a request says otherwise: temp {} top-k {} top-p {} min-p {} repeat-penalty {} presence-penalty {} frequency-penalty {} (last {})", sampling.temperature, sampling.top_k, sampling.top_p, sampling.min_p, sampling.repeat_penalty, sampling.presence_penalty, sampling.frequency_penalty, sampling.repeat_last_n);
+    let site = site(&eng, &model, &name, n_ctx, ui.clone(), compaction, notes, sampling);
     let (tx, rx) = std::sync::mpsc::channel();
     let addr = format!("{host}:{port}");
     let tok2 = tok.clone();
@@ -69,9 +86,9 @@ fn main() -> Result<(), String> {
 }
 
 /// /props and /v1/models in the form llama-server gives them, for the llama.cpp chat UI.
-fn site(eng: &Engine, path: &str, name: &str, n_ctx: usize, ui: Option<std::path::PathBuf>, compaction: ik_engine::compact::Settings, notes: ik_engine::compact::Notes) -> server::Site {
+fn site(eng: &Engine, path: &str, name: &str, n_ctx: usize, ui: Option<std::path::PathBuf>, compaction: ik_engine::compact::Settings, notes: ik_engine::compact::Notes, sampling: ik_engine::sampler::SamplingParams) -> server::Site {
     use serde_json::json;
-    let d = ik_engine::sampler::SamplingParams::default();
+    let d = &sampling;
     let template = eng.g.str("tokenizer.chat_template").unwrap_or("").to_string();
     let props = json!({
         "default_generation_settings": {
@@ -121,5 +138,5 @@ fn site(eng: &Engine, path: &str, name: &str, n_ctx: usize, ui: Option<std::path
             "meta": {"n_ctx": n_ctx, "n_ctx_train": 1048576, "n_vocab": eng.hp.n_vocab, "n_embd": eng.hp.n_embd}
         }]
     });
-    server::Site { props, models, ui, compaction, notes }
+    server::Site { props, models, ui, compaction, notes, sampling }
 }

@@ -39,6 +39,10 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
 - `reasoning_effort`: `none`, `minimal`, `low`, `medium`, `high` (the default), `xhigh`, `max`.
   `chat_template_kwargs.enable_thinking: false` is `none`.
 - As in llama-server, no `max_tokens` (or 0, -1) generates until the context is full.
+- Sampling: a request's `temperature`, `top_k` (0 = all), `top_p`, `min_p`, `repeat_penalty`, `presence_penalty`,
+  `frequency_penalty`, `repeat_last_n`, `seed`; otherwise the server's, set by `--temp`, `--top-k`, `--top-p`, `--min-p`,
+  `--repeat-penalty`, `--presence-penalty`, `--frequency-penalty`, `--repeat-last-n` (llama-server's defaults: 1.0,
+  40, 0.95, 0.05, 1.0, 0, 0, 64). Unsloth recommends `--temp 1.0 --top-k 0 --top-p 1.0 --min-p 0` for this model.
 - The server ends a thinking block (it writes the tokens that close it, then the model answers) at
   `thinking_budget_tokens`, when a finite `max_tokens` has a quarter (at most 1024) left for the answer, or on
   `POST /v1/chat/completions/control {"action": "reasoning_end", "id": <completion id>}`.

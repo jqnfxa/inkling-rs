@@ -858,8 +858,8 @@ fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn params_of(r: &Value) -> SamplingParams {
-    let d = SamplingParams::default();
+/// The request's sampling settings over the server's (`d`).
+fn params_of(r: &Value, d: &SamplingParams) -> SamplingParams {
     let f = |k: &str, dv: f32| r.get(k).and_then(Value::as_f64).map(|v| v as f32).unwrap_or(dv);
     SamplingParams {
         temperature: f("temperature", d.temperature),
@@ -869,7 +869,7 @@ fn params_of(r: &Value) -> SamplingParams {
         repeat_penalty: f("repeat_penalty", f("repetition_penalty", d.repeat_penalty)),
         presence_penalty: f("presence_penalty", d.presence_penalty),
         frequency_penalty: f("frequency_penalty", d.frequency_penalty),
-        repeat_last_n: d.repeat_last_n,
+        repeat_last_n: r.get("repeat_last_n").and_then(Value::as_u64).map_or(d.repeat_last_n, |v| v as usize),
         seed: r.get("seed").and_then(Value::as_u64).unwrap_or(0),
     }
 }
@@ -886,6 +886,8 @@ pub struct Site {
     pub compaction: compact::Settings,
     /// progress notes unless a request says otherwise
     pub notes: compact::Notes,
+    /// sampling settings unless a request says otherwise
+    pub sampling: SamplingParams,
 }
 
 /// The request's `reasoning_summary` (or `reasoning.summary`) and `reasoning_summary_interval` over the server's.
@@ -1134,7 +1136,7 @@ fn handle(mut stream: TcpStream, jobs: Sender<Job>, tok: Arc<Tokenizer>, model: 
                 id: id.clone(),
                 prompt: ids,
                 chat: chat_in,
-                params: params_of(&r),
+                params: params_of(&r, &site.sampling),
                 max_tokens,
                 thinking_budget,
                 stop,
