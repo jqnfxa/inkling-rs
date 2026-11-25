@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
-use crate::cpu::{Q8_0, dot_row, quantize_q8_0, quantize_q8_0_block};
+use crate::cpu::{Q8_0, c12_at, dot_row, quantize_q8_0, quantize_q8_0_block16};
 use crate::cpu_batch::dot_tokens;
 use crate::cuda::HostBuf;
 use crate::experts::Experts;
@@ -296,9 +296,12 @@ fn run_decode(sh: &Shared, cx: &Ctx, t: usize, epoch: u32) {
                 // SAFETY: block `blk` of miss m is written by this chunk alone, and read only after all are done
                 unsafe {
                     let qs = std::slice::from_raw_parts_mut((aq.qs.as_ptr() as *mut i8).add(blk * 32), 32);
-                    let (d, sum) = quantize_q8_0_block(&act, qs);
+                    let (d, sum, s16) = quantize_q8_0_block16(&act, qs);
                     *(aq.d.as_ptr() as *mut f32).add(blk) = d;
                     *(aq.sums.as_ptr() as *mut i32).add(blk) = sum;
+                    let (lo, hi) = c12_at(blk);
+                    *(aq.c12.as_ptr() as *mut i32).add(lo) = 12 * s16[0];
+                    *(aq.c12.as_ptr() as *mut i32).add(hi) = 12 * s16[1];
                 }
                 sh.gu_done.fetch_add(1, Ordering::Release);
             }
@@ -424,7 +427,7 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
             for h in w.bh.iter_mut().take(npairs) {
                 h.resize(2 * nff, 0.0);
             }
-            w.bact.resize_with(npairs.max(w.bact.len()), || Q8_0 { d: vec![], qs: vec![], sums: vec![] });
+            w.bact.resize_with(npairs.max(w.bact.len()), Q8_0::default);
             for c in &sh.next {
                 c.store(0, Ordering::Relaxed);
             }
@@ -482,7 +485,7 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
             let x = unsafe { std::slice::from_raw_parts(job.add(JOB_X) as *const f32, n) };
             quantize_q8_0(x, &mut w.xq);
             if w.aq.len() < n_miss {
-                w.aq.resize_with(n_miss, || Q8_0 { d: vec![0.0; nff / 32], qs: vec![0; nff], sums: vec![0; nff / 32] });
+                w.aq.resize_with(n_miss, || Q8_0 { d: vec![0.0; nff / 32], qs: vec![0; nff], sums: vec![0; nff / 32], c12: vec![0; nff / 16] });
             }
             w.out = cx.out;
             let g = sh.epoch.load(Ordering::Relaxed).wrapping_add(1);
