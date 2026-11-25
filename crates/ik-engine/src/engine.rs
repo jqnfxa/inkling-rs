@@ -1659,6 +1659,11 @@ impl Engine {
         time!("moe_nv4_d gate_up 8 experts", 8 * b0.gu_bytes, self.k.moe_d(&self.s, nv, b0.gu.ptr, b0.gu_bytes as u64, self.sc.slots.ptr, self.sc.xq.ptr, self.sc.xd.ptr, 0, self.sc.gu.ptr, 2 * ffu, n)?);
         time!("situ_q8 8 experts", 8 * 8 * ffu as usize, self.k.situ_q8(&self.s, self.sc.gu.ptr, self.sc.slots.ptr, self.sc.aq.ptr, self.sc.ad.ptr, self.sc.asum.ptr, ffu, 4.0, 25.0)?);
         time!("moe_nv4_d down 8 experts", 8 * b0.down_bytes, self.k.moe_d(&self.s, nv, b0.down.ptr, b0.down_bytes as u64, self.sc.slots.ptr, self.sc.aq.ptr, self.sc.ad.ptr, ffu, self.sc.dn.ptr, n, ffu)?);
+        let (q8, b1) = (crate::experts::Fmt::Q8, &self.cache.banks[1]);
+        if b1.n_slots >= 8 {
+            time!("moe_q8_d gate_up 8 experts", 8 * b1.gu_bytes, self.k.moe_d(&self.s, q8, b1.gu.ptr, b1.gu_bytes as u64, self.sc.slots.ptr, self.sc.xq.ptr, self.sc.xd.ptr, 0, self.sc.gu.ptr, 2 * ffu, n)?);
+            time!("moe_q8_d down 8 experts", 8 * b1.down_bytes, self.k.moe_d(&self.s, q8, b1.down.ptr, b1.down_bytes as u64, self.sc.slots.ptr, self.sc.aq.ptr, self.sc.ad.ptr, ffu, self.sc.dn.ptr, n, ffu)?);
+        }
         let maxs = self.maxs as u32;
         let mut cases = vec![(1024u32, (hp.n_swa + T_MAX) as u32, 6usize)];
         let mut keys = 4096;

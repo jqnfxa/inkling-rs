@@ -1967,13 +1967,12 @@ pub mod gpu {
     }
 
     /// y = W x for the 8 experts of `slots` (grid.y) on a Q8_0 bank in the slot layout of experts.rs: rows of k int8,
-    /// then the f16 scales (k/32 a row). x as in moe_nv4_d. 4 lanes per row (16-byte chunks), 64 rows per block.
-    #[reqntid(256)]
+    /// then the f16 scales (k/32 a row). x as in moe_nv4_d, threads and rows as there: 8 lanes per row (16-byte
+    /// chunks), 4 rows a thread, 64 rows per block of 128 threads; x read through L1. k a multiple of 32.
+    #[reqntid(128)]
     pub unsafe extern "ptx-kernel" fn moe_q8_d(
         bank: *const u8, slot_bytes: u64, slots: *const i32, xq: *const u8, xd: *const f32, xstride: u32, y: *mut f32, rows: u32, kdim: u32,
     ) {
-        let xs: shared<[u8; 2304], 16>;
-        let dsh: shared<[f32; 72], 16>;
         let ke: u32;
         mov.u32(ke, ctaid.y);
         let (sa, slot): (u64, s32);
@@ -1984,93 +1983,113 @@ pub mod gpu {
         if none {
             ret();
         }
-        let (xb, db, nb, nb4, aoff, boff): (u32, u32, u32, u32, u32, u32);
-        mov.u32(xb, xs);
-        mov.u32(db, dsh);
-        shr.u32(nb, kdim, 5);
-        shl.b32(nb4, nb, 2);
+        // x straight from global memory: every block of the expert reads it, L1 keeps it
+        let (aoff, boff): (u32, u32);
         mul.lo.u32(aoff, ke, xstride);
         shr.u32(boff, aoff, 5);
         let (xk, dk): (u64, u64);
         mad.wide.u32(xk, aoff, 1, xq);
         mad.wide.u32(dk, boff, 4, xd);
-        stage_bytes(xb, xk, kdim);
-        stage_bytes(db, dk, nb4);
-        bar.sync(0);
-        let (t, part, row): (u32, u32, u32);
+        let (t, lr, bk, row0, last): (u32, u32, u32, u32, u32);
         mov.u32(t, tid.x);
-        and.b32(part, t, 3);
-        let bk: u32;
+        and.b32(lr, t, 7);
         mov.u32(bk, ctaid.x);
-        shr.u32(row, t, 2);
-        mad.lo.u32(row, bk, 64, row);
+        shr.u32(row0, t, 3);
+        mad.lo.u32(row0, bk, 64, row0);
         let past: pred;
-        setp.ge.u32(past, row, rows);
+        setp.ge.u32(past, row0, rows);
         if past {
             ret();
         }
-        let (sl, base, qrow, drow): (u64, u64, u64, u64);
+        sub.u32(last, rows, 1);
+        let (sl, base): (u64, u64);
         cvt.u64.s32(sl, slot);
         mul.lo.u64(sl, sl, slot_bytes);
         add.u64(base, bank, sl);
-        mad.wide.u32(qrow, row, kdim, base);
-        let (qbytes, o): (u32, u32);
+        let (qbytes, sk): (u32, u32);
         mul.lo.u32(qbytes, rows, kdim);
-        shr.u32(o, kdim, 4);
-        mad.lo.u32(o, row, o, qbytes);
-        cvt.u64.u32(drow, o);
-        add.u64(drow, drow, base);
-        let (nc, c): (u32, u32);
+        shr.u32(sk, kdim, 4);
+        // a lane's chunks c = lr + 8i: values 16c.., in block c/2 = lr/2 + 4i
+        let (nc, c, g0): (u32, u32, u32);
         shr.u32(nc, kdim, 4);
-        mov.u32(c, part);
-        let acc: f32;
-        mov.f32(acc, 0.0);
+        mov.u32(c, lr);
+        shr.u32(g0, lr, 1);
+        // the thread's rows row0 + 16 r (past the end: the last row, computed, not stored)
+        let (qa, da): ([u64; 4], [u64; 4]);
+        for r in 0..4 {
+            let (rr, so): (u32, u32);
+            add.u32(rr, row0, r * 16);
+            min.u32(rr, rr, last);
+            mad.wide.u32(qa[r], rr, kdim, base);
+            mad.wide.u32(qa[r], lr, 16, qa[r]);
+            mad.lo.u32(so, rr, sk, qbytes);
+            mad.lo.u32(so, g0, 2, so);
+            cvt.u64.u32(da[r], so);
+            add.u64(da[r], da[r], base);
+        }
+        let (xo, xda): (u64, u64);
+        mad.wide.u32(xo, lr, 16, xk);
+        mad.wide.u32(xda, g0, 4, dk);
+        let acc: [f32; 4];
+        for r in 0..4 {
+            mov.f32(acc[r], 0.0);
+        }
         label(top);
         let done: pred;
         setp.ge.u32(done, c, nc);
         if done {
             bra(end);
         }
-        // chunk c: values 16c.., in block c/2
-        let (qa, xo, blk): (u64, u32, u32);
-        mad.wide.u32(qa, c, 16, qrow);
-        let (w0, w1, w2, w3): (u32, u32, u32, u32);
-        ld.global.nc.v4.u32((w0, w1, w2, w3), [qa]);
-        shl.b32(xo, c, 4);
-        add.u32(xo, xo, xb);
-        let (x0, x1, x2, x3): (u32, u32, u32, u32);
-        ld.shared.v4.u32((x0, x1, x2, x3), [xo]);
-        let isum: u32;
-        mov.u32(isum, 0);
-        dp4a.s32.s32(isum, w0, x0, isum);
-        dp4a.s32.s32(isum, w1, x1, isum);
-        dp4a.s32.s32(isum, w2, x2, isum);
-        dp4a.s32.s32(isum, w3, x3, isum);
-        shr.u32(blk, c, 1);
-        let (da, hd, dw, dx, f, xda): (u64, f16, f32, f32, f32, u32);
-        mad.wide.u32(da, blk, 2, drow);
-        ld.global.nc.b16(hd, [da]);
-        cvt.f32.f16(dw, hd);
-        mad.lo.u32(xda, blk, 4, db);
-        ld.shared.f32(dx, [xda]);
-        mul.rn.f32(dw, dw, dx);
-        cvt.rn.f32.s32(f, isum);
-        fma.rn.f32(acc, f, dw, acc);
-        add.u32(c, c, 4);
+        let (w0, w1, w2, w3, hd): ([u32; 4], [u32; 4], [u32; 4], [u32; 4], [f16; 4]);
+        for r in 0..4 {
+            ld.global.nc.v4.u32((w0[r], w1[r], w2[r], w3[r]), [qa[r]]);
+        }
+        for r in 0..4 {
+            ld.global.nc.b16(hd[r], [da[r]]);
+        }
+        let (x0, x1, x2, x3, dx): (u32, u32, u32, u32, f32);
+        ld.global.nc.v4.u32((x0, x1, x2, x3), [xo]);
+        ld.global.nc.f32(dx, [xda]);
+        for r in 0..4 {
+            let (isum, dw, f): (u32, f32, f32);
+            mov.u32(isum, 0);
+            dp4a.s32.s32(isum, w0[r], x0, isum);
+            dp4a.s32.s32(isum, w1[r], x1, isum);
+            dp4a.s32.s32(isum, w2[r], x2, isum);
+            dp4a.s32.s32(isum, w3[r], x3, isum);
+            cvt.f32.f16(dw, hd[r]);
+            mul.rn.f32(dw, dw, dx);
+            cvt.rn.f32.s32(f, isum);
+            fma.rn.f32(acc[r], f, dw, acc[r]);
+        }
+        add.u32(c, c, 8);
+        for r in 0..4 {
+            add.u64(qa[r], qa[r], 128);
+            add.u64(da[r], da[r], 8);
+        }
+        add.u64(xo, xo, 128);
+        add.u64(xda, xda, 16);
         bra(top);
         label(end);
-        for sh in [2, 1] {
-            let o: f32;
-            shfl.sync.bfly.b32(o, acc, sh, 31, 0xffff_ffff);
-            add.rn.f32(acc, acc, o);
+        for sh in [4, 2, 1] {
+            for r in 0..4 {
+                let o: f32;
+                shfl.sync.bfly.b32(o, acc[r], sh, 31, 0xffff_ffff);
+                add.rn.f32(acc[r], acc[r], o);
+            }
         }
         let first: pred;
-        setp.eq.u32(first, part, 0);
-        if first {
-            let (oi, oa): (u32, u64);
-            mad.lo.u32(oi, ke, rows, row);
+        setp.eq.u32(first, lr, 0);
+        for r in 0..4 {
+            let (rr, oi, oa, inr, store): (u32, u32, u64, pred, pred);
+            add.u32(rr, row0, r * 16);
+            setp.lt.u32(inr, rr, rows);
+            and.pred(store, inr, first);
+            mad.lo.u32(oi, ke, rows, rr);
             mad.wide.u32(oa, oi, 4, y);
-            st.global.f32([oa], acc);
+            if store {
+                st.global.f32([oa], acc[r]);
+            }
         }
     }
 

@@ -240,11 +240,11 @@ impl Kernels {
     /// (xstride 0) or each expert's at xq + ke xstride.
     #[allow(clippy::too_many_arguments)]
     pub fn moe_d(&self, s: &Stream, f: crate::experts::Fmt, bank: P, slot_bytes: u64, slots: P, xq: P, xd: P, xstride: u32, y: P, rows: u32, k: u32) -> Result<()> {
-        let (name, threads) = match f {
-            crate::experts::Fmt::Nv4 => ("moe_nv4_d", 128),
-            crate::experts::Fmt::Q8 => ("moe_q8_d", 256),
+        let name = match f {
+            crate::experts::Fmt::Nv4 => "moe_nv4_d",
+            crate::experts::Fmt::Q8 => "moe_q8_d",
         };
-        self.run(s, name, (rows.div_ceil(64), 8, 1), threads, &[&bank, &slot_bytes, &slots, &xq, &xd, &xstride, &y, &rows, &k])
+        self.run(s, name, (rows.div_ceil(64), 8, 1), 128, &[&bank, &slot_bytes, &slots, &xq, &xd, &xstride, &y, &rows, &k])
     }
 
     pub fn router_logits(&self, s: &Stream, w: P, x: P, logits: P, n_expert: u32, n: u32) -> Result<()> {
