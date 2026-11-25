@@ -21,8 +21,10 @@ fn random_mat(fmt: Fmt, rows: usize, k: usize, seed: &mut u64) -> Vec<u8> {
             for v in &mut b[..rows * k / 2] {
                 *v = rnd(seed) as u8;
             }
+            // one scale in 8 subnormal or 0 (0x00-0x07); never 0x7F, which experts::repack turns into 0x00
             for v in &mut b[rows * k / 2..rows * k / 2 + rows * k / 16] {
-                *v = 0x08 + (rnd(seed) % 40) as u8;
+                let r = rnd(seed);
+                *v = if r % 8 == 0 { (r >> 8) as u8 & 7 } else { 0x08 + ((r >> 8) % 40) as u8 };
             }
             let o = rows * k / 2 + rows * k / 16;
             b[o..o + 4].copy_from_slice(&(0.5 + (rnd(seed) % 100) as f32 / 100.0).to_le_bytes());

@@ -121,7 +121,11 @@ fn repack(fmt: Fmt, src: &[u8], rows: usize, k: usize, scale: f32, dst: &mut [u8
                     for j in 0..32 {
                         dst[o + j] = v[j] | (v[32 + j] << 4);
                     }
-                    dst[qs_end + r * k / 16 + b * 4..qs_end + r * k / 16 + b * 4 + 4].copy_from_slice(&blk[..4]);
+                    // the scales; 0x7F (NaN, decoded as 0) as 0x00, also 0, which the GPU decode needs no test for
+                    let so = qs_end + r * k / 16 + b * 4;
+                    for (d, &s) in dst[so..so + 4].iter_mut().zip(&blk[..4]) {
+                        *d = if s & 0x7F == 0x7F { 0 } else { s };
+                    }
                 }
             }
             let o = qs_end + rows * k / 16;

@@ -123,6 +123,9 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
 - Decode attention splits the keys into chunks of 256, a block per (kv head, chunk): the query quantized to int8 per 32
   for dp4a scores, the values converted without `cvt` (each byte into the low byte of 2^23), 16-byte loads in the V
   pass. Full attention over 131k keys takes 507 us per layer pass with int4 caches, 746 with int8 (831 before).
+- The GPU expert kernels decode E2M1 by table lookups in `prmt` (8 values in 13 instructions) for dp4a. In decode a
+  warp reads 128 contiguous bytes of each of 4 rows, a thread keeps 4 rows, and x comes through L1 (no shared-memory
+  staging, no barrier): the gate_up of 8 NVFP4 experts (2304 x 2304) takes 62 us (388 GB/s), the down 34 us.
 - Kernels follow Marlin where it applies at these batch sizes: weights repacked into aligned layouts, 16-byte loads,
   int8 activations, one pass over each weight byte.
 - Serving follows mini-SGLang: HTTP front end, chat template and tokenizer, a scheduler thread that owns the engine, an
