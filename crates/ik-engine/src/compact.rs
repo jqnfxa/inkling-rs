@@ -243,6 +243,11 @@ pub fn feed_cut(tags: &[Tag], ends_line: &dyn Fn(usize) -> bool, lo: usize, hi: 
     (hi, at(hi) != Tag::End)
 }
 
+/// Whether a section is open at position `at` of a prompt (tokens `tags`), as feed_cut tells of its cut.
+pub fn open_at(tags: &[Tag], at: usize) -> bool {
+    tags[..at].iter().rev().find(|&&t| t != Tag::Text).is_some_and(|&t| t != Tag::End)
+}
+
 /// Where the kept messages start: the last ones that fit in `keep` tokens (the last message always), from `start` on,
 /// never with a tool result first (its call goes with it). None if nothing before it would be summarized.
 pub fn cut_point(sizes: &[usize], roles: &[&str], start: usize, keep: usize) -> Option<usize> {
@@ -492,6 +497,18 @@ mod tests {
 
     fn pieces(s: &[&str]) -> Vec<Vec<u8>> {
         s.iter().map(|p| p.as_bytes().to_vec()).collect()
+    }
+
+    #[test]
+    fn open_at_follows_the_last_tag() {
+        use Tag::*;
+        // header, open, text, end (a reply), header, open, text (a tool result)
+        let tags = [Header, Open, Text, End, Header, Open, Text];
+        assert!(!open_at(&tags, 0));
+        assert!(open_at(&tags, 3));
+        assert!(!open_at(&tags, 4));
+        assert!(open_at(&tags, 5));
+        assert!(open_at(&tags, 7));
     }
 
     #[test]

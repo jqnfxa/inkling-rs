@@ -418,12 +418,17 @@ fn feed_turn(eng: &mut Engine, tok: &Tokenizer, c: &mut Compactor, prompt: &[u32
     let limit = eng.n_ctx.saturating_sub(c.cfg.reserve);
     let tags = tags(tok, prompt);
     let ends_line = |i: usize| tok.piece_bytes(prompt[i], true).last() == Some(&b'\n');
-    let (cut, mut close) = compact::feed_cut(&tags, &ends_line, t, limit.min(prompt.len()), 2048);
-    // the cache extended as it is when the prompt continues it past the turn's start; else the part before the turn
-    // first, so that the snapshot is where the compactions rebuild from
-    let extends = eng.tokens.len() > t && cut > eng.tokens.len() && prompt[..cut].starts_with(&eng.tokens);
-    let (mut logits, reused) = if extends {
+    let (mut cut, mut close) = compact::feed_cut(&tags, &ends_line, t, limit.min(prompt.len()), 2048);
+    // the cache as it is when the prompt continues it past the turn's start (extended to the cut, or compacted from its
+    // end when the cut is not past it: the end of the last reply, where an agentic client's next request crosses the
+    // threshold); else the part before the turn first, so that the snapshot is where the compactions rebuild from
+    let cached = eng.tokens.len();
+    let extends = cached > t && cached <= limit && prompt.len() > cached && prompt.starts_with(&eng.tokens);
+    let (mut logits, reused) = if extends && cut > cached {
         eng.feed_progress(&prompt[..cut], progress)?
+    } else if extends {
+        (cut, close) = (cached, compact::open_at(&tags, cached));
+        (vec![], cached)
     } else {
         let (l, r) = eng.feed_progress(&prompt[..t], progress)?;
         (if cut > t { eng.extend(&prompt[t..cut], &mut |pos| progress(pos, r))? } else { l }, r)
@@ -497,15 +502,15 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
         let hide = job.notes.mode == compact::NoteMode::Only;
         // the prompt: the continuation of a stored sequence (a tool result after a reply of this server), or as
         // rendered; and where the current turn starts
-        let (prompt, mut turn, hashes) = match &job.chat {
+        let (prompt, mut turn, hashes, hit) = match &job.chat {
             Some(ch) => match prepare(&tok, ch, &job.prompt, &seqs) {
-                Ok((p, t, h, _)) => (p, t, Some(h)),
+                Ok((p, t, h, hit)) => (p, t, Some(h), hit),
                 Err(e) => {
                     let _ = job.tx.send(Event::Error(e));
                     continue;
                 }
             },
-            None => (job.prompt.clone(), None, None),
+            None => (job.prompt.clone(), None, None, true),
         };
         let total = prompt.len();
         let over = comp.cfg.enabled && total + comp.cfg.reserve > eng.n_ctx;
@@ -555,6 +560,7 @@ pub fn scheduler(mut eng: Engine, tok: Arc<Tokenizer>, rx: Receiver<Job>) {
                 continue;
             }
         };
+        eprintln!("prompt: {total} tokens, {reused} from the cache{}{}", if over { ", over the compaction threshold" } else { "" }, if hit { "" } else { " (no stored reply matched)" });
         // where a compaction rebuilds from: the turn's start, or the prompt's end
         let turn_start = turn.unwrap_or(prompt.len()).min(prompt.len());
         // compactions while the prompt was fed count as compaction time
