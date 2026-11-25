@@ -248,6 +248,44 @@ pub fn open_at(tags: &[Tag], at: usize) -> bool {
     tags[..at].iter().rev().find(|&&t| t != Tag::Text).is_some_and(|&t| t != Tag::End)
 }
 
+/// What a prompt over the compaction threshold is fed on top of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Start {
+    /// the whole cache: the prompt extends it (an agentic client's tool result after the last reply)
+    Cache,
+    /// the snapshot (the end of the last prompt, in the turn): the prompt agrees with the cache up to there
+    Snapshot,
+    /// the turn's start: the prompt differs from the cache before the snapshot, or the cache is before the turn
+    Turn,
+}
+
+/// How to feed a prompt over the threshold before its first compaction: from where, the tokens kept there (`base`),
+/// where to compact (`cut`), and whether a section is open at the cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeedPlan {
+    pub start: Start,
+    pub base: usize,
+    pub cut: usize,
+    pub close: bool,
+}
+
+/// The plan for a prompt (tokens `tags`) whose turn starts at `t`, against the cached sequence `cache` and its snapshot
+/// position `snap`; `limit` is the compaction threshold. The cut is feed_cut's (a line end in a section, else a
+/// message end, before `limit`), but never before what is kept: a cut there would feed the kept tokens again, so the
+/// compaction comes at `base` itself, a message end in the agentic case (the cache may end past `limit`: a reply that
+/// crossed it in its tool call, after the thinking, is not compacted).
+pub fn feed_plan(cache: &[u32], snap: Option<usize>, prompt: &[u32], tags: &[Tag], ends_line: &dyn Fn(usize) -> bool, t: usize, limit: usize) -> FeedPlan {
+    let (start, base) = if cache.len() >= t && prompt.len() > cache.len() && prompt.starts_with(cache) {
+        (Start::Cache, cache.len())
+    } else if let Some(p) = snap.filter(|&p| p >= t && p <= cache.len() && p < prompt.len() && prompt[..p] == cache[..p]) {
+        (Start::Snapshot, p)
+    } else {
+        (Start::Turn, t)
+    };
+    let (cut, close) = feed_cut(tags, ends_line, t, limit.min(prompt.len()), 2048);
+    if cut > base { FeedPlan { start, base, cut, close } } else { FeedPlan { start, base, cut: base, close: open_at(tags, base) } }
+}
+
 /// Where the kept messages start: the last ones that fit in `keep` tokens (the last message always), from `start` on,
 /// never with a tool result first (its call goes with it). None if nothing before it would be summarized.
 pub fn cut_point(sizes: &[usize], roles: &[&str], start: usize, keep: usize) -> Option<usize> {
@@ -509,6 +547,59 @@ mod tests {
         assert!(!open_at(&tags, 4));
         assert!(open_at(&tags, 5));
         assert!(open_at(&tags, 7));
+    }
+
+    /// Tags of messages of the given lengths (header, open, text, end), and the positions where messages end.
+    fn messages(lens: &[usize]) -> (Vec<Tag>, Vec<usize>) {
+        let (mut tags, mut ends) = (vec![], vec![]);
+        for &n in lens {
+            tags.extend([Tag::Header, Tag::Open]);
+            tags.extend(std::iter::repeat_n(Tag::Text, n - 3));
+            tags.push(Tag::End);
+            ends.push(tags.len());
+        }
+        (tags, ends)
+    }
+
+    #[test]
+    fn feed_plan_keeps_the_cache() {
+        let (t, limit) = (10, 100);
+        let no_lines = |_: usize| false;
+        // the turn: a user message (to t), replies, the last reply ending at `end`, then a one-line tool result of 30
+        // tokens (no line end in it) that crosses the limit
+        for end in [95, limit - 1, limit, limit + 1, limit + 40] {
+            let (tags, _) = messages(&[t, 40, end - t - 40, 30]);
+            let prompt: Vec<u32> = (0..tags.len() as u32).collect();
+            let plan = feed_plan(&prompt[..end], Some(end - 200.min(end - t)), &prompt, &tags, &no_lines, t, limit);
+            assert_eq!(plan, FeedPlan { start: Start::Cache, base: end, cut: end, close: false }, "cache end {end}");
+        }
+        // a cache well before the limit: the cut is past it, at a line end of the tool result (a section is open)
+        let (tags, _) = messages(&[t, 40, 20, 60]);
+        let prompt: Vec<u32> = (0..tags.len() as u32).collect();
+        let plan = feed_plan(&prompt[..70], None, &prompt, &tags, &|i| i == 90, t, limit);
+        assert_eq!(plan, FeedPlan { start: Start::Cache, base: 70, cut: 91, close: true });
+        // no line end: the message end at 70 is the only boundary, and it is the cache's end
+        let plan = feed_plan(&prompt[..70], None, &prompt, &tags, &no_lines, t, limit);
+        assert_eq!(plan, FeedPlan { start: Start::Cache, base: 70, cut: 70, close: false });
+
+        // the cache holds a reply the prompt does not (regenerated): back to the snapshot at the end of the last prompt
+        let (tags, _) = messages(&[t, 40, 50, 30]);
+        let prompt: Vec<u32> = (0..tags.len() as u32).collect();
+        let mut cache = prompt[..100].to_vec();
+        cache[60] = 9999;
+        let plan = feed_plan(&cache, Some(50), &prompt, &tags, &no_lines, t, limit);
+        assert_eq!(plan, FeedPlan { start: Start::Snapshot, base: 50, cut: 100, close: false });
+        let plan = feed_plan(&cache, Some(50), &prompt, &tags, &|i| i == 70, t, limit);
+        assert_eq!(plan, FeedPlan { start: Start::Snapshot, base: 50, cut: 71, close: true });
+        // it differs before the snapshot, or the snapshot is before the turn: from the turn's start
+        cache[30] = 9998;
+        let plan = feed_plan(&cache, Some(50), &prompt, &tags, &no_lines, t, limit);
+        assert_eq!(plan, FeedPlan { start: Start::Turn, base: t, cut: 100, close: false });
+        let plan = feed_plan(&cache, Some(5), &prompt, &tags, &no_lines, t, limit);
+        assert_eq!(plan.start, Start::Turn);
+        // a cache before the turn's start that the prompt extends: fed on top of it, the snapshot ends up at t
+        let plan = feed_plan(&prompt[..6], None, &prompt, &tags, &no_lines, t, limit);
+        assert_eq!(plan, FeedPlan { start: Start::Turn, base: t, cut: 100, close: false });
     }
 
     #[test]

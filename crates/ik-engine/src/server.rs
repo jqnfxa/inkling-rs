@@ -418,21 +418,28 @@ fn feed_turn(eng: &mut Engine, tok: &Tokenizer, c: &mut Compactor, prompt: &[u32
     let limit = eng.n_ctx.saturating_sub(c.cfg.reserve);
     let tags = tags(tok, prompt);
     let ends_line = |i: usize| tok.piece_bytes(prompt[i], true).last() == Some(&b'\n');
-    let (mut cut, mut close) = compact::feed_cut(&tags, &ends_line, t, limit.min(prompt.len()), 2048);
-    // the cache as it is when the prompt continues it past the turn's start (extended to the cut, or compacted from its
-    // end when the cut is not past it: the end of the last reply, where an agentic client's next request crosses the
-    // threshold); else the part before the turn first, so that the snapshot is where the compactions rebuild from
-    let cached = eng.tokens.len();
-    let extends = cached > t && cached <= limit && prompt.len() > cached && prompt.starts_with(&eng.tokens);
-    let (mut logits, reused) = if extends && cut > cached {
-        eng.feed_progress(&prompt[..cut], progress)?
-    } else if extends {
-        (cut, close) = (cached, compact::open_at(&tags, cached));
-        (vec![], cached)
-    } else {
-        let (l, r) = eng.feed_progress(&prompt[..t], progress)?;
-        (if cut > t { eng.extend(&prompt[t..cut], &mut |pos| progress(pos, r))? } else { l }, r)
+    // on top of the whole cache when the prompt extends it (compacted at its end when the cut is not past it: an agentic
+    // client's tool result crossing the threshold), or of the snapshot; else the part before the turn first, so that
+    // the snapshot is where the compactions rebuild from
+    let plan = compact::feed_plan(&eng.tokens, eng.snapshot_pos(), prompt, &tags, &ends_line, t, limit);
+    let (cut, mut close) = (plan.cut, plan.close);
+    let (mut logits, reused) = match plan.start {
+        compact::Start::Cache if cut > plan.base => eng.feed_progress(&prompt[..cut], progress)?,
+        compact::Start::Cache => (vec![], plan.base),
+        compact::Start::Snapshot => {
+            let p = eng.rollback(prompt.len() - plan.base)?;
+            (eng.extend(&prompt[p..cut], &mut |pos| progress(pos, p))?, p)
+        }
+        compact::Start::Turn => {
+            let (l, r) = eng.feed_progress(&prompt[..t], progress)?;
+            (if cut > t { eng.extend(&prompt[t..cut], &mut |pos| progress(pos, r))? } else { l }, r)
+        }
     };
+    eprintln!("prompt over the compaction threshold: {reused} tokens reused (from the {}), {} fed before the compaction at {cut}", match plan.start {
+        compact::Start::Cache => "cache",
+        compact::Start::Snapshot => "snapshot",
+        compact::Start::Turn => "turn's start",
+    }, cut - reused.min(cut));
     let mut fed = cut;
     while fed < prompt.len() {
         if c.at_prompt >= 64 {
