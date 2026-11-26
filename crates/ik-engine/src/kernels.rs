@@ -83,6 +83,13 @@ impl Kernels {
         self.run(s, "gemv_bf16", (rows.div_ceil(16), ntok, 1), 256, &[&w, &x, &y, &rows, &k, &y_stride])
     }
 
+    /// What gemv_bf16 gives for `ntok` tokens, by tiles of 128 rows and 128 tokens, each reading W once for its tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16(&self, s: &Stream, w: P, x: P, y: P, rows: u32, k: u32, ntok: u32, y_stride: u32) -> Result<()> {
+        assert!(k.is_multiple_of(16) && ntok > 0, "gemm_bf16: k {k}, {ntok} tokens");
+        self.run(s, "gemm_bf16", (rows.div_ceil(128), ntok.div_ceil(128), 1), 256, &[&w, &x, &y, &rows, &k, &ntok, &y_stride])
+    }
+
     /// gemv_bf16 of `nz` matrices of the same k in one launch: tab[4 z ..] = w, x, y, rows of matrix z; `max_rows` the
     /// largest rows.
     pub fn gemv_bf16t(&self, s: &Stream, tab: P, max_rows: u32, k: u32, nz: u32) -> Result<()> {

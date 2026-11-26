@@ -50,6 +50,9 @@ const STAGE_ROWS: usize = 4096;
 const PF_STATE: usize = 390;
 /// Prefill runs the pairs of cached experts on the GPU this many tokens at a time.
 const PF_GROUP: usize = 32;
+/// From this many tokens on, prefill's dense matrices run as gemm_bf16 (W read once for 128 tokens) and not as
+/// gemv_bf16 (W read once a token).
+const GEMM_MIN: usize = 8;
 
 /// Decode attention: keys per chunk of attn_part, log2, of the sliding-window layers (16 chunks of the window) and of
 /// the full ones.
@@ -635,7 +638,8 @@ impl Engine {
 
     /// y[t] = W x[t] for nt tokens: x f32 [nt][k], y[t] at t y_stride (floats)
     fn gemm(&self, m: &Mat, x: P, y: P, nt: usize, y_stride: usize) -> Result<()> {
-        self.k.gemv_bf16(&self.s, m.w.ptr, x, y, m.rows as u32, m.k as u32, nt as u32, y_stride as u32)
+        let (rows, k, ntu, ys) = (m.rows as u32, m.k as u32, nt as u32, y_stride as u32);
+        if nt >= GEMM_MIN { self.k.gemm_bf16(&self.s, m.w.ptr, x, y, rows, k, ntu, ys) } else { self.k.gemv_bf16(&self.s, m.w.ptr, x, y, rows, k, ntu, ys) }
     }
 
     /// The embedding of `token` as f32: its BF16 row of the checkpoint, read from the mapped file.
@@ -1665,6 +1669,12 @@ impl Engine {
         time!("gemv_bf16 wo 2304x3072", wo.bytes(), self.gemv(wo, x, self.sc.a.ptr)?);
         let o = &self.w.output;
         time!(format!("gemv_bf16 output {}x2304", o.rows), o.bytes(), self.gemv(o, x, self.sc.logits_raw.ptr)?);
+        // prefill's, on T_MAX tokens: the weights' bytes count once a token, and as a weight is 2 bytes and 2 flops a
+        // token, their GB/s are GFLOP/s
+        let (b, nt) = (&self.b, T_MAX);
+        for (name, m, x, y, ys) in [("wq", wq, b.xn.ptr, b.g0.ptr, l.g0_rows()), ("wk", &l.gk[0], b.xn.ptr, b.gk.ptr, l.gk.iter().map(|m| m.rows).sum::<usize>()), ("wo", wo, b.att2.ptr, b.a.ptr, wo.rows), ("router", &l.router, b.xn.ptr, b.rlog.ptr, l.router.rows)] {
+            time!(format!("gemm_bf16 {name}, {nt} tokens"), nt * m.bytes(), self.gemm(m, x, y, nt, ys)?);
+        }
         self.sc.slots.upload(&[0i32, 1, 2, 3, 4, 5, 6, 7])?;
         self.sc.ids.upload(&[0u32, 1, 2, 3, 4, 5, 6, 7])?;
         // an NVFP4 layer and the MXFP8 last one, on the first 8 slots of their banks

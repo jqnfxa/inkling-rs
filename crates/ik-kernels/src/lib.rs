@@ -291,6 +291,133 @@ pub mod gpu {
         gemv_bf16_body(wz, xz, yz, rows, k, b);
     }
 
+    /// y[t][r] = sum_c W[r][c] x[t][c] for a BF16 matrix W [rows][k] (row-major, as the checkpoint has it) and f32 x
+    /// [nt][k]; y[t] at t y_stride floats. A block takes 128 rows by 128 tokens, so that W is read once for 128 tokens,
+    /// and a thread 8 by 8 of them: rows 4 tr .. 4 tr + 4 and 64 + 4 tr .., tokens 4 tt .. and 64 + 4 tt .. (tid =
+    /// 16 tt + tr), each summed over c in order. c goes by 16: W's [128][16] and x's [128][16] wait in shared memory
+    /// as f32 turned to [16][128], in two buffers each, so that one fills while the other is read. Rows past `rows` and
+    /// tokens past `nt` read the last one and are not stored. k a multiple of 16.
+    #[reqntid(256)]
+    #[minnctapersm(2)]
+    pub unsafe extern "ptx-kernel" fn gemm_bf16(w: *const u16, x: *const f32, y: *mut f32, rows: u32, k: u32, nt: u32, y_stride: u32) {
+        let ash: shared<[f32; 4096], 16>;
+        let bsh: shared<[f32; 4096], 16>;
+        let (t, tr, tt, r0, t0): (u32, u32, u32, u32, u32);
+        mov.u32(t, tid.x);
+        and.b32(tr, t, 15);
+        shr.u32(tt, t, 4);
+        mov.u32(r0, ctaid.x);
+        shl.b32(r0, r0, 7);
+        mov.u32(t0, ctaid.y);
+        shl.b32(t0, t0, 7);
+        // the tiles' loads: thread t brings 8 columns (kh = 8 (t / 128) ..) of W's row t % 128 and of x's token t % 128
+        let (lr, kh, wr, xt, lim, o): (u32, u32, u32, u32, u32, u32);
+        and.b32(lr, t, 127);
+        shr.u32(kh, t, 7);
+        shl.b32(kh, kh, 3);
+        add.u32(wr, r0, lr);
+        sub.u32(lim, rows, 1);
+        min.u32(wr, wr, lim);
+        add.u32(xt, t0, lr);
+        sub.u32(lim, nt, 1);
+        min.u32(xt, xt, lim);
+        let (wa, xa): (u64, u64);
+        mad.lo.u32(o, wr, k, kh);
+        mad.wide.u32(wa, o, 2, w);
+        mad.lo.u32(o, xt, k, kh);
+        mad.wide.u32(xa, o, 4, x);
+        // column kh + j of that row goes to [kh + j][lr] of a buffer, at sto + 512 j; a warp's 32 rows to 32 banks
+        let (abase, bbase, sto, ard, brd): (u32, u32, u32, u32, u32);
+        mov.u32(abase, ash);
+        mov.u32(bbase, bsh);
+        mad.lo.u32(sto, kh, 128, lr);
+        shl.b32(sto, sto, 2);
+        // a thread reads [c][4 tr ..] and [c][64 + 4 tr ..] of W's buffer, [c][4 tt ..] and [c][64 + 4 tt ..] of x's
+        mad.lo.u32(ard, tr, 16, abase);
+        mad.lo.u32(brd, tt, 16, bbase);
+        let acc: [f32; 64];
+        for i in 0..64 {
+            mov.f32(acc[i], 0.0);
+        }
+        let wv: [u32; 4];
+        let xv: [f32; 8];
+        ld.global.nc.v4.u32((wv[0], wv[1], wv[2], wv[3]), [wa]);
+        ld.global.nc.v4.f32((xv[0], xv[1], xv[2], xv[3]), [xa]);
+        ld.global.nc.v4.f32((xv[4], xv[5], xv[6], xv[7]), [xa + 16]);
+        // buf: the byte offset of the buffers filled and read in this step, 0 or 8192. A step fills them, waits for
+        // the block, loads the next step's columns and reads them: a warp can fill a buffer only once every warp has
+        // passed the wait after the step that read it.
+        let (buf, k0, sa, sb, ar, br): (u32, u32, u32, u32, u32, u32);
+        mov.u32(buf, 0);
+        mov.u32(k0, 0);
+        label(top);
+        add.u32(sa, abase, buf);
+        add.u32(sa, sa, sto);
+        add.u32(sb, bbase, buf);
+        add.u32(sb, sb, sto);
+        for q in 0..4 {
+            let (lo, hi): (f32, f32);
+            bf16x2(lo, hi, wv[q]);
+            st.shared.f32([sa + (1024 * q)], lo);
+            st.shared.f32([sa + (1024 * q + 512)], hi);
+        }
+        for j in 0..8 {
+            st.shared.f32([sb + (512 * j)], xv[j]);
+        }
+        bar.sync(0);
+        let more: pred;
+        add.u32(k0, k0, 16);
+        setp.lt.u32(more, k0, k);
+        if more {
+            add.u64(wa, wa, 32);
+            add.u64(xa, xa, 64);
+            ld.global.nc.v4.u32((wv[0], wv[1], wv[2], wv[3]), [wa]);
+            ld.global.nc.v4.f32((xv[0], xv[1], xv[2], xv[3]), [xa]);
+            ld.global.nc.v4.f32((xv[4], xv[5], xv[6], xv[7]), [xa + 16]);
+        }
+        add.u32(ar, ard, buf);
+        add.u32(br, brd, buf);
+        for c in 0..16 {
+            let a: [f32; 8];
+            let b: [f32; 8];
+            ld.shared.v4.f32((a[0], a[1], a[2], a[3]), [ar + (512 * c)]);
+            ld.shared.v4.f32((a[4], a[5], a[6], a[7]), [ar + (512 * c + 256)]);
+            ld.shared.v4.f32((b[0], b[1], b[2], b[3]), [br + (512 * c)]);
+            ld.shared.v4.f32((b[4], b[5], b[6], b[7]), [br + (512 * c + 256)]);
+            for i in 0..8 {
+                for j in 0..8 {
+                    fma.rn.f32(acc[8 * i + j], a[i], b[j], acc[8 * i + j]);
+                }
+            }
+        }
+        xor.b32(buf, buf, 8192);
+        if more {
+            bra(top);
+        }
+        // y[t][r] for rows r0 + 4 tr + i % 4 + 64 (i / 4) and tokens t0 + 4 tt + j % 4 + 64 (j / 4)
+        let (rb, tb): (u32, u32);
+        mad.lo.u32(rb, tr, 4, r0);
+        mad.lo.u32(tb, tt, 4, t0);
+        for i in 0..8 {
+            let r: u32;
+            let rin: pred;
+            add.u32(r, rb, i % 4 + 64 * (i / 4));
+            setp.lt.u32(rin, r, rows);
+            for j in 0..8 {
+                let (tk, yo): (u32, u32);
+                let ya: u64;
+                let ok: pred;
+                add.u32(tk, tb, j % 4 + 64 * (j / 4));
+                setp.lt.and.u32(ok, tk, nt, rin);
+                mad.lo.u32(yo, tk, y_stride, r);
+                mad.wide.u32(ya, yo, 4, y);
+                if ok {
+                    st.global.f32([ya], acc[8 * i + j]);
+                }
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- norms
 
     /// y = x / rms(x) * w (w BF16; without w where `HAS_W` is 0), over n floats; grid.x walks vectors.

@@ -203,6 +203,29 @@ fn main() -> Result<(), String> {
         }
     }
 
+    // gemm_bf16: wq on 130 tokens (a tile of tokens and 2 of the next), 200 rows of wo (a tile of rows and 72 of the
+    // next) on 3 tokens, the controller's down (64 rows, k 4608) on 129 tokens; y's rows 5 floats apart, so that the
+    // gaps, and a token past the last, must stay 0
+    for (name, full, rows, nt) in [
+        ("model.llm.layers.5.attn.wq_du.weight", [3072, n], 3072, 130),
+        ("model.llm.layers.3.attn.wo_ud.weight", [n, 3072], 200, 3),
+        ("model.llm.layers.7.controllers.k.down_weight", [64, 2 * n], 64, 129),
+    ] {
+        let kk = full[1];
+        let w = &ck.get(name, Dtype::BF16, &full)?[..rows * kk * 2];
+        let x: Vec<f32> = (0..nt * kk).map(|_| rnd(&mut seed)).collect();
+        let ys = rows + 5;
+        let (bw, bx, by) = (DevBuf::from_slice(w)?, DevBuf::from_slice(&x)?, DevBuf::zeroed((nt + 1) * ys * 4, &s)?);
+        k.gemm_bf16(&s, bw.ptr, bx.ptr, by.ptr, rows as u32, kk as u32, nt as u32, ys as u32)?;
+        s.sync()?;
+        let y: Vec<f32> = by.download((nt + 1) * ys)?;
+        let err = (0..nt).map(|t| rel_err(&y[t * ys..][..rows], &gemv_ref(w, &x[t * kk..][..kk], rows, kk))).fold(0.0, f64::max);
+        check(&format!("gemm_bf16 {}, {rows} rows, {nt} tokens", name.rsplit("layers.").next().unwrap()), err, 1e-5, &mut fails);
+        if y.chunks(ys).enumerate().any(|(t, yt)| yt.iter().enumerate().any(|(r, &v)| (t == nt || r >= rows) && v != 0.0)) {
+            fails.push(format!("gemm_bf16 {name}: wrote past its rows or tokens"));
+        }
+    }
+
     // experts, decode: gate_up and down of 8 slots (the 4th one not cached: its outputs stay 0)
     let es = [3usize, 17, 64, 127, 0, 5, 9, 100];
     let slots: Vec<i32> = (0..8).map(|i| if i == 3 { -1 } else { i as i32 }).collect();
