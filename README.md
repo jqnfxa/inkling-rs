@@ -126,13 +126,15 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
 - The CPU threads take work from shared counters with no barrier; each gate/up chunk also applies the activation to
   its block, which the down projection reads.
 - Prefill runs ubatches of up to 256 tokens. The dense matrices run as a tiled BF16 GEMM and attention by tiles of 16
-  tokens and 32 keys, on the GPU, and so do the pairs of the cached experts. The other experts are grouped by expert,
-  each read once per ubatch for all its tokens. The CPU threads take most of them; an expert stream takes those with
-  the most tokens, as many as it can upload in the time the CPU takes for the rest. The host copies each to a small
-  page-locked slot, the copy stream uploads it from there to a staging slot in VRAM, and the GPU runs its pairs: an
-  NVFP4 expert's tokens in one kernel by tiles of 128 rows and 32 tokens, each weight decoded once a tile. On an RTX
-  3050 Laptop its gate_up and down take 378 us on 64 tokens (2.7 TFLOPS) and 1125 us on 256 (3.6), against 749 and
-  2997 us a pair at a time. `IK_PF_STREAM=0` turns the stream off.
+  tokens and 32 keys, on the GPU, and so do the pairs of the cached experts: a cached NVFP4 expert with at least 12 of
+  the ubatch's tokens runs them in one kernel by tiles of 128 rows and 32 tokens, each weight decoded once a tile, and
+  the others a pair at a time. The other experts are grouped by expert, each read once per ubatch for all its tokens.
+  The CPU threads take most of them; an expert stream takes those with the most tokens, as many as it can upload in
+  the time the CPU takes for the rest. The host copies each to a small page-locked slot, the copy stream uploads it
+  from there to a staging slot in VRAM, and the GPU runs its pairs, an NVFP4 expert's by the same tiles. On an RTX 3050
+  Laptop one expert's gate_up and down take 378 us on 64 tokens (2.7 TFLOPS) and 1125 us on 256 (3.6), against 749
+  and 2997 us a pair at a time; 8 experts on 12 tokens each take 1145 us by tiles and 1173 us a pair at a time.
+  `IK_PF_STREAM=0` turns the stream off.
 - Activations stay f32; the engine adds no quantization. The KV caches hold K and V in f16, as the reference code keeps
   them in BF16: the f32 values the kernels compute, rounded once (2048 bytes each per position and layer pass). The
   sliding-window passes' caches are rings of 1280 positions (the window and a ubatch). Perplexity over the first 2048

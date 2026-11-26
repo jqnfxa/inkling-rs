@@ -331,6 +331,13 @@ impl Kernels {
         self.run(s, "moe_combine_t", (n.div_ceil(256), ntok, 1), 256, &[&src, &slots, &wts, &out, &n, &g, &a])
     }
 
+    /// moe_combine_t over the pairs that `rows` ([token][8] i32) gives a row of src, -1 for the others.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_combine_r(&self, s: &Stream, src: P, rows: P, wts: P, out: P, n: u32, ntok: u32, add: bool) -> Result<()> {
+        let a = add as u32;
+        self.run(s, "moe_combine_r", (n.div_ceil(256), ntok, 1), 256, &[&src, &rows, &wts, &out, &n, &a])
+    }
+
     // ---------------------------------------------------------------- fused decode
 
     #[allow(clippy::too_many_arguments)]

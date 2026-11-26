@@ -370,6 +370,41 @@ fn main() -> Result<(), String> {
         check("moe_combine_t, the GPU's pairs then the CPU's", err, 1e-6, &mut fails);
     }
 
+    // the grouped combine of 3 tokens: two chunks' rows (the first sets the output, the second adds), each pair in at
+    // most one of them, some in neither
+    {
+        let (nt, nn, nr) = (3usize, 2304usize, 7usize);
+        let mut rows = [vec![-1i32; 8 * nt], vec![-1i32; 8 * nt]];
+        for p in 0..8 * nt {
+            if p % 4 != 3 {
+                rows[p % 2][p] = ((p * 5) % nr) as i32;
+            }
+        }
+        let w: Vec<f32> = (0..8 * nt).map(|_| rnd(&mut seed).abs()).collect();
+        let src: Vec<Vec<f32>> = (0..2).map(|_| (0..nr * nn).map(|_| rnd(&mut seed)).collect()).collect();
+        let bw = DevBuf::from_slice(&w)?;
+        let bo = DevBuf::from_slice(&vec![f32::NAN; nt * nn])?;
+        for c in 0..2 {
+            let (br, bs) = (DevBuf::from_slice(&rows[c])?, DevBuf::from_slice(&src[c])?);
+            k.moe_combine_r(&s, bs.ptr, br.ptr, bw.ptr, bo.ptr, nn as u32, nt as u32, c > 0)?;
+            s.sync()?;
+        }
+        let out: Vec<f32> = bo.download(nt * nn)?;
+        let mut err = 0f64;
+        for t in 0..nt {
+            let mut want = vec![0f64; nn];
+            for (c, rc) in rows.iter().enumerate() {
+                for p in (8 * t..8 * t + 8).filter(|&p| rc[p] >= 0) {
+                    for (i, v) in want.iter_mut().enumerate() {
+                        *v += w[p] as f64 * src[c][rc[p] as usize * nn + i] as f64;
+                    }
+                }
+            }
+            err = err.max(rel_err(&out[t * nn..(t + 1) * nn], &want));
+        }
+        check("moe_combine_r, two chunks of rows", err, 1e-6, &mut fails);
+    }
+
     // copy_rows on rows of 2304 floats, as the expert stream uses it: a gather of 5 rows of 9 (row 8 twice), their
     // scatter to 5 rows of 12 (the other rows untouched), and a plain copy of 3 rows; each value its source's bits (its
     // own seed: the checks after it keep their inputs)

@@ -47,6 +47,17 @@ const STAGE_ROWS: usize = 4096;
 const PF_STATE: usize = 390;
 /// Prefill runs the pairs of cached experts on the GPU this many tokens at a time.
 const PF_GROUP: usize = 32;
+/// A cached NVFP4 expert with at least this many of a ubatch's tokens runs them grouped (moe_nvfp4_g, a tile of 32
+/// tokens decoding each weight once), the others pair by pair (moe_nvfp4_d, the weights read a pair at a time).
+const G_MIN: usize = 12;
+/// Chunks of grouped pairs in a ubatch, at most: they fill the pf buffers' 8 PF_GROUP rows.
+const G_CHUNKS: usize = T_MAX / PF_GROUP;
+
+/// Bytes of BatchBufs::grp: for nt tokens, the tokens at 0, the pair by pair slots at 32 nt, chunk c's rows at
+/// 32 nt (2 + c), and the entries after the last chunk's rows.
+fn grp_bytes(hp: &Hp) -> usize {
+    32 * T_MAX * (2 + G_CHUNKS) + 64 * (hp.n_expert + G_CHUNKS)
+}
 /// Staging slots of prefill's expert stream: the copy stream fills one while the GPU runs the pairs of another.
 const STREAM_SLOTS: usize = 4;
 /// From this many tokens on, prefill's dense matrices run as gemm_bf16 (W read once for 128 tokens) and not as
@@ -153,6 +164,11 @@ struct BatchBufs {
     pf_gu: DevBuf,
     pf_af: DevBuf,
     pf_dn: DevBuf,
+    /// the lists of the grouped cached experts (experts_g): the tokens of the grouped pairs [8 T_MAX] u32, the slots
+    /// left to the pair by pair path [8 T_MAX] i32, each chunk's rows of the pairs [G_CHUNKS][8 T_MAX] i32, and the
+    /// moe_nvfp4_g entries of gate_up, then of down, [n_expert + G_CHUNKS][4] u64 each
+    grp: DevBuf,
+    grp_h: HostBuf,
 }
 
 /// Prefill's stream of uncached experts: the copy stream uploads each to a staging slot and the GPU runs its pairs,
@@ -318,6 +334,8 @@ pub struct Stats {
     pub pf_cpu_s: f64,
     pub pf_cpu_pairs: u64,
     pub pf_gpu_pairs: u64,
+    /// prefill: the GPU's pairs that ran grouped (experts_g)
+    pub pf_grouped_pairs: u64,
     /// prefill: pairs and experts of the expert stream (counted in pf_cpu_pairs too: they are not cached), its bytes
     /// and seconds, and the layers where it was still running when the CPU team was done, and the seconds it ran on
     pub pf_stream_pairs: u64,
@@ -486,6 +504,8 @@ impl Engine {
             pf_gu: f(8 * PF_GROUP * 2 * hp.n_ff_exp)?,
             pf_af: f(8 * PF_GROUP * hp.n_ff_exp)?,
             pf_dn: f(8 * PF_GROUP * n)?,
+            grp: DevBuf::new(grp_bytes(&hp))?,
+            grp_h: HostBuf::new(grp_bytes(&hp))?,
         };
         let stream_on = std::env::var("IK_PF_STREAM").map_or(true, |v| v != "0");
         let pf_stream = if GPU_EXPERTS && stream_on { Some(PfStream::new(&ex, &hp)?) } else { None };
@@ -1412,16 +1432,23 @@ impl Engine {
             let x = self.b.host_xn.as_slice::<f32>()[..nt * n].to_vec();
             self.pool.start_batch(crate::cpu_pool::BatchJob { layer: ip, x, misses: groups, out: self.b.cpu_out.ptr as usize });
         }
+        // the cached experts with many tokens run grouped, and set b.moe; the others pair by pair, by the slots left
+        let pp = self.experts_g(ip, nt, &ids, &slots)?;
+        let grouped = pp.is_some();
+        let (pp, pp_d) = match &pp {
+            Some(v) => (&v[..], self.b.grp.at(32 * nt)),
+            None => (&slots[..], self.b.slots.ptr),
+        };
         let spans: Vec<(usize, usize, bool)> = (0..nt)
             .step_by(PF_GROUP)
             .map(|ta| {
                 let tb = (ta + PF_GROUP).min(nt);
-                (ta, tb, slots[8 * ta..8 * tb].iter().any(|&s| s >= 0))
+                (ta, tb, pp[8 * ta..8 * tb].iter().any(|&s| s >= 0))
             })
             .collect();
         for &(ta, tb, gpu) in &spans {
             if gpu {
-                self.experts_pf(ip, ta, tb)?;
+                self.experts_pf(ip, ta, tb, pp_d + (4 * 8 * ta) as u64, grouped)?;
             }
         }
         if !streamed.is_empty() {
@@ -1452,7 +1479,7 @@ impl Engine {
         let cpu = self.b.cpu_out.dev;
         for &(ta, tb, gpu) in &spans {
             let (b, nn) = (&self.b, n * 4);
-            self.k.moe_combine_t(&self.s, cpu + (8 * ta * nn) as u64, b.slots.at(4 * 8 * ta), b.wts.at(4 * 8 * ta), b.moe.at(ta * nn), nu, (tb - ta) as u32, false, gpu)?;
+            self.k.moe_combine_t(&self.s, cpu + (8 * ta * nn) as u64, b.slots.at(4 * 8 * ta), b.wts.at(4 * 8 * ta), b.moe.at(ta * nn), nu, (tb - ta) as u32, false, gpu || grouped)?;
         }
         Ok(())
     }
@@ -1786,15 +1813,16 @@ impl Engine {
         }
     }
 
-    /// The pairs of tokens ta..tb on cached experts (b.slots), on the GPU: gate_up, SITU and down of each, and their
-    /// weighted sum into those tokens' rows of b.moe.
-    fn experts_pf(&self, ip: usize, ta: usize, tb: usize) -> Result<()> {
+    /// The pairs of tokens ta..tb on cached experts (`slots`, theirs of b.slots or of the pair by pair path's), on the
+    /// GPU: gate_up, SITU and down of each, and their weighted sum into those tokens' rows of b.moe (added to them if
+    /// `add`).
+    fn experts_pf(&self, ip: usize, ta: usize, tb: usize, slots: P, add: bool) -> Result<()> {
         let (n, ffu) = (self.hp.n_embd as u32, self.hp.n_ff_exp as u32);
         let (b, f) = (&self.b, self.ex.fmt[ip]);
         let bk = &self.cache.banks[f.index()];
         let (gu_b, dn_b) = (bk.gu_bytes as u64, bk.down_bytes as u64);
         let pairs = 8 * (tb - ta) as u32;
-        let (slots, ids, x) = (b.slots.at(4 * 8 * ta), b.ids.at(4 * 8 * ta), b.xn.at(4 * n as usize * ta));
+        let (ids, x) = (b.ids.at(4 * 8 * ta), b.xn.at(4 * n as usize * ta));
         match f {
             Fmt::NvFp4 => {
                 let ((gu_a, gu_d), (dn_a, dn_d)) = (self.cache.factor_ptrs(ip, 0), self.cache.factor_ptrs(ip, 1));
@@ -1808,7 +1836,90 @@ impl Engine {
                 self.k.moe_mxfp8_d(&self.s, bk.down.ptr, dn_b, slots, b.pf_af.ptr, ffu, 0, b.pf_dn.ptr, n, ffu, pairs)?;
             }
         }
-        self.k.moe_combine_t(&self.s, b.pf_dn.ptr, slots, b.wts.at(4 * 8 * ta), b.moe.at(4 * n as usize * ta), n, (tb - ta) as u32, true, false)
+        self.k.moe_combine_t(&self.s, b.pf_dn.ptr, slots, b.wts.at(4 * 8 * ta), b.moe.at(4 * n as usize * ta), n, (tb - ta) as u32, true, add)
+    }
+
+    /// The cached pairs of the NVFP4 experts with at least G_MIN of the ubatch's nt tokens: each expert's tokens
+    /// gathered and run by moe_nvfp4_g (which decodes a weight once for 32 tokens), the experts one after another in
+    /// chunks of the pf buffers' 8 PF_GROUP rows (an expert split at a chunk's end), and the chunks' outputs added
+    /// into b.moe (the first sets it). Returns the slots left to the pair by pair path (theirs, or -1), as uploaded to
+    /// b.grp, if any expert ran grouped.
+    fn experts_g(&mut self, ip: usize, nt: usize, ids: &[u32], slots: &[i32]) -> Result<Option<Vec<i32>>> {
+        if !matches!(self.ex.fmt[ip], Fmt::NvFp4) {
+            return Ok(None);
+        }
+        let ne = self.hp.n_expert;
+        let mut pairs: Vec<Vec<usize>> = vec![vec![]; ne];
+        for (p, &e) in ids.iter().enumerate().filter(|&(p, _)| slots[p] >= 0) {
+            pairs[e as usize].push(p);
+        }
+        if pairs.iter().all(|v| v.len() < G_MIN) {
+            return Ok(None);
+        }
+        let mut pp = slots.to_vec();
+        let cap = 8 * PF_GROUP;
+        let b = &self.b;
+        let bk = &self.cache.banks[Fmt::NvFp4.index()];
+        let (gu_b, dn_b) = (bk.gu_bytes as u64, bk.down_bytes as u64);
+        let (n, ffu) = (self.hp.n_embd, self.hp.n_ff_exp);
+        // the lists: row q of the tokens is the grouped pairs' q-th, expert after expert; chunk c holds rows c cap..
+        let total: usize = pairs.iter().filter(|v| v.len() >= G_MIN).map(|v| v.len()).sum();
+        let n_chunks = total.div_ceil(cap);
+        let (rows_at, tab_at) = (64 * nt, 32 * nt * (2 + n_chunks));
+        // per chunk: its first row, its rows, its first entry, its entries, and its most tokens of an expert
+        let mut chunks: Vec<[usize; 5]> = vec![];
+        let mut entries: Vec<[u64; 8]> = vec![];
+        let l = b.grp_h.as_mut_slice::<u32>();
+        l[rows_at / 4..tab_at / 4].fill(u32::MAX);
+        let mut q = 0;
+        for (e, ps) in pairs.iter().enumerate().filter(|(_, v)| v.len() >= G_MIN) {
+            let slot = slots[ps[0]] as u64;
+            let mut k = 0;
+            while k < ps.len() {
+                let (c, r) = (q / cap, q % cap);
+                if chunks.len() == c {
+                    chunks.push([q, 0, entries.len(), 0, 0]);
+                }
+                let m = (ps.len() - k).min(cap - r);
+                for (j, &p) in ps[k..k + m].iter().enumerate() {
+                    l[q + j] = (p / 8) as u32;
+                    l[(rows_at + 32 * nt * c) / 4 + p] = (r + j) as u32;
+                    pp[p] = -1;
+                }
+                let me = m as u64 | (e as u64) << 32;
+                let (x, h, a) = (b.pf_dn.at(4 * n * r), b.pf_gu.at(8 * ffu * r), b.pf_af.at(4 * ffu * r));
+                entries.push([bk.gu.ptr + slot * gu_b, x, h, me, bk.down.ptr + slot * dn_b, a, x, me]);
+                let ch = &mut chunks[c];
+                ch[1] += m;
+                ch[3] += 1;
+                ch[4] = ch[4].max(m);
+                (q, k) = (q + m, k + m);
+            }
+        }
+        for (p, &s) in pp.iter().enumerate() {
+            l[8 * nt + p] = s as u32;
+        }
+        let t = b.grp_h.as_mut_slice::<u64>();
+        let ne_ = entries.len();
+        for (i, en) in entries.iter().enumerate() {
+            t[tab_at / 8 + 4 * i..][..4].copy_from_slice(&en[..4]);
+            t[tab_at / 8 + 4 * (ne_ + i)..][..4].copy_from_slice(&en[4..]);
+        }
+        cuda::copy_h2d_async(b.grp.ptr, b.grp_h.ptr, tab_at + 64 * ne_, &self.s)?;
+        let ((gu_a, gu_d), (dn_a, dn_d)) = (self.cache.factor_ptrs(ip, 0), self.cache.factor_ptrs(ip, 1));
+        let (nu, fu) = (n as u32, ffu as u32);
+        for (c, &[q0, m, e0, nz, mm]) in chunks.iter().enumerate() {
+            let tok = b.grp.at(4 * q0);
+            let (m, nz, mm) = (m as u32, nz as u32, mm as u32);
+            self.k.copy_rows(&self.s, b.xn.ptr, Some(tok), b.pf_dn.ptr, None, nu, m)?;
+            self.k.moe_nvfp4_g(&self.s, b.grp.at(tab_at + 32 * e0), gu_a, gu_d, 2 * fu, nu, mm, nz)?;
+            // the tokens stand for slots: SITU takes every row
+            self.k.situ(&self.s, b.pf_gu.ptr, tok, b.pf_af.ptr, fu, self.ex.beta, self.ex.lb, m)?;
+            self.k.moe_nvfp4_g(&self.s, b.grp.at(tab_at + 32 * (ne_ + e0)), dn_a, dn_d, nu, fu, mm, nz)?;
+            self.k.moe_combine_r(&self.s, b.pf_dn.ptr, b.grp.at(rows_at + 32 * nt * c), b.wts.ptr, b.moe.ptr, nu, nt as u32, c > 0)?;
+        }
+        self.stats.pf_grouped_pairs += total as u64;
+        Ok(Some(pp))
     }
 
     /// Times each kernel kind on layer 6's buffers: (name, microseconds per call, bytes read per call).
@@ -1879,6 +1990,33 @@ impl Engine {
                     self.k.moe_nvfp4_g(&self.s, tab.ptr, gu_a, gu_d, 2 * ffu, n, m, 1)?;
                     self.k.moe_nvfp4_g(&self.s, tab.at(32), dn_a, dn_d, n, ffu, m, 1)?
                 });
+            }
+            // 8 cached experts on m tokens each, as a ubatch has them (pair 8t + k on expert k): per pair, and grouped
+            // in one launch (experts_g); G_MIN is where grouped gets faster
+            if bk.n_slots >= 8 {
+                let sl: Vec<i32> = (0..T_MAX as i32).map(|p| p % 8).collect();
+                let id: Vec<u32> = (0..T_MAX as u32).map(|p| p % 8).collect();
+                b.slots.upload(&sl)?;
+                b.ids.upload(&id)?;
+                for m in [4u32, 8, 12, 16, 24, 32] {
+                    let flops = 8 * 2 * m as usize * 3 * nn * ffu as usize;
+                    time!(format!("NvFp4 8 experts per pair, {m} tokens"), flops, {
+                        self.k.moe_nvfp4_d(&self.s, bk.gu.ptr, gu_b, b.slots.ptr, b.ids.ptr, gu_a, gu_d, b.xn.ptr, n, 3, b.pf_gu.ptr, 2 * ffu, n, 8 * m)?;
+                        self.k.moe_nvfp4_d(&self.s, bk.down.ptr, dn_b, b.slots.ptr, b.ids.ptr, dn_a, dn_d, b.pf_af.ptr, ffu, 0, b.pf_dn.ptr, n, ffu, 8 * m)?
+                    });
+                    let mut t = vec![];
+                    for k in 0..8u64 {
+                        t.extend([bk.gu.ptr + k * gu_b, b.xn.ptr, b.pf_gu.at(8 * ffu as usize * m as usize * k as usize), m as u64 | k << 32]);
+                    }
+                    for k in 0..8u64 {
+                        t.extend([bk.down.ptr + k * dn_b, b.pf_af.ptr, b.pf_dn.at(4 * nn * m as usize * k as usize), m as u64 | k << 32]);
+                    }
+                    let tab = DevBuf::from_slice(&t)?;
+                    time!(format!("NvFp4 8 experts grouped, {m} tokens"), flops, {
+                        self.k.moe_nvfp4_g(&self.s, tab.ptr, gu_a, gu_d, 2 * ffu, n, m, 8)?;
+                        self.k.moe_nvfp4_g(&self.s, tab.at(256), dn_a, dn_d, n, ffu, m, 8)?
+                    });
+                }
             }
         }
         let maxs = self.maxs as u32;

@@ -3106,6 +3106,55 @@ pub mod gpu {
         st.global.f32([oa], acc);
     }
 
+    /// out[t][c] = (add ? out[t][c] : 0) + sum_k wts[8t + k] src[rows[8t + k]][c] over the pairs with rows[8t + k] >= 0,
+    /// in k order: the pairs whose outputs a grouped kernel left in its own order. grid.y = token.
+    #[maxntid(256)]
+    pub unsafe extern "ptx-kernel" fn moe_combine_r(src: *const f32, rows: *const i32, wts: *const f32, out: *mut f32, n: u32, add: u32) {
+        let (b, nt, t, c, tk): (u32, u32, u32, u32, u32);
+        mov.u32(b, ctaid.x);
+        mov.u32(nt, ntid.x);
+        mov.u32(t, tid.x);
+        mov.u32(tk, ctaid.y);
+        mad.lo.u32(c, b, nt, t);
+        let past: pred;
+        setp.ge.u32(past, c, n);
+        if past {
+            ret();
+        }
+        let (oi, oa): (u32, u64);
+        mad.lo.u32(oi, tk, n, c);
+        mad.wide.u32(oa, oi, 4, out);
+        let acc: f32;
+        mov.f32(acc, 0.0);
+        let adding: pred;
+        setp.ne.u32(adding, add, 0);
+        if adding {
+            ld.global.f32(acc, [oa]);
+        }
+        for k in 0..8 {
+            let r: s32;
+            let wv: f32;
+            let (pi, ra, wa): (u32, u64, u64);
+            mad.lo.u32(pi, tk, 8, k);
+            mad.wide.u32(ra, pi, 4, rows);
+            ld.global.s32(r, [ra]);
+            let none: pred;
+            setp.lt.s32(none, r, 0);
+            if !none {
+                mad.wide.u32(wa, pi, 4, wts);
+                ld.global.f32(wv, [wa]);
+                let (ru, o, ga): (u32, u32, u64);
+                let v: f32;
+                cvt.u32.s32(ru, r);
+                mad.lo.u32(o, ru, n, c);
+                mad.wide.u32(ga, o, 4, src);
+                ld.global.f32(v, [ga]);
+                fma.rn.f32(acc, wv, v, acc);
+            }
+        }
+        st.global.f32([oa], acc);
+    }
+
     // ================================================================ fused decode kernels
 
     /// Attention over depth: the states are `ptrs[0..ns]` (n floats each, ns <= 8), each RMS-normalized; query `q` of
