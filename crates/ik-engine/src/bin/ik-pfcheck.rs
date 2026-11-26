@@ -46,5 +46,11 @@ fn main() -> Result<(), String> {
         st.pf_stream_late,
         st.pf_stream_late_s
     );
+    println!(
+        "bounce slots: the host copied {:.2} GB/s over {:.2}s, and waited {:.2}s for slots",
+        st.pf_stream_bytes as f64 / st.pf_stream_copy_s.max(1e-9) / 1e9,
+        st.pf_stream_copy_s,
+        st.pf_stream_wait_s
+    );
     Ok(())
 }

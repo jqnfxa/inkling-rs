@@ -318,6 +318,10 @@ pub struct Stats {
     pub pf_stream_s: f64,
     pub pf_stream_late: u64,
     pub pf_stream_late_s: f64,
+    /// prefill: the host's seconds copying the streamed experts to the bounce slots, and waiting for a slot's last
+    /// upload to be done
+    pub pf_stream_copy_s: f64,
+    pub pf_stream_wait_s: f64,
 }
 
 /// Host memory that can still be taken: MemAvailable, and within the memory limit of this process's cgroup if it has
@@ -1471,9 +1475,11 @@ impl Engine {
             let slot = j % STREAM_SLOTS;
             self.copy_s.wait(&ps.free[slot])?;
             let (gu, dn) = (self.ex.gate_up(ip, *e), self.ex.down(ip, *e));
+            let tw = std::time::Instant::now();
             while !ps.bounced[slot].done() {
                 std::thread::yield_now();
             }
+            let tc = std::time::Instant::now();
             let sb = ps.bounce.len / STREAM_SLOTS;
             let dst = &mut ps.bounce.as_mut_slice::<u8>()[slot * sb..(slot + 1) * sb];
             let mut at = 0;
@@ -1482,6 +1488,8 @@ impl Engine {
                 at += part.len();
             }
             assert_eq!(at, gu_b + dn_b, "an expert's parts fill its slots");
+            self.stats.pf_stream_wait_s += (tc - tw).as_secs_f64();
+            self.stats.pf_stream_copy_s += tc.elapsed().as_secs_f64();
             let src = dst.as_ptr();
             cuda::copy_h2d_async(ps.gu.at(slot * gu_b), src, gu_b, &self.copy_s)?;
             cuda::copy_h2d_async(ps.dn.at(slot * dn_b), src.wrapping_add(gu_b), dn_b, &self.copy_s)?;
