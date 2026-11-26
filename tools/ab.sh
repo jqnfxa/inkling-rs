@@ -5,7 +5,7 @@
 # the median and spread of each variant. A laptop's results move 5-15% from run to run: use 3 rounds or more.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-ROUNDS=3 GEN=256 MODEL="$HOME/models/unsloth/Inkling-2-Mini-UD-Q4_K_XL.gguf"
+ROUNDS=3 GEN=256 MODEL="$HOME/models/thinkingmachines/Inkling-2-Mini"
 while getopts n:g:m: o; do
   case $o in n) ROUNDS=$OPTARG ;; g) GEN=$OPTARG ;; m) MODEL=$OPTARG ;; *) exit 1 ;; esac
 done

@@ -4,8 +4,6 @@ use std::collections::HashMap;
 
 use fancy_regex::Regex;
 
-use crate::gguf::{Gguf, Value};
-
 const SPLIT: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 const TYPE_CONTROL: i32 = 3;
@@ -41,27 +39,6 @@ fn byte_chars() -> [char; 256] {
 }
 
 impl Tokenizer {
-    pub fn from_gguf(g: &Gguf) -> Result<Tokenizer, String> {
-        if g.str("tokenizer.ggml.model")? != "gpt2" || g.str("tokenizer.ggml.pre")? != "inkling2" {
-            return Err("the tokenizer is not the inkling2 BPE".into());
-        }
-        let pieces: Vec<String> = g.arr("tokenizer.ggml.tokens")?.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect();
-        let types: Vec<i32> = match g.meta.get("tokenizer.ggml.token_type") {
-            Some(Value::Arr(a)) => a.iter().map(|v| v.as_u64().map_or(1, |x| x as i32)).collect(),
-            _ => vec![1; pieces.len()],
-        };
-        let merges = g.arr("tokenizer.ggml.merges")?.iter().filter_map(|m| m.as_str()?.split_once(' ')).map(|(a, b)| (a.to_string(), b.to_string()));
-        let mut eos = vec![];
-        for k in ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"] {
-            if let Ok(id) = g.u64(k) {
-                if !eos.contains(&(id as u32)) {
-                    eos.push(id as u32);
-                }
-            }
-        }
-        Tokenizer::build(pieces, types, merges, eos)
-    }
-
     /// The tokenizer of a Hugging Face tokenizer.json (`json`, its text): the BPE vocabulary and merges, and the added
     /// tokens (special ones are control tokens). `eos`: the ids that end a reply.
     pub fn from_hf(json: &str, eos: &[u32]) -> Result<Tokenizer, String> {
