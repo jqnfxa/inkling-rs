@@ -1,4 +1,4 @@
-//! The kernite PTX modules (gpu and attn), loaded once, and launchers of their kernels.
+//! The kernite PTX module, loaded once, and launchers of its kernels.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use crate::cuda::{Arg, CUdeviceptr, DevBuf, Func, Module, Result, Stream};
 
 pub struct Kernels {
-    _modules: Vec<Module>,
+    _module: Module,
     f: HashMap<String, Func>,
     /// IK_PROF: a stamp of the GPU timer after each launch, and the names of the kernels launched since `prof_reset`
     pub prof: Option<(DevBuf, RefCell<Vec<&'static str>>, std::cell::Cell<bool>)>,
@@ -30,19 +30,16 @@ pub type P = CUdeviceptr;
 
 impl Kernels {
     pub fn load() -> Result<Kernels> {
-        let mut modules = vec![];
+        let ptx = ik_kernels::gpu::PTX;
+        let module = Module::load(ptx)?;
         let mut f = HashMap::new();
-        for ptx in [ik_kernels::gpu::PTX, ik_kernels::attn::PTX] {
-            let module = Module::load(ptx)?;
-            for line in ptx.lines() {
-                if let Some(name) = line.strip_prefix(".visible .entry ").and_then(|l| l.strip_suffix('(')) {
-                    f.insert(short(name), module.func(name)?);
-                }
+        for line in ptx.lines() {
+            if let Some(name) = line.strip_prefix(".visible .entry ").and_then(|l| l.strip_suffix('(')) {
+                f.insert(short(name), module.func(name)?);
             }
-            modules.push(module);
         }
         let prof = if std::env::var("IK_PROF").is_ok() { Some((DevBuf::new(PROF_MAX * 8)?, RefCell::new(vec![]), std::cell::Cell::new(false))) } else { None };
-        Ok(Kernels { _modules: modules, f, prof })
+        Ok(Kernels { _module: module, f, prof })
     }
 
     /// Profiling: forgets the kernels launched so far and stamps those that follow, until `prof_stop` (a token's body).
@@ -282,14 +279,14 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn attn_part(
         &self, s: &Stream, q: P, r: P, sink: P, rb: P, kc: P, vc: P, pm: P, pl: P, pacc: P, params: P, ring: u32, extent: u32, scale: f32, maxs: u32,
-        nsplit: u32, window: u32,
+        nsplit: u32, window: u32, cs: u32,
     ) -> Result<()> {
-        self.run(s, "attn_part", (8, nsplit, 1), 128, &[&q, &r, &sink, &rb, &kc, &vc, &pm, &pl, &pacc, &params, &ring, &extent, &scale, &maxs, &window])
+        self.run(s, "attn_part", (8, nsplit, 1), 128, &[&q, &r, &sink, &rb, &kc, &vc, &pm, &pl, &pacc, &params, &ring, &extent, &scale, &maxs, &window, &cs])
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn attn_reduce(&self, s: &Stream, pm: P, pl: P, pacc: P, out: P, params: P, window: u32, maxs: u32, n_head: u32) -> Result<()> {
-        self.run(s, "attn_reduce", (n_head, 1, 1), 128, &[&pm, &pl, &pacc, &out, &params, &window, &maxs])
+    pub fn attn_reduce(&self, s: &Stream, pm: P, pl: P, pacc: P, out: P, params: P, window: u32, maxs: u32, cs: u32, n_head: u32) -> Result<()> {
+        self.run(s, "attn_reduce", (n_head, 1, 1), 128, &[&pm, &pl, &pacc, &out, &params, &window, &maxs, &cs])
     }
 
     // ---------------------------------------------------------------- controllers, several at once (grid.z)
@@ -315,60 +312,6 @@ impl Kernels {
     /// gate + 64 z.
     pub fn ctrl_outz(&self, s: &Stream, tab: P, gate: P, n: u32, nz: u32) -> Result<()> {
         self.run(s, "ctrl_outz", (n.div_ceil(256), 1, nz), 256, &[&tab, &gate, &n])
-    }
-
-    // ---------------------------------------------------------------- int8 KV cache
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn kv_prep8(
-        &self, s: &Stream, dyn_taps: bool, gk: P, gv: P, kw: P, vw: P, state: P, k: P, v: P, kv: [P; 4], params: P, ring: u32, cscale: f32, thr: f32, eps: f32,
-    ) -> Result<()> {
-        let name = if dyn_taps { "kv_prep8_1" } else { "kv_prep8_0" };
-        let [kc, ks, vc, vs] = kv;
-        self.run(s, name, (8, 1, 1), 128, &[&gk, &gv, &kw, &vw, &state, &k, &v, &kc, &ks, &vc, &vs, &params, &ring, &cscale, &thr, &eps])
-    }
-
-    /// kv_prep8 for int4 caches; see the kernels.
-    #[allow(clippy::too_many_arguments)]
-    pub fn kv_prep4(&self, s: &Stream, gk: P, gv: P, kw: P, vw: P, state: P, k: P, v: P, kv: [P; 4], params: P, cscale: f32, thr: f32, eps: f32) -> Result<()> {
-        let [kc, ks, vc, vs] = kv;
-        self.run(s, "kv_prep4", (8, 1, 1), 128, &[&gk, &gv, &kw, &vw, &state, &k, &v, &kc, &ks, &vc, &vs, &params, &cscale, &thr, &eps])
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn kv_store4_t(&self, s: &Stream, k: P, v: P, kv: [P; 4], params: P, kstride: u32, vstride: u32, ntok: u32) -> Result<()> {
-        let [kc, ks, vc, vs] = kv;
-        self.run(s, "kv_store4_t", (8, ntok, 1), 128, &[&k, &v, &kc, &ks, &vc, &vs, &params, &kstride, &vstride])
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn kv_store8_t(&self, s: &Stream, k: P, v: P, kv: [P; 4], params: P, ring: u32, kstride: u32, vstride: u32, ntok: u32) -> Result<()> {
-        let [kc, ks, vc, vs] = kv;
-        self.run(s, "kv_store8_t", (8, ntok, 1), 128, &[&k, &v, &kc, &ks, &vc, &vs, &params, &ring, &kstride, &vstride])
-    }
-
-    /// Chunks of 2^cs keys; `nsplit` chunks are launched, those past the keys of the token return at once.
-    #[allow(clippy::too_many_arguments)]
-    pub fn attn_part8(
-        &self, s: &Stream, q: P, r: P, sink: P, rb: P, kv: [P; 4], pm: P, pl: P, pacc: P, params: P, ring: u32, extent: u32, scale: f32, maxs: u32,
-        nsplit: u32, window: u32, cs: u32, int4: bool,
-    ) -> Result<()> {
-        let [kc, ks, vc, vs] = kv;
-        self.run(s, if int4 { "attn_part8_1" } else { "attn_part8_0" }, (8, nsplit, 1), 128, &[&q, &r, &sink, &rb, &kc, &ks, &vc, &vs, &pm, &pl, &pacc, &params, &ring, &extent, &scale, &maxs, &window, &cs])
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn attn_reduce8(&self, s: &Stream, pm: P, pl: P, pacc: P, out: P, params: P, window: u32, maxs: u32, cs: u32, n_head: u32) -> Result<()> {
-        self.run(s, "attn_reduce8", (n_head, 1, 1), 256, &[&pm, &pl, &pacc, &out, &params, &window, &maxs, &cs])
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn attn_prefill8(
-        &self, s: &Stream, q: P, r: P, sink: P, rb: P, kv: [P; 4], out: P, params: P, ring: u32, window: u32, extent: u32, scale: f32, q_stride: u32,
-        r_stride: u32, s_stride: u32, ntok: u32, int4: bool,
-    ) -> Result<()> {
-        let [kc, ks, vc, vs] = kv;
-        self.run(s, if int4 { "attn_prefill8_1" } else { "attn_prefill8_0" }, (8, ntok, 1), 128, &[&q, &r, &sink, &rb, &kc, &ks, &vc, &vs, &out, &params, &ring, &window, &extent, &scale, &q_stride, &r_stride, &s_stride])
     }
 
     // ---------------------------------------------------------------- batched (prefill)

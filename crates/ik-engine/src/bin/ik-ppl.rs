@@ -1,6 +1,6 @@
 //! Perplexity of a text, decoded a token at a time: `ik-ppl <checkpoint dir> <text file> [n_tokens] [skip]`.
-//! Scores tokens skip.. of the first n_tokens (the first ones have too little context to say much). IK_KV_F16 and the
-//! other switches of the engine apply, to compare.
+//! Scores tokens skip.. of the first n_tokens (the first ones have too little context to say much). The engine's switches
+//! (IK_* variables) apply, to compare.
 use ik_engine::engine::{Engine, Options, threads_from_env};
 
 fn main() -> Result<(), String> {

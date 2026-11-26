@@ -128,13 +128,16 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
 - Prefill runs ubatches of up to 256 tokens. The BF16 GEMVs over the ubatch's tokens and flash-style attention run
   on the GPU. The experts run on the CPU, grouped so each is read once per ubatch. Prefill is slow until tensor-core
   BF16 GEMMs and grouped NVFP4/MXFP8 GEMMs move it to the GPU.
-- The KV caches: the sliding-window passes' are int8 with an f16 scale per 32 values, as q8_0 (1088 bytes per position
-  and layer pass); the full-attention passes' are int4 (symmetric, stored plus 8, the same scales: 576 bytes).
-  Perplexity over 16k tokens of the model's own reasoning: 1.6984 with int8 full-attention caches (`IK_KV=8`), 1.7058
-  with int4 (+0.44%); over 1984 tokens, int8 against f16 (`IK_KV_F16=1`): 6.4237 against 6.4402.
-- Decode attention splits the keys into chunks of 256, a block per (kv head, chunk): the query quantized to int8 per 32
-  for dp4a scores, the values converted without `cvt` (each byte into the low byte of 2^23), 16-byte loads in the V
-  pass. Full attention over 131k keys takes 507 us per layer pass with int4 caches, 746 with int8 (831 before).
+- Activations stay f32; the engine adds no quantization. The KV caches hold K and V in f16, as the reference code keeps
+  them in BF16: the f32 values the kernels compute, rounded once (2048 bytes each per position and layer pass). The
+  sliding-window passes' caches are rings of 1280 positions (the window and a ubatch). Perplexity over the first 2048
+  tokens of `/usr/share/common-licenses/GPL-3` is 1.5174, against 1.5265 with the int8 and int4 caches of before; but
+  a new order of f32 sums alone moves it 0.3% on this text, so it does not tell the two apart. The kernels are checked
+  against f64 instead (`ik-wcheck`).
+- Decode attention splits the keys into chunks, a block per (kv head, chunk): 64 keys in the sliding-window passes,
+  256 in the full ones. Scores are f32 FMAs against K converted from f16 (exactly); in the V pass a warp takes every
+  4th key and a lane 4 dimensions, with 8 rows in flight. On an RTX 3050 Laptop (192 GB/s) attention over 1024 keys
+  takes 36 us per layer pass, over 8192 keys 210 us (160 GB/s).
 - The GPU expert kernels decode E2M1 exactly, two values at a time into an f16 pair by shifts and masks, and multiply
   in f32. In decode a warp reads 128 contiguous bytes of each of 4 rows and a thread keeps 4 rows; x is staged in
   shared memory, padded so that the 8 lanes of a row read different banks, and each chunk's codes load while the one
@@ -147,14 +150,14 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
 ## Context
 
 The model has 8 full-attention layer passes per token; the other 40 use a sliding window of 1024 tokens. The full
-passes' KV cache takes 9 KiB per token (int4; 17 KiB with `IK_KV=8`). It has addresses for all of `--ctx` from the start
-but memory only for the tokens in use, mapped in 2 MiB pages (CUDA virtual memory) as the context grows: the expert
-cache gets the rest, so a short chat runs with the whole budget (about 1260 slots) whatever `--ctx` is, and each 2048
-tokens of context take about 4 slots back (7 with int8). A new chat that is shorter than the last gives the pages back
-to the expert cache.
+passes' KV cache takes 32 KiB per token (f16 K and V). It has addresses for all of `--ctx` from the start but memory
+only for the tokens in use, mapped in 2 MiB pages (CUDA virtual memory) as the context grows: the expert cache gets the
+rest, so a short chat runs with the whole budget whatever `--ctx` is, and each 1024 tokens of context take about 7
+slots back. A new chat that is shorter than the last gives the pages back to the expert cache.
 
-Decode slows as the context fills, from fewer expert slots and from attention over more keys (about 0.22 ms per token
-for each 8k tokens):
+Decode slows as the context fills, from fewer expert slots and from attention over more keys. The table was measured
+with the int4 caches of before, when full attention took about 0.22 ms per token for each 8k tokens; the f16 caches
+take 3.6 times the bytes, and with them a context fills the VRAM 3.6 times sooner:
 
 | Context in use | Expert slots | Decode | Prefill |
 |---|---|---|---|
@@ -165,7 +168,7 @@ for each 8k tokens):
 
 Measured with `ik-ctx` on one long text (code and the model's reasoning), 512 tokens decoded at each depth, prefill
 the average up to it; the hit rate changes with the text, and runs vary 10-20% with load and heat. The server takes
-`--ctx` up to what the VRAM holds (by the cache size, about 650k tokens with no expert cache left).
+`--ctx` up to what the VRAM holds (by the cache size, about 180k tokens with no expert cache left).
 
 ## Tools
 

@@ -37,35 +37,14 @@ pub const T_MAX: usize = 256;
 /// The expert usage counts decay by this much at each token: an expert that every token uses counts about 100.
 const DECAY: f32 = 0.99;
 
-/// Bytes of a row (position) of the int8 KV cache: 8 kv heads of 128 int8, and a f16 scale per 32.
-const KV_ROW: usize = 1024 + 64;
+/// Bytes of a row (position) of a K or a V cache: 8 kv heads of 128 f16, the f32 that K and V come to rounded once.
+const KV_ROW: usize = 2048;
 
-/// IK_KV_F16: the f16 KV cache of before (2048 bytes a row), to compare.
-fn kv_f16() -> bool {
-    std::env::var("IK_KV_F16").is_ok()
-}
+/// The full-attention KV caches get memory in steps of this many rows (a 2 MiB page).
+const KV_STEP: usize = 1024;
 
-/// Whether the full-attention KV caches are int4 (K and V, the default) or int8 (IK_KV=8); the sliding-window rings
-/// stay int8. Perplexity over 16k tokens of the model's reasoning: 1.6984 int8, 1.7058 int4 (+0.44%); the caches take
-/// 576 bytes a row and layer pass instead of 1088, and full attention over 131k keys 519 us instead of 727.
-fn kv_int4_env() -> bool {
-    !kv_f16() && std::env::var("IK_KV").as_deref() != Ok("8")
-}
-
-/// Bytes a row of the 4 parts of a full-attention cache take: K values, K scales, V values, V scales.
-fn kv_widths(int4: bool) -> [usize; 4] {
-    let v = if int4 { 512 } else { 1024 };
-    [v, 64, v, 64]
-}
-
-/// Bytes of a KV cache row.
-fn kv_row() -> usize {
-    if kv_f16() { 2048 } else { KV_ROW }
-}
-/// The full-attention KV caches get memory in steps of this many rows (a 2 MiB page of int8 values).
-const KV_STEP: usize = 2048;
-
-/// Decode attention: keys per chunk, log2, of the sliding window layers and of the full ones.
+/// Decode attention: keys per chunk of attn_part, log2, of the sliding-window layers (16 chunks of the window) and of
+/// the full ones.
 const CS_SWA: u32 = 6;
 const CS_FULL: u32 = 8;
 
@@ -184,16 +163,14 @@ pub struct Engine {
     pub s: Stream,
     pub n_ctx: usize,
     sched: Vec<Step>,
-    kcache: Vec<Option<DevBuf>>, // int8 rows [rows][8][128], then their f16 scales [rows][8][4]; the SWA rings (all with IK_KV_F16)
+    /// the sliding-window rings of K and of V: f16 rows [rows][8][128]
+    kcache: Vec<Option<DevBuf>>,
     vcache: Vec<Option<DevBuf>>,
-    /// the full-attention caches: int8 K, its scales, int8 V, its scales, at addresses for n_ctx rows; memory for kv_mapped
-    kv_vm: Vec<Option<[VmBuf; 4]>>,
+    /// the full-attention caches, K and V in f16 rows, at addresses for n_ctx rows; memory for kv_mapped
+    kv_vm: Vec<Option<[VmBuf; 2]>>,
     kv_mapped: usize,
-    /// the full-attention caches are int4 (kv_int4_env)
-    kv_int4: bool,
     /// VRAM for the expert cache and the mapped rows of kv_vm together
     vram_budget: usize,
-    kv_rows: Vec<usize>,
     ring: Vec<u32>,
     conv: Vec<DevBuf>, // per slot: k [kv][3], v [kv][3], post [n][3], ffn [n][3]
     sc: Scratch,
@@ -268,30 +245,26 @@ impl Engine {
         let mut kcache = vec![];
         let mut vcache = vec![];
         let mut kv_vm = vec![];
-        let kv_int4 = kv_int4_env();
-        let mut kv_rows = vec![];
         let mut ring = vec![];
         let mut conv = vec![];
         for il in 0..n_slots {
             let ip = Self::phys(&hp, il);
             let rows = if hp.is_swa[ip] { hp.n_swa + T_MAX } else { opt.n_ctx };
-            if hp.is_swa[ip] || kv_f16() {
-                kcache.push(Some(DevBuf::zeroed(rows * kv_row(), &s)?));
-                vcache.push(Some(DevBuf::zeroed(rows * kv_row(), &s)?));
+            if hp.is_swa[ip] {
+                kcache.push(Some(DevBuf::zeroed(rows * KV_ROW, &s)?));
+                vcache.push(Some(DevBuf::zeroed(rows * KV_ROW, &s)?));
                 kv_vm.push(None);
             } else {
                 // memory comes as the context grows (plan_kv)
-                let r = |b: usize| VmBuf::reserve(rows.div_ceil(KV_STEP) * KV_STEP * b, ctx.device);
+                let r = || VmBuf::reserve(rows.div_ceil(KV_STEP) * KV_STEP * KV_ROW, ctx.device);
                 kcache.push(None);
                 vcache.push(None);
-                let [kw, ksw, vw, vsw] = kv_widths(kv_int4);
-                kv_vm.push(Some([r(kw)?, r(ksw)?, r(vw)?, r(vsw)?]));
+                kv_vm.push(Some([r()?, r()?]));
             }
-            kv_rows.push(rows);
             ring.push(if hp.is_swa[ip] { (hp.n_swa + T_MAX) as u32 } else { 0 });
             conv.push(f((2 * kv + 2 * n) * 3)?);
         }
-        let maxs = (opt.n_ctx >> CS_FULL).max(hp.n_swa >> CS_SWA) + 1;
+        let maxs = opt.n_ctx.div_ceil(1 << CS_FULL).max(hp.n_swa.div_ceil(1 << CS_SWA));
         let sc = Scratch {
             x: f(n)?,
             inp_sa: f(n)?,
@@ -435,10 +408,8 @@ impl Engine {
             kcache,
             vcache,
             kv_vm,
-            kv_int4,
             kv_mapped: 0,
             vram_budget,
-            kv_rows,
             ring,
             conv,
             sc,
@@ -453,7 +424,7 @@ impl Engine {
             snap_conv: DevBuf::new(n_slots * (2 * kv + 2 * n) * 3 * 4)?,
             ckpt_pos: None,
             ckpt_conv: DevBuf::new(n_slots * (2 * kv + 2 * n) * 3 * 4)?,
-            snap_swa: HostBuf::new(n_slots * 2 * n_swa * kv_row())?,
+            snap_swa: HostBuf::new(n_slots * 2 * n_swa * KV_ROW)?,
             copy_s: Stream::new_nonblocking()?,
         };
         let need = e.kv_bytes(e.n_ctx);
@@ -473,7 +444,7 @@ impl Engine {
 
     /// Bytes of the full-attention KV caches with `rows` rows mapped.
     fn kv_bytes(&self, rows: usize) -> usize {
-        self.kv_vm.iter().flatten().map(|b| b.iter().zip(kv_widths(self.kv_int4)).map(|(v, w)| v.pages_for(rows * w)).sum::<usize>()).sum()
+        self.kv_vm.iter().flatten().flatten().map(|v| v.pages_for(rows * KV_ROW)).sum()
     }
 
     /// Gives the full-attention KV caches memory for `rows` positions (rounded up to KV_STEP) and the expert cache the
@@ -494,11 +465,8 @@ impl Engine {
         self.copy_s.sync()?;
         self.join_uploads();
         let resize = |e: &mut Engine, rows: usize| -> Result<()> {
-            let widths = kv_widths(e.kv_int4);
-            for b in e.kv_vm.iter_mut().flatten() {
-                for (v, w) in b.iter_mut().zip(widths) {
-                    v.resize(rows * w, &e.s)?;
-                }
+            for v in e.kv_vm.iter_mut().flatten().flatten() {
+                v.resize(rows * KV_ROW, &e.s)?;
             }
             Ok(())
         };
@@ -702,24 +670,12 @@ impl Engine {
         if start + count <= ring { vec![(start, 0, count)] } else { vec![(start, 0, ring - start), (0, ring - start, count - (ring - start))] }
     }
 
-    /// Whether slot il's KV cache is int4: the full-attention ones with kv_int4; the sliding-window rings are int8.
-    fn int4_at(&self, il: usize) -> bool {
-        self.kv_int4 && self.kv_vm[il].is_some()
-    }
-
-    /// The int8 values and the scales of slot il's K and V caches.
-    fn kv8(&self, il: usize) -> [P; 4] {
+    /// Slot il's K and V caches.
+    fn kv(&self, il: usize) -> [P; 2] {
         if let Some(b) = &self.kv_vm[il] {
-            return [b[0].ptr, b[1].ptr, b[2].ptr, b[3].ptr];
+            return [b[0].ptr, b[1].ptr];
         }
-        let (k, v) = (self.kcache[il].as_ref().unwrap(), self.vcache[il].as_ref().unwrap());
-        let q = self.kv_rows[il] * 1024;
-        [k.ptr, k.ptr + q as u64, v.ptr, v.ptr + q as u64]
-    }
-
-    /// The (offset, bytes a row) in a cache of `rows` rows of row `row`'s int8 values and of its scales (or its f16 row).
-    fn kv_parts(rows: usize, row: usize) -> Vec<(usize, usize)> {
-        if kv_f16() { vec![(row * 2048, 2048)] } else { vec![(row * 1024, 1024), (rows * 1024 + row * 64, 64)] }
+        [self.kcache[il].as_ref().unwrap().ptr, self.vcache[il].as_ref().unwrap().ptr]
     }
 
     /// Saves the state at the current position, the end of a prompt.
@@ -735,16 +691,12 @@ impl Engine {
                 continue;
             }
             for (ci, cache) in [&self.kcache[il], &self.vcache[il]].into_iter().flatten().enumerate() {
-                // the window's int8 rows, then its scales
-                let base = (il * 2 + ci) * w * kv_row();
+                // the window's rows
+                let base = (il * 2 + ci) * w * KV_ROW;
                 for (row, off, cnt) in self.window_rows(ring) {
-                    let mut at = base;
-                    for (o, b) in Self::kv_parts(ring, row) {
-                        // SAFETY: inside the page-locked snapshot buffer
-                        let dst = unsafe { self.snap_swa.ptr.add(at + off * b) };
-                        cuda::copy_d2h_async(dst, cache.at(o), cnt * b, &self.s)?;
-                        at += w * b;
-                    }
+                    // SAFETY: inside the page-locked snapshot buffer
+                    let dst = unsafe { self.snap_swa.ptr.add(base + off * KV_ROW) };
+                    cuda::copy_d2h_async(dst, cache.at(row * KV_ROW), cnt * KV_ROW, &self.s)?;
                 }
             }
         }
@@ -769,15 +721,11 @@ impl Engine {
                 continue;
             }
             for (ci, cache) in [&self.kcache[il], &self.vcache[il]].into_iter().flatten().enumerate() {
-                let base = (il * 2 + ci) * w * kv_row();
+                let base = (il * 2 + ci) * w * KV_ROW;
                 for (row, off, cnt) in self.window_rows(ring) {
-                    let mut at = base;
-                    for (o, b) in Self::kv_parts(ring, row) {
-                        // SAFETY: inside the page-locked snapshot buffer
-                        let src = unsafe { self.snap_swa.ptr.add(at + off * b) };
-                        cuda::copy_h2d_async(cache.at(o), src, cnt * b, &self.s)?;
-                        at += w * b;
-                    }
+                    // SAFETY: inside the page-locked snapshot buffer
+                    let src = unsafe { self.snap_swa.ptr.add(base + off * KV_ROW) };
+                    cuda::copy_h2d_async(cache.at(row * KV_ROW), src, cnt * KV_ROW, &self.s)?;
                 }
             }
         }
@@ -1172,26 +1120,12 @@ impl Engine {
         self.probe("Vcur", il, self.b.v.ptr, nt * kv)?;
         self.probe("Rcur", il, self.b.r.ptr, nt * hp.n_head * hp.n_rel)?;
         let l = &self.w.layers[ip];
-        let (kv8, ring) = (self.kv8(il), self.ring[il]);
-        if kv_f16() {
-            self.k.kv_store_t(&self.s, self.b.k.ptr, self.b.v.ptr, kv8[0], kv8[2], self.params.ptr, ring, kv as u32, kv as u32, kv as u32, ntu)?;
-        } else {
-            if self.int4_at(il) {
-                self.k.kv_store4_t(&self.s, self.b.k.ptr, self.b.v.ptr, kv8, self.params.ptr, kv as u32, kv as u32, ntu)?;
-            } else {
-                self.k.kv_store8_t(&self.s, self.b.k.ptr, self.b.v.ptr, kv8, self.params.ptr, ring, kv as u32, kv as u32, ntu)?;
-            }
-        }
+        let ([kc, vc], ring) = (self.kv(il), self.ring[il]);
+        self.k.kv_store_t(&self.s, self.b.k.ptr, self.b.v.ptr, kc, vc, self.params.ptr, ring, kv as u32, kv as u32, kv as u32, ntu)?;
         let extent = if swa { hp.n_swa } else { hp.rel_extent } as u32;
         let window = if swa { hp.n_swa as u32 } else { u32::MAX };
         let scale = 1.0 / (hp.head_dim as f32).sqrt();
-        if kv_f16() {
-            self.k.attn_prefill(&self.s, self.b.q.ptr, self.b.r.ptr, sink, l.rel_proj.ptr, kv8[0], kv8[2], self.b.att.ptr, self.params.ptr, ring, window, extent, scale, nh as u32, nhd * nr, g0r, ntu)?;
-        } else {
-            let int4 = self.int4_at(il);
-            let l = &self.w.layers[ip];
-            self.k.attn_prefill8(&self.s, self.b.q.ptr, self.b.r.ptr, sink, l.rel_proj.ptr, kv8, self.b.att.ptr, self.params.ptr, ring, window, extent, scale, nh as u32, nhd * nr, g0r, ntu, int4)?;
-        }
+        self.k.attn_prefill(&self.s, self.b.q.ptr, self.b.r.ptr, sink, l.rel_proj.ptr, kc, vc, self.b.att.ptr, self.params.ptr, ring, window, extent, scale, nh as u32, nhd * nr, g0r, ntu)?;
         self.probe("kqv_out", il, self.b.att.ptr, nt * nh)?;
         let gate = self.b.g0.at(nh * 4);
         self.k.mul_sigmoid_t(&self.s, self.b.att.ptr, gate, self.b.att2.ptr, ntu * nh as u32, nh as u32, g0r)?;
@@ -1392,15 +1326,8 @@ impl Engine {
         let cscale = if swa { 1.0 / ((hp.n_conv + 1) as f32).sqrt() } else { 1.0 / ((2 * hp.n_conv + 1) as f32).sqrt() };
         let _ = st_v;
         // K and V: convolutions, K clip, V norm, and the cache row, in one kernel
-        let (kv8, ring) = (self.kv8(il), self.ring[il]);
-        if kv_f16() {
-            self.k.kv_prep(&self.s, !swa, self.sc.gk.ptr, self.sc.gv.ptr, l.k_conv.ptr, l.v_conv.ptr, st_k, self.sc.k.ptr, self.sc.v.ptr, kv8[0], kv8[2], p_pos, ring, cscale, hp.qk_clip, hp.eps)?;
-        } else {
-            match self.int4_at(il) {
-                false => self.k.kv_prep8(&self.s, !swa, self.sc.gk.ptr, self.sc.gv.ptr, l.k_conv.ptr, l.v_conv.ptr, st_k, self.sc.k.ptr, self.sc.v.ptr, kv8, p_pos, ring, cscale, hp.qk_clip, hp.eps)?,
-                true => self.k.kv_prep4(&self.s, self.sc.gk.ptr, self.sc.gv.ptr, l.k_conv.ptr, l.v_conv.ptr, st_k, self.sc.k.ptr, self.sc.v.ptr, kv8, p_pos, cscale, hp.qk_clip, hp.eps)?,
-            }
-        }
+        let ([kc, vc], ring) = (self.kv(il), self.ring[il]);
+        self.k.kv_prep(&self.s, !swa, self.sc.gk.ptr, self.sc.gv.ptr, l.k_conv.ptr, l.v_conv.ptr, st_k, self.sc.k.ptr, self.sc.v.ptr, kc, vc, p_pos, ring, cscale, hp.qk_clip, hp.eps)?;
 
         // Q and R clip, scaled by tau on full attention
         let post = if swa { p_one } else { p_tau };
@@ -1419,22 +1346,14 @@ impl Engine {
         let maxs = self.maxs as u32;
         let window = if swa { hp.n_swa as u32 } else { u32::MAX };
         let cs = if swa { CS_SWA } else { CS_FULL };
-        let nsplit = if swa { (hp.n_swa >> CS_SWA) as u32 } else { self.n_ctx.div_ceil(1 << CS_FULL) as u32 };
-        if kv_f16() {
-            let nsplit = if swa { hp.n_swa.div_ceil(256) as u32 } else { self.n_ctx.div_ceil(256) as u32 };
-            self.k.attn_part(&self.s, self.sc.q.ptr, self.sc.r.ptr, sink, l.rel_proj.ptr, kv8[0], kv8[2], self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, p_pos, ring, extent, scale, maxs, nsplit, window)?;
-            self.k.attn_reduce(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, p_pos, window, maxs, hp.n_head as u32)?;
-        } else {
-            let int4 = self.int4_at(il);
-            let l = &self.w.layers[ip];
-            self.k.attn_part8(&self.s, self.sc.q.ptr, self.sc.r.ptr, sink, l.rel_proj.ptr, kv8, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, p_pos, ring, extent, scale, maxs, nsplit, window, cs, int4)?;
-            if !swa {
-                // the per-chunk max and sum of each head: [kv head][chunk][3]
-                self.probe("attn_pm", il, self.sc.pm.ptr, 8 * maxs as usize * 3)?;
-                self.probe("attn_pl", il, self.sc.pl.ptr, 8 * maxs as usize * 3)?;
-            }
-            self.k.attn_reduce8(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, p_pos, window, maxs, cs, hp.n_head as u32)?;
+        let nsplit = if swa { hp.n_swa } else { self.n_ctx }.div_ceil(1 << cs) as u32;
+        self.k.attn_part(&self.s, self.sc.q.ptr, self.sc.r.ptr, sink, l.rel_proj.ptr, kc, vc, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, p_pos, ring, extent, scale, maxs, nsplit, window, cs)?;
+        if !swa {
+            // the per-chunk max and sum of each head: [kv head][chunk][3]
+            self.probe("attn_pm", il, self.sc.pm.ptr, 8 * maxs as usize * 3)?;
+            self.probe("attn_pl", il, self.sc.pl.ptr, 8 * maxs as usize * 3)?;
         }
+        self.k.attn_reduce(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, p_pos, window, maxs, cs, hp.n_head as u32)?;
         self.probe("kqv_out", il, self.sc.att.ptr, nh as usize)?;
         self.k.mul_sigmoid(&self.s, self.sc.att.ptr, gate, self.sc.att2.ptr, nh)?;
         let l = &self.w.layers[ip];
@@ -1570,14 +1489,12 @@ impl Engine {
             let p: [u32; 4] = [keys - 1, 1f32.to_bits(), 1f32.to_bits(), 0];
             self.params.upload(&p)?;
             let (window, cs) = if ring != 0 { (hp.n_swa as u32, CS_SWA) } else { (u32::MAX, CS_FULL) };
-            let nsplit = if ring != 0 { (hp.n_swa >> CS_SWA) as u32 } else { self.n_ctx.div_ceil(1 << CS_FULL) as u32 };
-            let kv8 = self.kv8(kvi);
+            let nsplit = if ring != 0 { hp.n_swa } else { self.n_ctx }.div_ceil(1 << cs) as u32;
+            let [kc, vc] = self.kv(kvi);
             let lr = &self.w.layers[kvi];
-            let int4 = self.int4_at(kvi);
-            let row: usize = if ring != 0 { KV_ROW * 2 } else { kv_widths(int4).iter().sum() };
-            time!(format!("attn part+reduce {keys} keys"), keys as usize * row, {
-                self.k.attn_part8(&self.s, self.sc.q.ptr, self.sc.r.ptr, self.sc.g0.ptr, lr.rel_proj.ptr, kv8, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.params.ptr, ring, 1024, 0.088, maxs, nsplit, window, cs, int4)?;
-                self.k.attn_reduce8(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, self.params.ptr, window, maxs, cs, hp.n_head as u32)?
+            time!(format!("attn part+reduce {keys} keys"), keys as usize * 2 * KV_ROW, {
+                self.k.attn_part(&self.s, self.sc.q.ptr, self.sc.r.ptr, self.sc.g0.ptr, lr.rel_proj.ptr, kc, vc, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.params.ptr, ring, 1024, 0.088, maxs, nsplit, window, cs)?;
+                self.k.attn_reduce(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, self.params.ptr, window, maxs, cs, hp.n_head as u32)?
             });
         }
         let list = vec![self.bl.b0.ptr, self.bl.b6[0].ptr, self.bl.b12[0].ptr, self.sc.x.ptr];

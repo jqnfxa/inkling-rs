@@ -503,7 +503,7 @@ impl ExpertCache {
         self.banks.iter().map(|b| b.n_slots).sum()
     }
 
-    /// The slots of each bank that `bytes` of memory hold: the Q8_0 bank its share, the NVFP4 bank the rest.
+    /// The slots of each bank that `bytes` of memory hold: the MXFP8 bank its share, the NVFP4 bank the rest.
     pub fn fit(&self, bytes: usize) -> [usize; 2] {
         let most = |b: &Bank, bytes: usize| {
             let mut n = (bytes / (b.gu_bytes + b.down_bytes)).min(b.max_slots);

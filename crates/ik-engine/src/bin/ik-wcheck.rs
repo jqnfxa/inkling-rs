@@ -19,6 +19,66 @@ fn bf16(b: &[u8], i: usize) -> f64 {
     f32::from_bits((u16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as u32) << 16) as f64
 }
 
+/// 32 random bits
+fn bits(seed: &mut u64) -> u32 {
+    rnd(seed);
+    (*seed >> 32) as u32
+}
+
+/// The f16 of bits h.
+fn f16(h: u16) -> f64 {
+    let (s, e, m) = (if h & 0x8000 != 0 { -1.0 } else { 1.0 }, ((h >> 10) & 31) as i32, (h & 1023) as f64);
+    assert!(e != 31, "f16 infinity or NaN");
+    s * if e == 0 { m * 2f64.powi(-24) } else { (1.0 + m / 1024.0) * 2f64.powi(e - 15) }
+}
+
+/// The f16 spacing at x: 2^-10 of its power of two, 2^-24 below 2^-14.
+fn f16_ulp(x: f64) -> f64 {
+    2f64.powi(((x.abs().to_bits() >> 52) as i32 - 1023).max(-14) - 10)
+}
+
+/// x rounded to the nearest f16, ties to the even one (as cvt.rn.f16.f32).
+fn f16_round(x: f32) -> f64 {
+    let (x, u) = (x as f64, f16_ulp(x as f64));
+    let r = (x / u).round_ties_even() * u;
+    assert!(r.abs() <= 65504.0, "f16 overflow");
+    r
+}
+
+/// Random f16 bits: magnitudes 2^-6 to 8, or subnormal where `tiny`.
+fn rnd_f16(seed: &mut u64, tiny: bool) -> u16 {
+    let b = bits(seed);
+    let exp = if tiny { 0 } else { 9 + (b >> 10) % 9 };
+    (((b >> 31) << 15) | (exp << 10) | (b & 1023)) as u16
+}
+
+/// Decode attention of the token at `pos` in f64: query head h attends with kv head h / 3 to the keys at distances
+/// d < min(pos + 1, window), at rows (pos - d) % ring (pos - d where ring is 0). A key's score is scale q.k, plus the
+/// bias r[h] . rb[..][d] where d < extent, minus sink[h]; the softmax has a zero logit beside the scores.
+/// q [24][128], r [24][16], sink [24], rb BF16 [16][1024], the caches f16 [rows][8][128]. Returns [24][128].
+#[allow(clippy::too_many_arguments)]
+fn attn_ref(q: &[f32], r: &[f32], sink: &[f32], rb: &[u8], kc: &[u16], vc: &[u16], pos: usize, ring: usize, window: usize, extent: usize, scale: f64) -> Vec<f64> {
+    let nk = (pos + 1).min(window);
+    let row = |d: usize| if ring > 0 { (pos - d) % ring } else { pos - d };
+    let mut out = vec![0f64; 24 * 128];
+    for h in 0..24 {
+        let at = |d: usize, i: usize| (row(d) * 8 + h / 3) * 128 + i;
+        let s: Vec<f64> = (0..nk)
+            .map(|d| {
+                let dot: f64 = (0..128).map(|i| q[h * 128 + i] as f64 * f16(kc[at(d, i)])).sum();
+                let bias: f64 = if d < extent { (0..16).map(|j| r[h * 16 + j] as f64 * bf16(rb, j * 1024 + d)).sum() } else { 0.0 };
+                scale * dot + bias - sink[h] as f64
+            })
+            .collect();
+        let m = s.iter().fold(0f64, |a, &b| a.max(b));
+        let den = (-m).exp() + s.iter().map(|&v| (v - m).exp()).sum::<f64>();
+        for i in 0..128 {
+            out[h * 128 + i] = (0..nk).map(|d| (s[d] - m).exp() * f16(vc[at(d, i)])).sum::<f64>() / den;
+        }
+    }
+    out
+}
+
 /// y = W x on the CPU in f64, W a BF16 [rows][k].
 fn gemv_ref(w: &[u8], x: &[f32], rows: usize, k: usize) -> Vec<f64> {
     (0..rows).map(|r| (0..k).map(|c| bf16(w, r * k + c) * x[c] as f64).sum()).collect()
@@ -414,6 +474,150 @@ fn main() -> Result<(), String> {
         })
         .collect();
     check("ctrl_out bf16 gain, forget", rel_err(&by.download::<f32>(n)?, &want), 1e-5, &mut fails);
+
+    // attention on made-up f16 caches (every 97th row subnormal) with the BF16 bias profiles [16][1024] of layer 0
+    // (sliding: a ring of 1280 rows, a window of 1024, 18 chunks of 64) and of layer 5 (full, 8 chunks of 256): decode
+    // (attn_part, then attn_reduce, the last chunks past the keys) at a position before the window or the profiles'
+    // extent and at one past it, then prefill (attn_prefill) of the 3 tokens up to the second, their rows of q, r and
+    // sink padded
+    let scale = 1.0 / 128f32.sqrt();
+    for (l, ring, window, cs, positions) in [(0usize, 1280usize, 1024usize, 6u32, [100usize, 2000]), (5, 0, usize::MAX, 8, [37, 1300])] {
+        let rb = ck.get(&format!("model.llm.layers.{l}.attn.rel_logits_proj.proj"), Dtype::BF16, &[16, 1024])?;
+        let rows = if ring > 0 { ring } else { positions[1] + 1 };
+        let kc: Vec<u16> = (0..rows * 1024).map(|i| rnd_f16(&mut seed, i / 1024 % 97 == 0)).collect();
+        let vc: Vec<u16> = (0..rows * 1024).map(|i| rnd_f16(&mut seed, i / 1024 % 97 == 0)).collect();
+        let (brb, bkc, bvc) = (DevBuf::from_slice(rb)?, DevBuf::from_slice(&kc)?, DevBuf::from_slice(&vc)?);
+        let w = window.min(u32::MAX as usize) as u32;
+        let what = if ring > 0 { "sliding, ring" } else { "full" };
+        let maxs = if ring > 0 { 18 } else { 8 };
+        let (bpm, bpl, bpacc, bout) = (DevBuf::new(8 * maxs * 3 * 4)?, DevBuf::new(8 * maxs * 3 * 4)?, DevBuf::new(8 * maxs * 3 * 128 * 4)?, DevBuf::new(24 * 128 * 4)?);
+        for pos in positions {
+            let q: Vec<f32> = (0..24 * 128).map(|_| rnd(&mut seed) * 3.0).collect();
+            let r: Vec<f32> = (0..24 * 16).map(|_| rnd(&mut seed)).collect();
+            let sink: Vec<f32> = (0..24).map(|_| rnd(&mut seed) * 2.0).collect();
+            let (bq, br, bs, bp) = (DevBuf::from_slice(&q)?, DevBuf::from_slice(&r)?, DevBuf::from_slice(&sink)?, DevBuf::from_slice(&[pos as u32, 0, 0, 0])?);
+            k.attn_part(&s, bq.ptr, br.ptr, bs.ptr, brb.ptr, bkc.ptr, bvc.ptr, bpm.ptr, bpl.ptr, bpacc.ptr, bp.ptr, ring as u32, 1024, scale, maxs as u32, maxs as u32, w, cs)?;
+            k.attn_reduce(&s, bpm.ptr, bpl.ptr, bpacc.ptr, bout.ptr, bp.ptr, w, maxs as u32, cs, 24)?;
+            s.sync()?;
+            let want = attn_ref(&q, &r, &sink, rb, &kc, &vc, pos, ring, window, 1024, scale as f64);
+            check(&format!("attn_part + attn_reduce {what}, pos {pos}"), rel_err(&bout.download::<f32>(24 * 128)?, &want), 1e-5, &mut fails);
+        }
+        let (p0, nt, qs, rs, ss) = (positions[1] - 2, 3, 3072 + 64, 384 + 16, 24 + 8);
+        let q: Vec<f32> = (0..nt * qs).map(|_| rnd(&mut seed) * 3.0).collect();
+        let r: Vec<f32> = (0..nt * rs).map(|_| rnd(&mut seed)).collect();
+        let sink: Vec<f32> = (0..nt * ss).map(|_| rnd(&mut seed) * 2.0).collect();
+        let (bq, br, bs, bp, bo) = (DevBuf::from_slice(&q)?, DevBuf::from_slice(&r)?, DevBuf::from_slice(&sink)?, DevBuf::from_slice(&[p0 as u32, 0, 0, 0])?, DevBuf::new(nt * 3072 * 4)?);
+        k.attn_prefill(&s, bq.ptr, br.ptr, bs.ptr, brb.ptr, bkc.ptr, bvc.ptr, bo.ptr, bp.ptr, ring as u32, w, 1024, scale, qs as u32, rs as u32, ss as u32, nt as u32)?;
+        s.sync()?;
+        let out: Vec<f32> = bo.download(nt * 3072)?;
+        let mut err = 0f64;
+        for t in 0..nt {
+            let want = attn_ref(&q[t * qs..][..3072], &r[t * rs..][..384], &sink[t * ss..][..24], rb, &kc, &vc, p0 + t, ring, window, 1024, scale as f64);
+            err = err.max(rel_err(&out[t * 3072..][..3072], &want));
+        }
+        check(&format!("attn_prefill {what}, pos {p0}..{}", p0 + nt), err, 1e-5, &mut fails);
+    }
+
+    // the prefill cache writer: K and V of 5 tokens at positions 1278.. of a ring of 1280 rows, then of 3 tokens at 7..
+    // of a plain cache, their rows of 1024 padded to 1056: each value the nearest f16 (every 16th a tie, every 16th
+    // after it subnormal) at its row, the other rows untouched
+    for (ring, p0, nt) in [(1280usize, 1278usize, 5usize), (0, 7, 3)] {
+        let (rows, stride) = (if ring > 0 { ring } else { p0 + nt + 2 }, 1056);
+        let mut val = |i: usize| match i % 16 {
+            0 => (2048 + 2 * (bits(&mut seed) % 1024) + 1) as f32 / 2048.0 * 2f32.powi((bits(&mut seed) % 6) as i32 - 2) * if i % 32 == 0 { -1.0 } else { 1.0 },
+            1 => rnd(&mut seed) * 2f32.powi(-15),
+            _ => rnd(&mut seed) * 8.0,
+        };
+        let (kx, vx): (Vec<f32>, Vec<f32>) = ((0..nt * stride).map(&mut val).collect(), (0..nt * stride).map(&mut val).collect());
+        let (bk, bv, bp) = (DevBuf::from_slice(&kx)?, DevBuf::from_slice(&vx)?, DevBuf::from_slice(&[p0 as u32, 0, 0, 0])?);
+        let (bkc, bvc) = (DevBuf::zeroed(rows * 2048, &s)?, DevBuf::zeroed(rows * 2048, &s)?);
+        k.kv_store_t(&s, bk.ptr, bv.ptr, bkc.ptr, bvc.ptr, bp.ptr, ring as u32, 1024, stride as u32, stride as u32, nt as u32)?;
+        s.sync()?;
+        let (kc, vc): (Vec<u16>, Vec<u16>) = (bkc.download(rows * 1024)?, bvc.download(rows * 1024)?);
+        let mut wrong = 0;
+        for row in 0..rows {
+            let tok = (0..nt).find(|&t| (if ring > 0 { (p0 + t) % ring } else { p0 + t }) == row);
+            for (x, c) in [(&kx, &kc), (&vx, &vc)] {
+                for i in 0..1024 {
+                    let got = c[row * 1024 + i];
+                    wrong += !match tok {
+                        Some(t) => f16(got) == f16_round(x[t * stride + i]),
+                        None => got == 0,
+                    } as usize;
+                }
+            }
+        }
+        check(&format!("kv_store_t {}: values not the nearest f16", if ring > 0 { "ring" } else { "plain" }), wrong as f64, 0.0, &mut fails);
+    }
+
+    // the decode cache writer over 5 steps from a zero state: layer 0 (sliding: conv1d [c][1][4], a ring of 1280 rows
+    // at positions 1278..) and layer 5 (full: static taps [4][c] plus the input-dependent ones, a plain cache); the
+    // convolutions, the K clip to an L2 norm of 22.627 per head (inputs larger head by head, so some heads are clipped
+    // and some not), the V RMS norm without a gain; as f32, and as f16 rows (each value within half an f16 spacing of
+    // the f64 one), the other rows untouched
+    for (l, ring, p0) in [(0usize, 1280usize, 1278usize), (5, 0, 3)] {
+        let full = ring == 0;
+        let (wn, shape) = if full { ("sconv.static_w", vec![4, kv]) } else { ("sconv.weight", vec![kv, 1, 4]) };
+        let kw = ck.get(&format!("model.llm.layers.{l}.attn.k_{wn}"), Dtype::BF16, &shape)?;
+        let vw = ck.get(&format!("model.llm.layers.{l}.attn.v_{wn}"), Dtype::BF16, &shape)?;
+        // the weight of lag j (0 the current token) for channel c
+        let wl = |w: &[u8], c: usize, j: usize| if full { bf16(w, j * kv + c) } else { bf16(w, c * 4 + 3 - j) };
+        let (nx, rows) = (if full { kv + 32 } else { kv }, if ring > 0 { ring } else { p0 + 7 });
+        let (bkw, bvw, bst) = (DevBuf::from_slice(kw)?, DevBuf::from_slice(vw)?, DevBuf::zeroed(2 * kv * 3 * 4, &s)?);
+        let (bgk, bgv, bk, bv, bp) = (DevBuf::new(nx * 4)?, DevBuf::new(nx * 4)?, DevBuf::new(kv * 4)?, DevBuf::new(kv * 4)?, DevBuf::new(16)?);
+        let (bkc, bvc) = (DevBuf::zeroed(rows * 2048, &s)?, DevBuf::zeroed(rows * 2048, &s)?);
+        let (cscale, thr, eps) = (if full { 1.0 / 3.0 } else { 1.0 / 5f32.sqrt() }, 22.627f32, 1e-6f32);
+        let mut hist: Vec<[Vec<f32>; 2]> = vec![];
+        let (mut err, mut e16, mut clipped) = (0f64, 0f64, 0);
+        for step in 0..5 {
+            let gk: Vec<f32> = (0..nx).map(|i| rnd(&mut seed) * if i < kv { 0.5 + (i / 128) as f32 } else { 0.5 }).collect();
+            let gv: Vec<f32> = (0..nx).map(|i| rnd(&mut seed) * if i < kv { 2.0 } else { 0.5 }).collect();
+            let pos = p0 + step;
+            bgk.upload(&gk)?;
+            bgv.upload(&gv)?;
+            bp.upload(&[pos as u32, 0, 0, 0])?;
+            k.kv_prep(&s, full, bgk.ptr, bgv.ptr, bkw.ptr, bvw.ptr, bst.ptr, bk.ptr, bv.ptr, bkc.ptr, bvc.ptr, bp.ptr, ring as u32, cscale, thr, eps)?;
+            s.sync()?;
+            hist.push([gk, gv]);
+            let conv = |x: usize, w: &[u8], c: usize| {
+                let cur = &hist[hist.len() - 1][x];
+                let mut o = cur[c] as f64;
+                for j in 0..4.min(hist.len()) {
+                    let tap = if full { cur[kv + c / 128 * 4 + j] as f64 } else { 0.0 };
+                    o += (wl(w, c, j) + tap) * hist[hist.len() - 1 - j][x][c] as f64;
+                }
+                o * cscale as f64
+            };
+            let (mut kr, mut vr): (Vec<f64>, Vec<f64>) = ((0..kv).map(|c| conv(0, kw, c)).collect(), (0..kv).map(|c| conv(1, vw, c)).collect());
+            for h in 0..8 {
+                let ks = &mut kr[h * 128..][..128];
+                let f = (thr as f64 / (ks.iter().map(|a| a * a).sum::<f64>().sqrt() + 1e-6)).clamp(0.0, 1.0);
+                clipped += (f < 1.0) as usize;
+                ks.iter_mut().for_each(|a| *a *= f);
+                let vs = &mut vr[h * 128..][..128];
+                let rms = (vs.iter().map(|a| a * a).sum::<f64>() / 128.0 + eps as f64).sqrt();
+                vs.iter_mut().for_each(|a| *a /= rms);
+            }
+            err = err.max(rel_err(&bk.download::<f32>(kv)?, &kr)).max(rel_err(&bv.download::<f32>(kv)?, &vr));
+            let row = if ring > 0 { pos % ring } else { pos };
+            for (c, want) in [(bkc.download::<u16>(rows * 1024)?, &kr), (bvc.download::<u16>(rows * 1024)?, &vr)] {
+                for (i, &w) in want.iter().enumerate() {
+                    e16 = e16.max((f16(c[row * 1024 + i]) - w).abs() / f16_ulp(w));
+                }
+            }
+        }
+        let written: Vec<usize> = (0..5).map(|t| if ring > 0 { (p0 + t) % ring } else { p0 + t }).collect();
+        for c in [bkc.download::<u16>(rows * 1024)?, bvc.download::<u16>(rows * 1024)?] {
+            if (0..rows).filter(|r| !written.contains(r)).any(|r| c[r * 1024..][..1024].iter().any(|&v| v != 0)) {
+                fails.push(format!("kv_prep layer {l}: a row not of the 5 positions was written"));
+            }
+        }
+        if clipped == 0 || clipped == 40 {
+            fails.push(format!("kv_prep layer {l}: {clipped} of 40 heads clipped; the check wants both kinds"));
+        }
+        check(&format!("kv_prep layer {l} k, v"), err, 1e-5, &mut fails);
+        check(&format!("kv_prep layer {l} f16 rows (f16 spacings)"), e16, 0.501, &mut fails);
+    }
 
     if fails.is_empty() {
         println!("all good");
