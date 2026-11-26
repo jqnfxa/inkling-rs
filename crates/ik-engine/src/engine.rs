@@ -672,8 +672,8 @@ impl Engine {
                 break vram_rows;
             }
             if t == T_FLOOR {
-                let per = per_step / KV_STEP;
-                let most = if host_ok { (kv_budget / per_step * KV_STEP) + host_free / per } else { kv_budget / per };
+                // the context's rows are whole KV_STEPs, and so are those in VRAM
+                let most = (kv_budget / per_step + if host_ok { host_free / per_step } else { 0 }) * KV_STEP;
                 return Err(format!(
                     "a context of {} tokens needs {} MiB of KV cache; there are {} MiB of VRAM for it and the experts{}: {} tokens at most",
                     e.n_ctx,
