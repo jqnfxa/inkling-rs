@@ -198,7 +198,7 @@ impl BatchBufs {
             inp_sa: g(rg, tm * n),
             mix: many(rg, 3),
             msg: many(rg, 4),
-            ctl: many(rg, 4),
+            ctl: many(rg, 3),
             ctl_g: g(rg, tm * 2 * n),
             ctl_gate: g(rg, tm * 64),
             inn: many(rg, 3),
