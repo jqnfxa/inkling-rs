@@ -286,7 +286,10 @@ impl Engine {
             ring.push(if hp.is_swa[ip] { (hp.n_swa + T_MAX) as u32 } else { 0 });
             conv.push(f((2 * kv + 2 * n) * 3)?);
         }
-        let maxs = opt.n_ctx.div_ceil(1 << CS_FULL).max(hp.n_swa.div_ceil(1 << CS_SWA));
+        // the GPU's chunks of full attention cover the rows in VRAM, which are fewer than VRAM holds
+        let full = (0..n_slots).filter(|&il| !hp.is_swa[Self::phys(&hp, il)]).count().max(1);
+        let vram_rows_max = ctx.mem_info()?.1 / (full * 2 * KV_ROW);
+        let maxs = opt.n_ctx.min(vram_rows_max).div_ceil(1 << CS_FULL).max(hp.n_swa.div_ceil(1 << CS_SWA));
         let sc = Scratch {
             x: f(n)?,
             inp_sa: f(n)?,
@@ -1564,7 +1567,7 @@ impl Engine {
         let maxs = self.maxs as u32;
         let mut cases = vec![(1024u32, (hp.n_swa + T_MAX) as u32, 6usize)];
         let mut keys = 4096;
-        while keys <= self.n_ctx {
+        while keys <= self.n_ctx.min(self.kv_vram_rows) {
             cases.push((keys as u32, 0, 5));
             keys *= 2;
         }
@@ -1572,7 +1575,7 @@ impl Engine {
             let p: [u32; 4] = [keys - 1, 1f32.to_bits(), 1f32.to_bits(), 0];
             self.params.upload(&p)?;
             let (window, cs) = if ring != 0 { (hp.n_swa as u32, CS_SWA) } else { (u32::MAX, CS_FULL) };
-            let nsplit = if ring != 0 { hp.n_swa } else { self.n_ctx }.div_ceil(1 << cs) as u32;
+            let nsplit = if ring != 0 { hp.n_swa } else { self.n_ctx.min(self.kv_vram_rows) }.div_ceil(1 << cs) as u32;
             let [kc, vc] = self.kv(kvi);
             let lr = &self.w.layers[kvi];
             time!(format!("attn part+reduce {keys} keys"), keys as usize * 2 * KV_ROW, {
