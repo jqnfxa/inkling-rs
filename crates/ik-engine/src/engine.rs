@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use crate::checkpoint::{Checkpoint, Dtype};
 use crate::cpu_pool::{ATTN_JOB, ATTN_OUT, ATTN_STEP, AttnCtx, Pool};
@@ -45,6 +46,9 @@ const KV_ROW: usize = 2048;
 
 /// The full-attention KV caches get memory in steps of this many rows (a 2 MiB page).
 const KV_STEP: usize = 1024;
+/// The VRAM that decode leaves the expert cache when it takes KV rows from host memory (dec_split), MiB: ~31 NVFP4
+/// slots. Down to about that many slots, the 146 rows that a slot's VRAM holds save more a token than the slot does.
+const DEC_CACHE_MIB: usize = 144;
 /// host memory left free when the KV cache spills there
 const HOST_MARGIN: usize = 1 << 30;
 /// Prefill reads the host rows of the KV cache from copies in VRAM, this many rows at a time.
@@ -364,8 +368,14 @@ pub struct Engine {
     /// the full-attention caches, K and V in f16 rows, at addresses for n_ctx rows; memory for kv_mapped
     kv_vm: Vec<Option<[VmBuf; 2]>>,
     kv_mapped: usize,
-    /// the rows of kv_vm in VRAM; the rows past them are host memory
+    /// the rows of kv_vm in VRAM while prefill runs, its region beside them; the rows past them are host memory
     kv_vram_rows: usize,
+    /// the rows of kv_vm in VRAM now: kv_vram_rows while prefill runs, those of dec_split while decode does
+    kv_split: usize,
+    /// the VRAM that decode leaves the expert cache when it takes more KV rows than prefill (IK_DEC_CACHE_MIB)
+    dec_cache: usize,
+    /// a page of addresses with nothing mapped: the KV pages that move between VRAM and host memory get their copy there
+    kv_scratch: Option<VmBuf>,
     /// whether the caches have rows past kv_vram_rows: then decode posts attention jobs to the CPU team for them
     kv_cpu: bool,
     /// the order of each full-attention slot among them: its attention job's step is ATTN_STEP + this
@@ -456,6 +466,9 @@ pub struct Stats {
     /// upload to be done
     pub pf_stream_copy_s: f64,
     pub pf_stream_wait_s: f64,
+    /// KV pages moved between VRAM and host memory as decode's split and prefill's take turns, and the seconds it took
+    pub kv_moved: u64,
+    pub kv_move_s: f64,
 }
 
 /// Host memory that can still be taken: MemAvailable, and within the memory limit of this process's cgroup if it has
@@ -623,6 +636,9 @@ impl Engine {
             kv_vm,
             kv_mapped: 0,
             kv_vram_rows: 0,
+            kv_split: 0,
+            dec_cache: std::env::var("IK_DEC_CACHE_MIB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(DEC_CACHE_MIB) << 20,
+            kv_scratch: None,
             kv_cpu: false,
             attn_idx: vec![],
             attn_out: HostBuf::new(4 * ATTN_OUT)?,
@@ -652,15 +668,12 @@ impl Engine {
             copy_s: Stream::new_nonblocking()?,
             pf_stream,
         };
-        // the full-attention KV rows: in VRAM as far as the budget goes (IK_KV_VRAM_ROWS caps them), the rest in host
-        // memory where the device can map it there
+        // the full-attention KV rows: in VRAM as far as the budget goes (IK_KV_VRAM_ROWS caps them while prefill runs;
+        // decode's follow dec_split), the rest in host memory where the device can map it there
         let all = e.n_ctx.div_ceil(KV_STEP) * KV_STEP;
         let per_step = e.kv_bytes(KV_STEP).max(1);
-        let cap = std::env::var("IK_KV_VRAM_ROWS").ok().and_then(|v| v.parse::<usize>().ok());
-        let rows_for = |budget: usize| {
-            let r = (budget / per_step * KV_STEP).min(all);
-            cap.map_or(r, |c| r.min(c.div_ceil(KV_STEP) * KV_STEP))
-        };
+        let cap = std::env::var("IK_KV_VRAM_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).map_or(usize::MAX, |c| c.div_ceil(KV_STEP) * KV_STEP);
+        let rows_for = |budget: usize| (budget / per_step * KV_STEP).min(all).min(cap);
         // the VRAM rows leave prefill's region room in its layout for T_MAX tokens, or for fewer down to T_FLOOR where
         // the whole context would not fit beside it, with the stage if there are host rows. Decode gains little from
         // the rows that a smaller region would leave in VRAM: past them the expert cache has their memory instead.
@@ -700,6 +713,7 @@ impl Engine {
             v.set_host_from(vram_rows * KV_ROW);
         }
         e.kv_vram_rows = vram_rows;
+        e.kv_split = vram_rows;
         e.kv_cpu = vram_rows < all;
         let mut g = 0;
         for b in &e.kv_vm {
@@ -718,11 +732,12 @@ impl Engine {
                 kv: e.kv_vm.iter().map(|b| b.as_ref().map(|b| (b[0].ptr as usize, b[1].ptr as usize))).collect(),
                 phys: (0..e.kv_vm.len()).map(|il| Self::phys(hp, il)).collect(),
                 proj,
-                vram: vram_rows,
+                vram: AtomicUsize::new(vram_rows),
                 extent: hp.rel_extent,
                 scale: 1.0 / (hp.head_dim as f32).sqrt(),
                 out: e.attn_out.ptr as usize,
             });
+            e.kv_scratch = Some(VmBuf::reserve(1, e.ctx.device)?);
         }
         // the region's bytes in each layout, which pf_plan chooses from
         let mut t = T_MIN;
@@ -755,46 +770,95 @@ impl Engine {
     /// Gives the full-attention KV caches memory for `rows` positions (rounded up to KV_STEP) and the expert cache the
     /// rest of the budget, less prefill's region while it runs. As the context grows the last slots go, with their
     /// experts; when a new sequence is shorter, or decode takes over from prefill, they come back empty and fill as
-    /// experts are used.
+    /// experts are used. The rows in VRAM are prefill's while it runs, decode's (dec_split) else: the pages between
+    /// move over.
     fn plan_kv(&mut self, rows: usize) -> Result<()> {
         let rows = (rows.div_ceil(KV_STEP) * KV_STEP).min(self.n_ctx.div_ceil(KV_STEP) * KV_STEP);
-        // the VRAM rows; new ensured they fit with the region
-        let kv = self.kv_bytes(rows.min(self.kv_vram_rows));
+        // new ensured that prefill's rows in VRAM fit with its region
+        let split = if self.pf_on { self.kv_vram_rows } else { self.dec_split(rows) };
+        let kv = self.kv_bytes(rows.min(split));
         let pf = if self.pf_on { self.region.bytes() } else { 0 };
         let slots = self.cache.fit(self.vram_budget.saturating_sub(kv + pf));
-        if rows == self.kv_mapped && slots == [self.cache.banks[0].n_slots, self.cache.banks[1].n_slots] {
+        if rows == self.kv_mapped && split == self.kv_split && slots == [self.cache.banks[0].n_slots, self.cache.banks[1].n_slots] {
             return Ok(());
         }
-        // nothing in flight may touch the pages that go: finish the token's work and the uploads
+        // nothing in flight may touch the pages that go or move: finish the token's work and the uploads
         self.s.sync()?;
         self.copy_s.sync()?;
         let resize = |e: &mut Engine, rows: usize| -> Result<()> {
             for v in e.kv_vm.iter_mut().flatten().flatten() {
                 v.resize(rows * KV_ROW, &e.s)?;
             }
+            e.kv_mapped = rows;
             Ok(())
         };
         // host pages are page-locked, which the cgroup's memory.max does not reliably count: new checked the whole
-        // context against what was free then, and each step past it is checked against what is free now
-        if rows > self.kv_mapped.max(self.kv_vram_rows) {
-            let more = self.kv_bytes(rows) - self.kv_bytes(self.kv_mapped.max(self.kv_vram_rows));
+        // context against what was free then, and each step past it, of rows or of pages back from VRAM, is checked
+        // against what is free now
+        let host = |e: &Engine, rows: usize, split: usize| e.kv_bytes(rows) - e.kv_bytes(rows.min(split));
+        let more = host(self, rows, split).saturating_sub(host(self, self.kv_mapped, self.kv_split));
+        if more > 0 {
             let free = host_mem_free().saturating_sub(HOST_MARGIN);
             if more > free {
                 return Err(format!("the KV cache of {rows} tokens needs {} MiB more of host memory; {} MiB are free", more >> 20, free >> 20));
             }
         }
-        // release before taking: the KV rows first when they shrink, the slots first when they do
+        // release before taking: the rows that go and the pages that move to host memory before the slots change, the
+        // pages that move to VRAM and the rows that come after
         if rows < self.kv_mapped {
             resize(self, rows)?;
         }
+        if split < self.kv_split {
+            self.move_split(split)?;
+        }
         self.cache.set_slots(slots, &self.s)?;
+        if split > self.kv_split {
+            self.move_split(split)?;
+        }
         if rows > self.kv_mapped {
             resize(self, rows)?;
         }
-        self.kv_mapped = rows;
         self.s.sync()?;
         let flat: Vec<i32> = self.cache.slot_of.iter().flatten().copied().collect();
         self.map.upload(&flat)
+    }
+
+    /// The KV rows that decode keeps in VRAM with `rows` mapped. The CPU team attends a host row in the 8 full passes
+    /// in ~1.1 us, the GPU one in VRAM in ~0.23 us, the two parts at once. While the CPU's is the longer, the 146 rows
+    /// that an expert slot's VRAM holds save ~0.16 ms a token, more than the slot does down to some 30 slots. So past
+    /// prefill's rows decode's take the expert cache's VRAM, as far as the cache keeps dec_cache and the host more
+    /// than a sixth of the rows (where the two parts take as long).
+    fn dec_split(&self, rows: usize) -> usize {
+        if !self.kv_cpu {
+            return self.kv_vram_rows;
+        }
+        let even = (rows - rows / 6) / KV_STEP * KV_STEP;
+        let most = self.vram_budget.saturating_sub(self.dec_cache) / self.kv_bytes(KV_STEP).max(1) * KV_STEP;
+        even.min(most).max(self.kv_vram_rows)
+    }
+
+    /// Moves the KV rows in VRAM to `split`: the pages between move over with their contents, the CPU team's attention
+    /// jobs and the decode graph follow. If a page fails to move, the split is where every cache has only host pages
+    /// past it, as the CPU team's part needs.
+    fn move_split(&mut self, split: usize) -> Result<()> {
+        let scratch = self.kv_scratch.as_ref().ok_or("no addresses to move KV pages through")?.ptr;
+        let t = std::time::Instant::now();
+        let vram = |e: &Engine| e.kv_vm.iter().flatten().flatten().map(|v| v.split().min(v.mapped())).sum::<usize>() as i64;
+        let before = vram(self);
+        let mut r = Ok(());
+        for v in self.kv_vm.iter_mut().flatten().flatten() {
+            r = v.move_split(split * KV_ROW, scratch, &self.s);
+            if r.is_err() {
+                break;
+            }
+        }
+        self.kv_split = if r.is_ok() { split } else { self.kv_vm.iter().flatten().flatten().map(|v| v.split() / KV_ROW).max().unwrap_or(split) };
+        // a page of each cache holds KV_STEP rows
+        self.stats.kv_moved += (vram(self) - before).unsigned_abs() / (KV_STEP * KV_ROW) as u64;
+        self.stats.kv_move_s += t.elapsed().as_secs_f64();
+        self.pool.set_attn_vram(self.kv_split);
+        self.graph = None;
+        r
     }
 
     /// Prefill's region takes its memory from the expert cache (`on`), with the experts of the slots that go, or gives
@@ -808,15 +872,22 @@ impl Engine {
         self.copy_s.sync()?;
         self.pf_on = on;
         if on {
-            self.plan_kv(self.kv_mapped)?;
-            self.region.set(true, &self.s)?;
-            self.s.sync()?;
-            self.b.one.upload(&vec![1f32; self.tm])?;
+            let r = (|| {
+                self.plan_kv(self.kv_mapped)?;
+                self.region.set(true, &self.s)?;
+                self.s.sync()?;
+                self.b.one.upload(&vec![1f32; self.tm])
+            })();
+            if r.is_err() {
+                // decode's memory as far as it got (the pages that moved stay where they are): prefill tries again
+                self.pf_on = false;
+                let _ = self.region.set(false, &self.s);
+            }
+            r
         } else {
             self.region.set(false, &self.s)?;
-            self.plan_kv(self.kv_mapped)?;
+            self.plan_kv(self.kv_mapped)
         }
-        Ok(())
     }
 
     /// Lays prefill's device buffers out in its region for ubatches of up to `tm` tokens: the batch buffers, the expert
@@ -1909,12 +1980,12 @@ impl Engine {
         // full attention with rows in host memory: the CPU team takes them (an attention job, posted first so the two
         // parts run together), the GPU the rows in VRAM
         let cpu = !swa && self.kv_cpu;
-        let (vram, step) = if cpu { (self.kv_vram_rows as u32, ATTN_STEP + self.attn_idx[il]) } else { (u32::MAX, 0) };
+        let (vram, step) = if cpu { (self.kv_split as u32, ATTN_STEP + self.attn_idx[il]) } else { (u32::MAX, 0) };
         if cpu {
             let nr = (hp.n_head * hp.n_rel) as u32;
             self.k.job_post(&self.s, self.sc.q.ptr, nh, self.sc.r.ptr, nr, sink, hp.n_head as u32, self.job.dev, p_pos, step, il as u32)?;
         }
-        let nsplit = if swa { hp.n_swa } else { self.n_ctx.min(self.kv_vram_rows) }.div_ceil(1 << cs).max(1) as u32;
+        let nsplit = if swa { hp.n_swa } else { self.n_ctx.min(self.kv_split) }.div_ceil(1 << cs).max(1) as u32;
         self.k.attn_part(&self.s, self.sc.q.ptr, self.sc.r.ptr, sink, l.rel_proj.ptr, kc, vc, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, p_pos, ring, extent, scale, maxs, nsplit, window, cs, vram)?;
         if !swa {
             // the per-chunk max and sum of each head: [kv head][chunk][3]
@@ -2265,7 +2336,7 @@ impl Engine {
         let maxs = self.maxs as u32;
         let mut cases = vec![(1024u32, (hp.n_swa + T_MAX) as u32, 6usize)];
         let mut keys = 4096;
-        while keys <= self.n_ctx.min(self.kv_vram_rows) {
+        while keys <= self.n_ctx.min(self.kv_split) {
             cases.push((keys as u32, 0, 5));
             keys *= 2;
         }
@@ -2273,7 +2344,7 @@ impl Engine {
             let p: [u32; 4] = [keys - 1, 1f32.to_bits(), 1f32.to_bits(), 0];
             self.params.upload(&p)?;
             let (window, cs) = if ring != 0 { (hp.n_swa as u32, CS_SWA) } else { (u32::MAX, CS_FULL) };
-            let nsplit = if ring != 0 { hp.n_swa } else { self.n_ctx.min(self.kv_vram_rows) }.div_ceil(1 << cs) as u32;
+            let nsplit = if ring != 0 { hp.n_swa } else { self.n_ctx.min(self.kv_split) }.div_ceil(1 << cs) as u32;
             let [kc, vc] = self.kv(kvi);
             let lr = &self.w.layers[kvi];
             time!(format!("attn part+reduce {keys} keys"), keys as usize * 2 * KV_ROW, {

@@ -4,7 +4,7 @@
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 use crate::cpu::{dot_row, order_x, x_pos};
@@ -30,7 +30,8 @@ pub struct AttnCtx {
     pub kv: Vec<Option<(usize, usize)>>,
     pub phys: Vec<usize>,
     pub proj: Vec<Vec<u16>>,
-    pub vram: usize,
+    /// the rows in VRAM (the GPU's), which the engine moves between tokens
+    pub vram: AtomicUsize,
     pub extent: usize,
     pub scale: f32,
     /// host address of the partials, [ATTN_OUT] f32
@@ -599,7 +600,7 @@ fn attn_job(sh: &Shared, job: *const u32) {
     let Some(ac) = sh.attn.get() else { return };
     // SAFETY: the GPU wrote the job before seq, behind a system fence
     let (il, pos) = unsafe { (std::ptr::read_volatile(job.add(1)) as usize, std::ptr::read_volatile(job.add(2)) as usize) };
-    let d0 = (pos + 1).saturating_sub(ac.vram);
+    let d0 = (pos + 1).saturating_sub(ac.vram.load(Ordering::Acquire));
     if d0 == 0 || ac.kv.get(il).is_none_or(|kv| kv.is_none()) {
         return;
     }
@@ -647,6 +648,13 @@ impl Pool {
     /// Sets what the attention jobs need; once, before the first.
     pub fn set_attn(&self, ac: AttnCtx) {
         let _ = self.shared.attn.set(ac);
+    }
+
+    /// Moves the split of the attention jobs: the rows from `rows` on are the CPU's. No job may be in flight.
+    pub fn set_attn_vram(&self, rows: usize) {
+        if let Some(ac) = self.shared.attn.get() {
+            ac.vram.store(rows, Ordering::Release);
+        }
     }
 
     /// Starts a prefill job on the team; wait_batch returns when it is done.

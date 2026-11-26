@@ -411,6 +411,64 @@ impl VmBuf {
         self.pages.len().saturating_sub(self.host_from) * self.page
     }
 
+    /// The byte from which pages are host memory.
+    pub fn split(&self) -> usize {
+        self.host_from.saturating_mul(self.page)
+    }
+
+    /// Moves the split between device and host pages to byte `bytes` (rounded up to pages): each mapped page on the
+    /// wrong side moves over with its contents (move_page), one at a time with the split, which so stays true if one
+    /// fails. Pages mapped later follow the split. The caller makes sure no work in flight uses the pages that move.
+    pub fn move_split(&mut self, bytes: usize, scratch: CUdeviceptr, s: &Stream) -> Result<()> {
+        let new = self.pages_for(bytes) / self.page;
+        if new > self.host_from {
+            for i in self.host_from..new.min(self.pages.len()) {
+                self.move_page(i, false, scratch, s)?;
+                self.host_from = i + 1;
+            }
+        } else {
+            for i in (new..self.host_from.min(self.pages.len())).rev() {
+                self.move_page(i, true, scratch, s)?;
+                self.host_from = i;
+            }
+        }
+        self.host_from = new;
+        Ok(())
+    }
+
+    /// Gives mapped page `i` new memory, in host memory or VRAM, with its contents: the new memory is mapped first at
+    /// `scratch` (a page of addresses with nothing mapped) to copy them over on `s`, then in place of the old.
+    fn move_page(&mut self, i: usize, host: bool, scratch: CUdeviceptr, s: &Stream) -> Result<()> {
+        let (at, page) = (self.ptr + (i * self.page) as u64, self.page);
+        // the device reads and writes all pages; the host its own too
+        let desc = [CUmemAccessDesc { location: CUmemLocation { ty: 1, id: self.dev }, flags: 3 }, CUmemAccessDesc { location: CUmemLocation { ty: 3, id: 0 }, flags: 3 }];
+        let nd = 1 + host as usize;
+        let mut h = 0;
+        ck!(cuMemCreate(&mut h, page, &Self::prop(self.dev, host), 0))?;
+        let copied = ck!(cuMemMap(scratch, page, 0, h, 0)).and_then(|_| {
+            let r = ck!(cuMemSetAccess(scratch, page, desc.as_ptr(), nd)).and_then(|_| ck!(cuMemcpyDtoDAsync_v2(scratch, at, page, s.0))).and_then(|_| s.sync());
+            let u = ck!(cuMemUnmap(scratch, page));
+            r.and(u)
+        });
+        let moved = copied.and_then(|_| ck!(cuMemUnmap(at, page))).and_then(|_| {
+            ck!(cuMemMap(at, page, 0, h, 0)).and_then(|_| ck!(cuMemSetAccess(at, page, desc.as_ptr(), nd))).inspect_err(|_| {
+                // back to the old memory, which still holds the contents
+                // SAFETY: the addresses are this buffer's, the old memory its own
+                unsafe {
+                    cuMemUnmap(at, page);
+                    cuMemMap(at, page, 0, self.pages[i], 0);
+                    cuMemSetAccess(at, page, desc.as_ptr(), 3 - nd);
+                }
+            })
+        });
+        if let Err(e) = moved {
+            // SAFETY: the new memory is mapped nowhere now
+            unsafe { cuMemRelease(h) };
+            return Err(e);
+        }
+        ck!(cuMemRelease(std::mem::replace(&mut self.pages[i], h)))
+    }
+
     /// The bytes that `bytes` of content take: whole pages.
     pub fn pages_for(&self, bytes: usize) -> usize {
         bytes.div_ceil(self.page) * self.page
