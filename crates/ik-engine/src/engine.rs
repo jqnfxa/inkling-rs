@@ -362,9 +362,15 @@ pub struct Engine {
     pub s: Stream,
     pub n_ctx: usize,
     sched: Vec<Step>,
-    /// the sliding-window rings of K and of V: f16 rows [rows][8][128]
-    kcache: Vec<Option<DevBuf>>,
-    vcache: Vec<Option<DevBuf>>,
+    /// the sliding-window rings of K and of V: f16 rows [rows][8][128], at addresses for n_swa + T_MAX rows (the long
+    /// layout, row pos % (n_swa + T_MAX)), with memory for n_swa of them (the short one, pos % n_swa) while decode runs
+    /// with no checkpoint out (set_ring)
+    swa: Vec<Option<[VmBuf; 2]>>,
+    /// whether plan_kv gives the expert cache and the KV rows the rings' second halves' VRAM: only while every ring is
+    /// short (self.ring holds each one's layout)
+    ring_short: bool,
+    /// the VRAM of the rings' second halves; 0 where the short layout is not used (T_MAX != n_swa)
+    ring_spare: usize,
     /// the full-attention caches, K and V in f16 rows, at addresses for n_ctx rows; memory for kv_mapped
     kv_vm: Vec<Option<[VmBuf; 2]>>,
     kv_mapped: usize,
@@ -501,8 +507,7 @@ impl Engine {
         let f = |len: usize| DevBuf::zeroed(len * 4, &s);
 
         let n_slots = hp.n_slots();
-        let mut kcache = vec![];
-        let mut vcache = vec![];
+        let mut swa = vec![];
         let mut kv_vm = vec![];
         let mut ring = vec![];
         let mut conv = vec![];
@@ -510,14 +515,18 @@ impl Engine {
             let ip = Self::phys(&hp, il);
             let rows = if hp.is_swa[ip] { hp.n_swa + T_MAX } else { opt.n_ctx };
             if hp.is_swa[ip] {
-                kcache.push(Some(DevBuf::zeroed(rows * KV_ROW, &s)?));
-                vcache.push(Some(DevBuf::zeroed(rows * KV_ROW, &s)?));
+                // long; new makes them short once the budget is known
+                let r = || -> Result<VmBuf> {
+                    let mut v = VmBuf::reserve(rows * KV_ROW, ctx.device)?;
+                    v.resize(rows * KV_ROW, &s)?;
+                    Ok(v)
+                };
+                swa.push(Some([r()?, r()?]));
                 kv_vm.push(None);
             } else {
                 // memory comes as the context grows (plan_kv)
                 let r = || VmBuf::reserve(rows.div_ceil(KV_STEP) * KV_STEP * KV_ROW, ctx.device);
-                kcache.push(None);
-                vcache.push(None);
+                swa.push(None);
                 kv_vm.push(Some([r()?, r()?]));
             }
             ring.push(if hp.is_swa[ip] { (hp.n_swa + T_MAX) as u32 } else { 0 });
@@ -593,7 +602,10 @@ impl Engine {
         let (free, _) = ctx.mem_info()?;
         let margin = std::env::var("IK_VRAM_MARGIN_MIB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(160) << 20;
         let vram_budget = free.saturating_sub(margin);
-        let max_slots = if GPU_EXPERTS { (vram_budget / (ex.gu_bytes[0] + ex.down_bytes[0])).min(opt.cache_slots) } else { 0 };
+        // decode's short rings free their second halves (set_ring), which blocks of n_swa positions alternate between in
+        // the long layout
+        let ring_spare = if T_MAX == n_swa { swa.iter().flatten().flatten().map(|v| v.mapped() - v.pages_for(n_swa * KV_ROW)).sum() } else { 0 };
+        let max_slots = if GPU_EXPERTS { ((vram_budget + ring_spare) / (ex.gu_bytes[0] + ex.down_bytes[0])).min(opt.cache_slots) } else { 0 };
         let cache = ExpertCache::new(&ex, &hp, max_slots, ctx.device)?;
         s.sync()?;
         let job = HostBuf::new(4 * (32 + n.max(ATTN_JOB)))?;
@@ -631,8 +643,9 @@ impl Engine {
             s,
             n_ctx: opt.n_ctx,
             sched,
-            kcache,
-            vcache,
+            swa,
+            ring_short: false,
+            ring_spare,
             kv_vm,
             kv_mapped: 0,
             kv_vram_rows: 0,
@@ -748,6 +761,7 @@ impl Engine {
         }
         e.place(e.floor);
         e.plan_kv(T_MAX)?;
+        e.set_ring(true)?;
         Ok(e)
     }
 
@@ -778,7 +792,7 @@ impl Engine {
         let split = if self.pf_on { self.kv_vram_rows } else { self.dec_split(rows) };
         let kv = self.kv_bytes(rows.min(split));
         let pf = if self.pf_on { self.region.bytes() } else { 0 };
-        let slots = self.cache.fit(self.vram_budget.saturating_sub(kv + pf));
+        let slots = self.cache.fit(self.budget().saturating_sub(kv + pf));
         if rows == self.kv_mapped && split == self.kv_split && slots == [self.cache.banks[0].n_slots, self.cache.banks[1].n_slots] {
             return Ok(());
         }
@@ -823,6 +837,80 @@ impl Engine {
         self.map.upload(&flat)
     }
 
+    /// The VRAM for the expert cache, the KV rows in VRAM and prefill's region: with the rings' second halves while
+    /// they are short.
+    fn budget(&self) -> usize {
+        self.vram_budget + if self.ring_short { self.ring_spare } else { 0 }
+    }
+
+    /// The rings' rows in a layout: n_swa (short) or n_swa + T_MAX (long).
+    fn ring_len(&self, short: bool) -> usize {
+        self.hp.n_swa + if short { 0 } else { T_MAX }
+    }
+
+    /// Whether every ring is laid out short (or long).
+    fn rings_are(&self, short: bool) -> bool {
+        let len = self.ring_len(short) as u32;
+        self.swa.iter().zip(&self.ring).all(|(b, &r)| b.is_none() || r == len)
+    }
+
+    /// Lays the rings out short (where ring_spare) or long, and plans the KV memory: the second halves go before
+    /// plan_kv gives their VRAM to the expert cache and the KV rows, or come after it has taken it back. The window's
+    /// rows move to their rows in the new layout: those of positions in odd blocks of n_swa are in the long one's
+    /// second half, and in the short one where the block before them was, over rows of positions before the window.
+    /// A ring's length (self.ring) is its layout throughout: if a step fails, the rings not yet laid out keep theirs.
+    fn set_ring(&mut self, short: bool) -> Result<()> {
+        let short = short && self.ring_spare > 0;
+        if self.rings_are(short) {
+            self.ring_short = short;
+            return self.plan_kv(self.kv_mapped);
+        }
+        let (w, len) = (self.hp.n_swa, self.ring_len(short));
+        if !short {
+            self.ring_short = false;
+            self.plan_kv(self.kv_mapped)?;
+        }
+        // (row in the first half, rows) of the window's positions in odd blocks
+        let q0 = self.pos.saturating_sub(w);
+        let runs: Vec<(usize, usize)> = (q0 / w..self.pos.div_ceil(w))
+            .filter(|b| b % 2 == 1)
+            .map(|b| (q0.max(b * w), self.pos.min((b + 1) * w)))
+            .filter(|(lo, hi)| lo < hi)
+            .map(|(lo, hi)| (lo % w, hi - lo))
+            .collect();
+        let todo: Vec<usize> = (0..self.swa.len()).filter(|&il| self.swa[il].is_some() && self.ring[il] as usize != len).collect();
+        self.s.sync()?;
+        self.graph = None;
+        for &il in &todo {
+            for v in self.swa[il].iter_mut().flatten() {
+                if !short {
+                    v.resize(len * KV_ROW, &self.s)?;
+                }
+                for &(row, n) in &runs {
+                    let (first, second) = (v.at(row * KV_ROW), v.at((row + w) * KV_ROW));
+                    let (dst, src) = if short { (first, second) } else { (second, first) };
+                    cuda::copy_d2d(dst, src, n * KV_ROW, &self.s)?;
+                }
+            }
+            if !short {
+                self.ring[il] = len as u32;
+            }
+        }
+        if short {
+            // the copies read the second halves, which go
+            self.s.sync()?;
+            for &il in &todo {
+                self.ring[il] = len as u32;
+                for v in self.swa[il].iter_mut().flatten() {
+                    v.resize(len * KV_ROW, &self.s)?;
+                }
+            }
+            self.ring_short = true;
+            self.plan_kv(self.kv_mapped)?;
+        }
+        Ok(())
+    }
+
     /// The KV rows that decode keeps in VRAM with `rows` mapped. The CPU team attends a host row in the 8 full passes
     /// in ~1.1 us, the GPU one in VRAM in ~0.23 us, the two parts at once. While the CPU's is the longer, the 146 rows
     /// that an expert slot's VRAM holds save ~0.16 ms a token, more than the slot does down to some 30 slots. So past
@@ -833,7 +921,7 @@ impl Engine {
             return self.kv_vram_rows;
         }
         let even = (rows - rows / 6) / KV_STEP * KV_STEP;
-        let most = self.vram_budget.saturating_sub(self.dec_cache) / self.kv_bytes(KV_STEP).max(1) * KV_STEP;
+        let most = self.budget().saturating_sub(self.dec_cache) / self.kv_bytes(KV_STEP).max(1) * KV_STEP;
         even.min(most).max(self.kv_vram_rows)
     }
 
@@ -864,7 +952,9 @@ impl Engine {
     /// Prefill's region takes its memory from the expert cache (`on`), with the experts of the slots that go, or gives
     /// it back as free slots, which fill as decode misses experts.
     fn pf_mode(&mut self, on: bool) -> Result<()> {
-        if on == self.pf_on {
+        // decode keeps the rings short, but not while a checkpoint is out: its branch must not overwrite its window
+        let short = !on && self.ckpt_pos.is_none() && self.ring_spare > 0;
+        if on == self.pf_on && self.rings_are(short) {
             return Ok(());
         }
         // nothing in flight may touch the pages that go (the expert stream's work ends before self.s's)
@@ -873,7 +963,7 @@ impl Engine {
         self.pf_on = on;
         if on {
             let r = (|| {
-                self.plan_kv(self.kv_mapped)?;
+                self.set_ring(false)?;
                 self.region.set(true, &self.s)?;
                 self.s.sync()?;
                 self.b.one.upload(&vec![1f32; self.tm])
@@ -886,7 +976,7 @@ impl Engine {
             r
         } else {
             self.region.set(false, &self.s)?;
-            self.plan_kv(self.kv_mapped)
+            self.set_ring(short)
         }
     }
 
@@ -1077,8 +1167,9 @@ impl Engine {
     }
 
     /// Marks the current position to come back to after a branch of at most T_MAX tokens (back_to_checkpoint). Only
-    /// the conv states are saved: the SWA rings hold T_MAX rows past the window, so such a branch does not overwrite
-    /// the rows the checkpoint's window needs, and the full-attention rows before it stay as they are.
+    /// the conv states are saved: while it is out the SWA rings keep the long layout (pf_mode), T_MAX rows past the
+    /// window, so such a branch does not overwrite the rows the checkpoint's window needs, and the full-attention rows
+    /// before it stay as they are.
     pub fn checkpoint(&mut self) -> Result<()> {
         let per = self.conv[0].len;
         for (il, c) in self.conv.iter().enumerate() {
@@ -1116,10 +1207,8 @@ impl Engine {
 
     /// Slot il's K and V caches.
     fn kv(&self, il: usize) -> [P; 2] {
-        if let Some(b) = &self.kv_vm[il] {
-            return [b[0].ptr, b[1].ptr];
-        }
-        [self.kcache[il].as_ref().unwrap().ptr, self.vcache[il].as_ref().unwrap().ptr]
+        let b = self.kv_vm[il].as_ref().or(self.swa[il].as_ref()).unwrap();
+        [b[0].ptr, b[1].ptr]
     }
 
     /// Saves the state at the current position, the end of a prompt.
@@ -1129,12 +1218,10 @@ impl Engine {
             cuda::copy_d2d(self.snap_conv.at(il * per), c.ptr, per, &self.s)?;
         }
         let w = self.hp.n_swa;
-        for il in 0..self.kcache.len() {
+        for il in 0..self.swa.len() {
             let ring = self.ring[il] as usize;
-            if ring == 0 {
-                continue;
-            }
-            for (ci, cache) in [&self.kcache[il], &self.vcache[il]].into_iter().flatten().enumerate() {
+            let Some(b) = &self.swa[il] else { continue };
+            for (ci, cache) in b.iter().enumerate() {
                 // the window's rows
                 let base = (il * 2 + ci) * w * KV_ROW;
                 for (row, off, cnt) in self.window_rows(ring) {
@@ -1159,12 +1246,10 @@ impl Engine {
         self.tokens.truncate(p);
         self.ckpt_pos = None;
         let w = self.hp.n_swa;
-        for il in 0..self.kcache.len() {
+        for il in 0..self.swa.len() {
             let ring = self.ring[il] as usize;
-            if ring == 0 {
-                continue;
-            }
-            for (ci, cache) in [&self.kcache[il], &self.vcache[il]].into_iter().flatten().enumerate() {
+            let Some(b) = &self.swa[il] else { continue };
+            for (ci, cache) in b.iter().enumerate() {
                 let base = (il * 2 + ci) * w * KV_ROW;
                 for (row, off, cnt) in self.window_rows(ring) {
                     // SAFETY: inside the page-locked snapshot buffer
