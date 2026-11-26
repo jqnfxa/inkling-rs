@@ -42,6 +42,8 @@ const KV_ROW: usize = 2048;
 
 /// The full-attention KV caches get memory in steps of this many rows (a 2 MiB page).
 const KV_STEP: usize = 1024;
+/// host memory left free when the KV cache spills there
+const HOST_MARGIN: usize = 1 << 30;
 
 /// Decode attention: keys per chunk of attn_part, log2, of the sliding-window layers (16 chunks of the window) and of
 /// the full ones.
@@ -169,6 +171,8 @@ pub struct Engine {
     /// the full-attention caches, K and V in f16 rows, at addresses for n_ctx rows; memory for kv_mapped
     kv_vm: Vec<Option<[VmBuf; 2]>>,
     kv_mapped: usize,
+    /// the rows of kv_vm in VRAM; the rows past them are host memory
+    kv_vram_rows: usize,
     /// VRAM for the expert cache and the mapped rows of kv_vm together
     vram_budget: usize,
     ring: Vec<u32>,
@@ -222,6 +226,21 @@ pub struct Stats {
     pub pf_cpu_s: f64,
     pub pf_cpu_pairs: u64,
     pub pf_gpu_pairs: u64,
+}
+
+/// Host memory that can still be taken: MemAvailable, and within the memory limit of this process's cgroup if it has
+/// one (memory.max less what the cgroup holds other than file pages).
+fn host_mem_free() -> usize {
+    let num = |v: &str| v.trim().trim_end_matches("kB").trim().parse::<usize>().ok();
+    let mut free = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| m.lines().find_map(|l| l.strip_prefix("MemAvailable:")).and_then(num)).map_or(usize::MAX, |k| k << 10);
+    if let Some(path) = std::fs::read_to_string("/proc/self/cgroup").ok().and_then(|c| c.lines().find_map(|l| l.strip_prefix("0::").map(|p| p.trim().to_string()))) {
+        let rd = |f: &str| std::fs::read_to_string(format!("/sys/fs/cgroup{path}/{f}")).ok();
+        if let (Some(max), Some(cur)) = (rd("memory.max").as_deref().and_then(num), rd("memory.current").as_deref().and_then(num)) {
+            let file = rd("memory.stat").and_then(|s| s.lines().find_map(|l| l.strip_prefix("file ")).and_then(num)).unwrap_or(0);
+            free = free.min(max.saturating_sub(cur.saturating_sub(file)));
+        }
+    }
+    free
 }
 
 impl Engine {
@@ -406,6 +425,7 @@ impl Engine {
             vcache,
             kv_vm,
             kv_mapped: 0,
+            kv_vram_rows: 0,
             vram_budget,
             ring,
             conv,
@@ -424,19 +444,43 @@ impl Engine {
             snap_swa: HostBuf::new(n_slots * 2 * n_swa * KV_ROW)?,
             copy_s: Stream::new_nonblocking()?,
         };
-        let need = e.kv_bytes(e.n_ctx);
-        if need > e.vram_budget {
-            let per = e.kv_bytes(KV_STEP * 64) / (KV_STEP * 64);
+        // the full-attention KV rows: in VRAM as far as the budget goes (IK_KV_VRAM_ROWS caps them), the rest in host
+        // memory where the device can map it there
+        let all = e.n_ctx.div_ceil(KV_STEP) * KV_STEP;
+        let per_step = e.kv_bytes(KV_STEP).max(1);
+        let mut vram_rows = (e.vram_budget / per_step * KV_STEP).min(all);
+        if let Some(cap) = std::env::var("IK_KV_VRAM_ROWS").ok().and_then(|v| v.parse::<usize>().ok()) {
+            vram_rows = vram_rows.min(cap.div_ceil(KV_STEP) * KV_STEP);
+        }
+        let host_ok = VmBuf::host_pages_supported(e.ctx.device);
+        if !host_ok {
+            vram_rows = all;
+        }
+        let (need_vram, need_host) = (e.kv_bytes(vram_rows), e.kv_bytes(all) - e.kv_bytes(vram_rows));
+        let host_free = host_mem_free().saturating_sub(HOST_MARGIN);
+        if need_vram > e.vram_budget || need_host > host_free {
+            let per = per_step / KV_STEP;
+            let most = if host_ok { (e.vram_budget / per_step * KV_STEP) + host_free / per } else { e.vram_budget / per };
             return Err(format!(
-                "a context of {} tokens needs {} MiB of KV cache, more than the {} MiB of VRAM there are for it and the experts: {} tokens at most",
+                "a context of {} tokens needs {} MiB of KV cache; there are {} MiB of VRAM for it and the experts{}: {} tokens at most",
                 e.n_ctx,
-                need >> 20,
+                e.kv_bytes(all) >> 20,
                 e.vram_budget >> 20,
-                e.vram_budget / per.max(1)
+                if host_ok { format!(", and {} MiB of host memory past that", host_free >> 20) } else { String::new() },
+                most
             ));
         }
+        for v in e.kv_vm.iter_mut().flatten().flatten() {
+            v.set_host_from(vram_rows * KV_ROW);
+        }
+        e.kv_vram_rows = vram_rows;
         e.plan_kv(T_MAX)?;
         Ok(e)
+    }
+
+    /// Bytes of the full-attention KV caches in host memory now.
+    pub fn kv_host_bytes(&self) -> usize {
+        self.kv_vm.iter().flatten().flatten().map(|v| v.host_bytes()).sum()
     }
 
     /// Bytes of the full-attention KV caches with `rows` rows mapped.
@@ -449,11 +493,9 @@ impl Engine {
     /// they come back empty and fill as experts are used.
     fn plan_kv(&mut self, rows: usize) -> Result<()> {
         let rows = (rows.div_ceil(KV_STEP) * KV_STEP).min(self.n_ctx.div_ceil(KV_STEP) * KV_STEP);
-        let kv = self.kv_bytes(rows);
-        if kv > self.vram_budget {
-            return Err(format!("not enough VRAM for the KV cache of {rows} tokens"));
-        }
-        let slots = self.cache.fit(self.vram_budget - kv);
+        // the VRAM rows; new ensured they fit
+        let kv = self.kv_bytes(rows.min(self.kv_vram_rows));
+        let slots = self.cache.fit(self.vram_budget.saturating_sub(kv));
         if rows == self.kv_mapped && slots == [self.cache.banks[0].n_slots, self.cache.banks[1].n_slots] {
             return Ok(());
         }

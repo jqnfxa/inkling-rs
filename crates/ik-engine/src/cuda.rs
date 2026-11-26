@@ -295,7 +295,8 @@ impl Drop for DevBuf {
 }
 
 /// Device memory at a fixed address range whose pages are backed on demand: the first `mapped()` bytes are usable.
-/// Kernels and CUDA graphs keep the address while pages come and go, so memory can move between buffers.
+/// Kernels and CUDA graphs keep the address while pages come and go, so memory can move between buffers. Pages from
+/// `host_from` on are page-locked host memory at the same addresses: kernels read and write them over PCIe.
 pub struct VmBuf {
     pub ptr: CUdeviceptr,
     /// the reserved bytes, a whole number of pages
@@ -303,20 +304,33 @@ pub struct VmBuf {
     pages: Vec<u64>,
     page: usize,
     dev: CUdevice,
+    host_from: usize,
 }
 unsafe impl Send for VmBuf {}
 unsafe impl Sync for VmBuf {}
 
 impl VmBuf {
-    fn prop(dev: CUdevice) -> CUmemAllocationProp {
-        CUmemAllocationProp { ty: 1, handle_types: 0, location: CUmemLocation { ty: 1, id: dev }, win32: null_mut(), flags: [0; 8] }
+    fn prop(dev: CUdevice, host: bool) -> CUmemAllocationProp {
+        // CU_MEM_LOCATION_TYPE_HOST_NUMA = 3, node 0
+        let location = if host { CUmemLocation { ty: 3, id: 0 } } else { CUmemLocation { ty: 1, id: dev } };
+        CUmemAllocationProp { ty: 1, handle_types: 0, location, win32: null_mut(), flags: [0; 8] }
     }
 
     /// The page size: the driver's minimum granularity (2 MiB on current GPUs).
     pub fn granularity(dev: CUdevice) -> Result<usize> {
         let mut g = 0;
-        ck!(cuMemGetAllocationGranularity(&mut g, &Self::prop(dev), 0))?;
+        ck!(cuMemGetAllocationGranularity(&mut g, &Self::prop(dev, false), 0))?;
         Ok(g)
+    }
+
+    /// Whether pages can be host memory (CU_DEVICE_ATTRIBUTE_HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED), and
+    /// host pages are no larger than device pages.
+    pub fn host_pages_supported(dev: CUdevice) -> bool {
+        let mut v = 0;
+        let mut g = usize::MAX;
+        // SAFETY: plain queries
+        let ok = unsafe { cuDeviceGetAttribute(&mut v, 141, dev) == 0 && v != 0 && cuMemGetAllocationGranularity(&mut g, &Self::prop(dev, true), 0) == 0 };
+        ok && Self::granularity(dev).is_ok_and(|p| p % g == 0)
     }
 
     /// Reserves addresses for `len` bytes (rounded up to pages); no memory is mapped yet.
@@ -325,7 +339,17 @@ impl VmBuf {
         let len = len.max(1).div_ceil(page) * page;
         let mut ptr = 0;
         ck!(cuMemAddressReserve(&mut ptr, len, page, 0, 0))?;
-        Ok(VmBuf { ptr, len, pages: vec![], page, dev })
+        Ok(VmBuf { ptr, len, pages: vec![], page, dev, host_from: usize::MAX })
+    }
+
+    /// Pages mapped from now on at byte `bytes` (rounded up to pages) and past it are host memory.
+    pub fn set_host_from(&mut self, bytes: usize) {
+        self.host_from = self.pages_for(bytes) / self.page;
+    }
+
+    /// The mapped bytes in host memory.
+    pub fn host_bytes(&self) -> usize {
+        self.pages.len().saturating_sub(self.host_from) * self.page
     }
 
     /// The bytes that `bytes` of content take: whole pages.
@@ -348,19 +372,23 @@ impl VmBuf {
                 ck!(cuMemRelease(h))?;
             }
         } else if want > have {
-            let prop = Self::prop(self.dev);
             for i in have..want {
                 let mut h = 0;
-                ck!(cuMemCreate(&mut h, self.page, &prop, 0))?;
+                ck!(cuMemCreate(&mut h, self.page, &Self::prop(self.dev, i >= self.host_from), 0))?;
                 if let Err(e) = ck!(cuMemMap(self.ptr + (i * self.page) as u64, self.page, 0, h, 0)) {
                     unsafe { cuMemRelease(h) };
                     return Err(e);
                 }
                 self.pages.push(h);
             }
+            // the device reads and writes all pages; the host its own too
+            let desc = [CUmemAccessDesc { location: CUmemLocation { ty: 1, id: self.dev }, flags: 3 }, CUmemAccessDesc { location: CUmemLocation { ty: 3, id: 0 }, flags: 3 }];
+            for (from, to, nd) in [(have, want.min(self.host_from), 1), (have.max(self.host_from), want, 2)] {
+                if to > from {
+                    ck!(cuMemSetAccess(self.ptr + (from * self.page) as u64, (to - from) * self.page, desc.as_ptr(), nd))?;
+                }
+            }
             let (at, n) = (self.ptr + (have * self.page) as u64, (want - have) * self.page);
-            let desc = CUmemAccessDesc { location: CUmemLocation { ty: 1, id: self.dev }, flags: 3 };
-            ck!(cuMemSetAccess(at, n, &desc, 1))?;
             ck!(cuMemsetD8Async(at, 0, n, s.0))?;
         }
         Ok(())

@@ -80,7 +80,7 @@ fn main() -> Result<(), String> {
             let busy = (e.pool.busy_ns.load(std::sync::atomic::Ordering::Relaxed) - busy0) as f64 / 1e6 / (n_gen - 1) as f64;
             let misses = (m - m1) as f64 / (n_gen - 1) as f64;
             let uses = (h - h1 + m - m1) as f64 / (n_gen - 1) as f64;
-            println!("        last token {total:.0} us on the GPU timeline; CPU experts {busy:.2} ms/token (all threads), {misses:.1} misses of {uses:.0} uses a token; {} slots", e.cache.n_slots());
+            println!("        last token {total:.0} us on the GPU timeline; CPU experts {busy:.2} ms/token (all threads), {misses:.1} misses of {uses:.0} uses a token; {} slots; {} MiB of KV in host memory", e.cache.n_slots(), e.kv_host_bytes() >> 20);
             for (name, n, us) in v.iter().take(10) {
                 println!("          {name:22} {n:5} x {:7.1} us = {us:7.0} us ({:4.1}%)", us / *n as f64, 100.0 * us / total);
             }
