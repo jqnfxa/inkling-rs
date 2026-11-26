@@ -1743,7 +1743,7 @@ impl Engine {
             let m = pairs.len() as u32;
             let at = |k: usize| ps.lists.at(4 * (k * cap + o));
             let (sl, tk, pr) = (at(0), at(1), at(2));
-            self.k.copy_rows(&ps.s, self.b.xn.ptr, Some(tk), ps.x.ptr, None, n, m)?;
+            self.k.gather_rows(&ps.s, self.b.xn.ptr, tk, ps.x.ptr, n, m)?;
             match f {
                 Fmt::NvFp4 => {
                     let ((gu_a, gu_d), (dn_a, dn_d)) = (self.cache.factor_ptrs(ip, 0), self.cache.factor_ptrs(ip, 1));
@@ -2106,7 +2106,7 @@ impl Engine {
         for (c, &[q0, m, e0, nz, mm]) in chunks.iter().enumerate() {
             let tok = b.grp.at(4 * q0);
             let (m, nz, mm) = (m as u32, nz as u32, mm as u32);
-            self.k.copy_rows(&self.s, b.xn.ptr, Some(tok), b.pf_dn.ptr, None, nu, m)?;
+            self.k.gather_rows(&self.s, b.xn.ptr, tok, b.pf_dn.ptr, nu, m)?;
             self.k.moe_nvfp4_g(&self.s, b.grp.at(tab_at + 32 * e0), gu_a, gu_d, 2 * fu, nu, mm, nz)?;
             // the tokens stand for slots: SITU takes every row
             self.k.situ(&self.s, b.pf_gu.ptr, tok, b.pf_af.ptr, fu, self.ex.beta, self.ex.lb, m)?;

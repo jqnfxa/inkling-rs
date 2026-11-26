@@ -188,13 +188,10 @@ impl Kernels {
         self.run(s, "add", (n.div_ceil(256), 1, 1), 256, &[&a, &b, &y, &n])
     }
 
-    /// Rows of n floats (a multiple of 4): dst row didx[i] (or i, without didx) = src row sidx[i] (or i), for i < m.
-    #[allow(clippy::too_many_arguments)]
-    pub fn copy_rows(&self, s: &Stream, src: P, sidx: Option<P>, dst: P, didx: Option<P>, n: u32, m: u32) -> Result<()> {
-        assert!(n.is_multiple_of(4), "copy_rows: n {n}");
-        let mode = sidx.is_some() as u32 | (didx.is_some() as u32) << 1;
-        let (si, di) = (sidx.unwrap_or(0), didx.unwrap_or(0));
-        self.run(s, "copy_rows", ((n / 4).div_ceil(128), m, 1), 128, &[&src, &si, &dst, &di, &n, &mode])
+    /// Rows of n floats (a multiple of 4): dst row i = src row sidx[i], for i < m.
+    pub fn gather_rows(&self, s: &Stream, src: P, sidx: P, dst: P, n: u32, m: u32) -> Result<()> {
+        assert!(n.is_multiple_of(4), "gather_rows: n {n}");
+        self.run(s, "gather_rows", ((n / 4).div_ceil(128), m, 1), 128, &[&src, &sidx, &dst, &n])
     }
 
     /// Rows of n floats (a multiple of 4): dst row didx[i] += wts[widx[i]] * src row i, for i < m; the rows didx[i] are

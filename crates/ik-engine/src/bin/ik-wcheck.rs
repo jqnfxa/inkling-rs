@@ -405,29 +405,21 @@ fn main() -> Result<(), String> {
         check("moe_combine_r, two chunks of rows", err, 1e-6, &mut fails);
     }
 
-    // copy_rows on rows of 2304 floats, as the expert stream uses it: a gather of 5 rows of 9 (row 8 twice), their
-    // scatter to 5 rows of 12 (the other rows untouched), and a plain copy of 3 rows; each value its source's bits (its
-    // own seed: the checks after it keep their inputs)
+    // gather_rows on rows of 2304 floats, as the expert stream uses it: 5 rows of 9 (row 8 twice), each value its
+    // source's bits (its own seed: the checks after it keep their inputs)
     {
         let nn = 2304usize;
         let mut seed = 0xc0b1_e5u64;
         let src: Vec<f32> = (0..9 * nn).map(|_| rnd(&mut seed)).collect();
-        let fill: Vec<f32> = (0..12 * nn).map(|_| rnd(&mut seed)).collect();
-        let (sidx, didx) = ([8u32, 0, 3, 8, 5], [11u32, 2, 7, 4, 0]);
-        let (bs, bf, bsi, bdi) = (DevBuf::from_slice(&src)?, DevBuf::from_slice(&fill)?, DevBuf::from_slice(&sidx)?, DevBuf::from_slice(&didx)?);
-        let (bg, bp) = (DevBuf::zeroed(5 * nn * 4, &s)?, DevBuf::zeroed(3 * nn * 4, &s)?);
-        k.copy_rows(&s, bs.ptr, Some(bsi.ptr), bg.ptr, None, nn as u32, 5)?;
-        k.copy_rows(&s, bg.ptr, None, bf.ptr, Some(bdi.ptr), nn as u32, 5)?;
-        k.copy_rows(&s, bs.ptr, None, bp.ptr, None, nn as u32, 3)?;
+        let sidx = [8u32, 0, 3, 8, 5];
+        let (bs, bsi) = (DevBuf::from_slice(&src)?, DevBuf::from_slice(&sidx)?);
+        let bg = DevBuf::zeroed(5 * nn * 4, &s)?;
+        k.gather_rows(&s, bs.ptr, bsi.ptr, bg.ptr, nn as u32, 5)?;
         s.sync()?;
-        let (g, d, p): (Vec<f32>, Vec<f32>, Vec<f32>) = (bg.download(5 * nn)?, bf.download(12 * nn)?, bp.download(3 * nn)?);
+        let g: Vec<f32> = bg.download(5 * nn)?;
         let row = |v: &[f32], r: usize| v[r * nn..(r + 1) * nn].iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
-        let mut wrong = (0..5).filter(|&i| row(&g, i) != row(&src, sidx[i] as usize)).count();
-        wrong += (0..12)
-            .filter(|&r| row(&d, r) != didx.iter().position(|&x| x as usize == r).map_or(row(&fill, r), |i| row(&src, sidx[i] as usize)))
-            .count();
-        wrong += (0..3).filter(|&i| row(&p, i) != row(&src, i)).count();
-        check("copy_rows: rows not their source's", wrong as f64, 0.0, &mut fails);
+        let wrong = (0..5).filter(|&i| row(&g, i) != row(&src, sidx[i] as usize)).count();
+        check("gather_rows: rows not their source's", wrong as f64, 0.0, &mut fails);
     }
 
     // add_rows_w as the expert stream uses it: 5 rows of 2304 floats added, each weighted by its pair, to 5 rows of 12
