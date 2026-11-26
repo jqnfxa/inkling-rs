@@ -383,13 +383,21 @@ impl VmBuf {
             }
             // the device reads and writes all pages; the host its own too
             let desc = [CUmemAccessDesc { location: CUmemLocation { ty: 1, id: self.dev }, flags: 3 }, CUmemAccessDesc { location: CUmemLocation { ty: 3, id: 0 }, flags: 3 }];
-            for (from, to, nd) in [(have, want.min(self.host_from), 1), (have.max(self.host_from), want, 2)] {
+            let at = |i: usize| self.ptr + (i * self.page) as u64;
+            let host = want.min(self.host_from).max(have);
+            for (from, to, nd) in [(have, host, 1), (host, want, 2)] {
                 if to > from {
-                    ck!(cuMemSetAccess(self.ptr + (from * self.page) as u64, (to - from) * self.page, desc.as_ptr(), nd))?;
+                    ck!(cuMemSetAccess(at(from), (to - from) * self.page, desc.as_ptr(), nd))?;
                 }
             }
-            let (at, n) = (self.ptr + (have * self.page) as u64, (want - have) * self.page);
-            ck!(cuMemsetD8Async(at, 0, n, s.0))?;
+            // zeroed: the new device pages at once, the host pages one at a time (a memset over two host pages, or
+            // over a device page and a host one, is refused: invalid argument)
+            if host > have {
+                ck!(cuMemsetD8Async(at(have), 0, (host - have) * self.page, s.0))?;
+            }
+            for i in host..want {
+                ck!(cuMemsetD8Async(at(i), 0, self.page, s.0))?;
+            }
         }
         Ok(())
     }
