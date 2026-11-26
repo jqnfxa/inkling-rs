@@ -586,10 +586,16 @@ fn grep_search(p: &Value, cwd: &Path) -> Result<String, String> {
     let include = s(p, &["include"]).filter(|x| !x.trim().is_empty()).map(Glob::new);
     let exclude = s(p, &["exclude"]).filter(|x| !x.trim().is_empty()).map(Glob::new);
     // not a regular expression (an unclosed "(" say): the text itself
-    let (re, literal) = match fancy_regex::Regex::new(&format!("{case}{pattern}")) {
-        Ok(re) => (re, false),
-        Err(_) => (fancy_regex::Regex::new(&format!("{case}{}", fancy_regex::escape(pattern))).map_err(|e| e.to_string())?, true),
-    };
+    let literal = fancy_regex::Regex::new(&format!("{case}{pattern}")).is_err();
+    let pat = if literal { fancy_regex::escape(pattern).into_owned() } else { pattern.to_string() };
+    let re = fancy_regex::Regex::new(&format!("{case}{pat}")).map_err(|e| e.to_string())?;
+    // One look at all of a file first, ^ and $ at its lines' ends, which most files fail. A line's match is the file's
+    // too, unless the pattern looks around, anchors at the text (\A \z \G) or turns flags off (?-m); or has a $ and the
+    // file a \r ((?m)$ is before \n, not before \r\n).
+    let off = pat.match_indices("(?").any(|(i, _)| pat[i + 2..].chars().take_while(|c| c.is_ascii_alphabetic() || *c == '-').any(|c| c == '-'));
+    let whole = !off && ["(?=", "(?!", "(?<=", "(?<!", "\\A", "\\z", "\\G"].iter().all(|x| !pat.contains(x));
+    let whole = whole.then(|| fancy_regex::Regex::new(&format!("(?m){case}{pat}")).ok()).flatten();
+    let dollar = pat.contains('$');
     let (mut out, mut found) = (String::new(), 0usize);
     let mut search = |path: &Path, name: &str| -> bool {
         // a FIFO or device, a large file, or a binary one (a NUL in its first 8 KiB) is left out, the last one unread
@@ -601,7 +607,11 @@ fn grep_search(p: &Value, cwd: &Path) -> Result<String, String> {
         if Read::by_ref(&mut f).take(8192).read_to_end(&mut b).is_err() || b.contains(&0) || f.read_to_end(&mut b).is_err() {
             return true;
         }
-        for (k, line) in String::from_utf8_lossy(&b).lines().enumerate() {
+        let t = String::from_utf8_lossy(&b);
+        if whole.as_ref().is_some_and(|w| !(dollar && t.contains('\r')) && !w.is_match(&t).unwrap_or(true)) {
+            return true;
+        }
+        for (k, line) in t.lines().enumerate() {
             if !re.is_match(line).unwrap_or(false) {
                 continue;
             }
@@ -721,6 +731,13 @@ mod tests {
         assert_eq!(r["entries"], json!([]));
         assert_eq!(call("file_glob_search", json!({"include": ".hid/*"}))["entries"], json!([{"path": ".hid/c.txt", "type": "file"}]));
         assert_eq!(call("grep_search", json!({"pattern": "line [45]", "path": "."}))["plain_text_response"], "a/b.txt:4:line 4\na/b.txt:5:line 5\n---\nTotal matches: 2");
+        // the look at a whole file first, (?m); a look past a line's end, a text anchor, (?-m), $ and \r\n: lines only
+        for pat in ["^line 5$", "5(?!\\s)", "\\Aline 5\\z", "(?-m)5$"] {
+            assert_eq!(call("grep_search", json!({"pattern": pat, "path": "a/b.txt"}))["plain_text_response"], "a/b.txt:5:line 5\n---\nTotal matches: 1", "{pat}");
+        }
+        for pat in ["d$", "^d"] {
+            assert_eq!(call("grep_search", json!({"pattern": pat, "path": "crlf.txt"}))["plain_text_response"], "crlf.txt:2:d\n---\nTotal matches: 1", "{pat}");
+        }
         let r = call("grep_search", json!({"pattern": "LINE (4", "ignore_case": true, "include": "b.*"}));
         assert_eq!(r["plain_text_response"], "---\nTotal matches: 0\n(not a regular expression, so searched for as plain text)");
         assert_eq!(super::call("read_file", &json!({"path": "crlf.txt"}), Some(&cwd), true).unwrap(), json!({"base64": "Yw0KZA0K", "size_bytes": 6}));
