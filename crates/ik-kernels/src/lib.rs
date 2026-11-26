@@ -1138,7 +1138,7 @@ pub mod gpu {
 
     /// Posts the MoE job of one layer to the CPU through host-mapped `job`, and the slots of the 8 selected experts:
     /// slots[k] = map[ids[k]] (-1 if not cached). Job layout (bytes): seq u32 @0, layer @4, ids @8, slots @40, x @128.
-    /// seq = params[3] * 64 + step + 1 is written last, after a system fence.
+    /// seq = params[3] * 256 + step + 1 (STEPS of ik-engine's cpu_pool) is written last, after a system fence.
     #[reqntid(256)]
     pub unsafe extern "ptx-kernel" fn moe_dispatch(
         ids: *const u32, map: *const i32, slots: *mut i32, x: *const f32, job: *mut u32, params: *const u32, step: u32, layer: u32, n: u32,
@@ -1190,7 +1190,7 @@ pub mod gpu {
             let (tok, seq): (u32, u32);
             st.volatile.global.u32([job + 4], layer);
             ld.global.u32(tok, [params + 12]);
-            mad.lo.u32(seq, tok, 64, step);
+            mad.lo.u32(seq, tok, 256, step);
             add.u32(seq, seq, 1);
             membar.sys();
             st.volatile.global.u32([job], seq);
@@ -1245,7 +1245,7 @@ pub mod gpu {
             ld.global.u32(pos, [params]);
             st.volatile.global.u32([job + 8], pos);
             ld.global.u32(tok, [params + 12]);
-            mad.lo.u32(seq, tok, 64, step);
+            mad.lo.u32(seq, tok, 256, step);
             add.u32(seq, seq, 1);
             membar.sys();
             st.volatile.global.u32([job], seq);
@@ -1265,7 +1265,7 @@ pub mod gpu {
         }
         let (tok, seq): (u32, u32);
         ld.global.u32(tok, [params + 12]);
-        mad.lo.u32(seq, tok, 64, step);
+        mad.lo.u32(seq, tok, 256, step);
         add.u32(seq, seq, 1);
         let (t0, now, lim): (u64, u64, u64);
         mov.u64(t0, globaltimer);
@@ -3916,7 +3916,7 @@ pub mod gpu {
             let (tok, seq): (u32, u32);
             st.volatile.global.u32([job + 4], layer);
             ld.global.u32(tok, [params + 12]);
-            mad.lo.u32(seq, tok, 64, step);
+            mad.lo.u32(seq, tok, 256, step);
             add.u32(seq, seq, 1);
             membar.sys();
             st.volatile.global.u32([job], seq);
@@ -4212,7 +4212,7 @@ pub mod gpu {
             let (tok, seq): (u32, u32);
             st.volatile.global.u32([job + 4], layer);
             ld.global.u32(tok, [params + 12]);
-            mad.lo.u32(seq, tok, 64, step);
+            mad.lo.u32(seq, tok, 256, step);
             add.u32(seq, seq, 1);
             // release at system scope: the job (all warps, ordered before by the barrier) is visible before seq
             st.release.sys.global.u32([job], seq);

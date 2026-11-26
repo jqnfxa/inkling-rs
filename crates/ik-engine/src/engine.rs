@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::checkpoint::{Checkpoint, Dtype};
-use crate::cpu_pool::{ATTN_JOB, ATTN_OUT, ATTN_STEP, AttnCtx, Pool, UNEMBED_STEP, UnembedCtx};
+use crate::cpu_pool::{ATTN_JOB, ATTN_OUT, ATTN_STEP, AttnCtx, Pool, STEPS, UNEMBED_STEP, UnembedCtx};
 use crate::cuda::{self, Ctx, DevBuf, Graph, HostBuf, Region, Result, Stream, VmBuf};
 use crate::experts::{ExpertCache, Experts, Fmt};
 use crate::hp::{Hp, Step};
@@ -744,7 +744,7 @@ impl Engine {
             e.attn_idx.push(g);
             g += b.is_some() as u32;
         }
-        if g > 64 - ATTN_STEP {
+        if g > UNEMBED_STEP - ATTN_STEP {
             return Err(format!("{g} full-attention layers: more attention jobs than a token has steps for"));
         }
         if e.kv_cpu {
@@ -1324,7 +1324,7 @@ impl Engine {
     /// Waits for the CPU team's rows of the token's logits: the unembedding job that the GPU posted and did not wait
     /// for. At most 5 s.
     fn wait_unembed(&mut self) -> Result<()> {
-        let seq = self.tok.wrapping_mul(64).wrapping_add(UNEMBED_STEP + 1);
+        let seq = self.tok.wrapping_mul(STEPS).wrapping_add(UNEMBED_STEP + 1);
         // SAFETY: host-mapped memory that lives as long as the engine, where the team writes the seq it acknowledged
         let ack = unsafe { &*(self.ack.ptr as *const AtomicU32) };
         let t = std::time::Instant::now();

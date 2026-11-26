@@ -16,8 +16,9 @@ use crate::experts::Experts;
 const JOB_IDS: usize = 2; // u32 index of ids
 const JOB_SLOTS: usize = 10;
 const JOB_X: usize = 32;
-/// The steps of a token's jobs (seq = token * 64 + step + 1): its MoE layers from 0, the attention of its
-/// full-attention layers from ATTN_STEP (8 of them).
+/// The steps a token has for its jobs: a job's seq is token * STEPS + step + 1 (also in the kernels that post and
+/// await jobs), its MoE layers from step 0, the attention of its full-attention layers from ATTN_STEP (8 of them).
+pub const STEPS: u32 = 256;
 pub const ATTN_STEP: u32 = 48;
 /// floats of an attention job: q [24][128], r [24][16], sink [24]
 pub const ATTN_JOB: usize = HEADS * DIM + HEADS * N_REL + HEADS;
@@ -577,12 +578,12 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
         let t0 = std::time::Instant::now();
         LEADER_T0.with(|c| c.set(t0));
         last = seq;
-        if (seq - 1) % 64 == UNEMBED_STEP {
+        if (seq - 1) % STEPS == UNEMBED_STEP {
             unembed_job(sh, job, n);
             ack.store(seq, Ordering::Release);
             continue;
         }
-        if (seq - 1) % 64 >= ATTN_STEP {
+        if (seq - 1) % STEPS >= ATTN_STEP {
             attn_job(sh, job);
             ack.store(seq, Ordering::Release);
             ATTN_NS[2].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);

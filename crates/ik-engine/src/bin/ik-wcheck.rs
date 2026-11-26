@@ -804,7 +804,7 @@ fn main() -> Result<(), String> {
         s.sync()?;
         // SAFETY: the host side of the mapped buffer, after the stream is done
         let got = unsafe { std::slice::from_raw_parts(job.ptr as *const u32, 32 + na + nb + nc) };
-        let head_ok = got[0] == 77 * 64 + 50 + 1 && got[1] == 41 && got[2] == 1234;
+        let head_ok = got[0] == 77 * 256 + 50 + 1 && got[1] == 41 && got[2] == 1234;
         let wrong = (0..x.len()).filter(|&i| f32::from_bits(got[32 + i]) != x[i]).count();
         check("job_post header and floats (wrong)", (wrong + !head_ok as usize) as f64, 0.0, &mut fails);
     }
