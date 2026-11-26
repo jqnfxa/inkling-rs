@@ -1313,13 +1313,14 @@ pub mod gpu {
         st.global.f32([afa], a);
     }
 
-    /// y = W x for the pairs of `slots` (grid.y: a token's 8 experts, or in prefill 8 pairs a token of several tokens) on
-    /// a bank of ModelOpt NVFP4 slots: the expert's codes as the checkpoint has them ([rows][k/2], element 2j of a row in
-    /// the low nibble of byte j), then its E4M3 scales ([rows][k/16]). The expert's factor is amax[ids[ke]] / denom[0].
-    /// x is f32, the same for all pairs (xstride 0) or pair ke's at x + (ke >> xshift) xstride: shift 3 for each token's
-    /// own x. 8 lanes per row (16-byte chunks of 32 elements, two scale blocks: a warp
-    /// reads 128 contiguous bytes of each of 4 rows), a thread takes 4 rows (r + 16i), 64 rows per block of 128
-    /// threads; x from shared memory. k a multiple of 32, at most 2304.
+    /// y = W x for the pairs of `slots` (grid.x: a token's 8 experts, or in prefill 8 pairs a token of several tokens, or
+    /// the pairs of one expert; grid.y the blocks of 64 rows, so that the pairs of a block of rows run side by side and
+    /// those of one expert read it from L2) on a bank of ModelOpt NVFP4 slots: the expert's codes as the checkpoint has
+    /// them ([rows][k/2], element 2j of a row in the low nibble of byte j), then its E4M3 scales ([rows][k/16]). The
+    /// expert's factor is amax[ids[ke]] / denom[0]. x is f32, the same for all pairs (xstride 0) or pair ke's at
+    /// x + (ke >> xshift) xstride: shift 3 for each token's own x. 8 lanes per row (16-byte chunks of 32 elements, two
+    /// scale blocks: a warp reads 128 contiguous bytes of each of 4 rows), a thread takes 4 rows (r + 16i), 64 rows per
+    /// block of 128 threads; x from shared memory. k a multiple of 32, at most 2304.
     ///
     /// The values are decoded exactly. Codes k and k + 4 of a word (nibbles at bits 4k, 4k + 16) shift to an f16x2 of
     /// them times 2^-14: e1 e0 m to bits 11..9 of each half (f16's exponent bias of 15 against E2M1's 1, and with
@@ -1335,7 +1336,7 @@ pub mod gpu {
         xstride: u32, xshift: u32, y: *mut f32, rows: u32, kdim: u32,
     ) {
         let ke: u32;
-        mov.u32(ke, ctaid.y);
+        mov.u32(ke, ctaid.x);
         let (sa0, slot): (u64, s32);
         mad.wide.u32(sa0, ke, 4, slots);
         ld.global.s32(slot, [sa0]);
@@ -1352,7 +1353,7 @@ pub mod gpu {
         let (t, lr, bk, row0, last): (u32, u32, u32, u32, u32);
         mov.u32(t, tid.x);
         and.b32(lr, t, 7);
-        mov.u32(bk, ctaid.x);
+        mov.u32(bk, ctaid.y);
         shr.u32(row0, t, 3);
         mad.lo.u32(row0, bk, 64, row0);
         // x to shared memory, chunk c's 32 floats at byte 144 c: the 8 lanes of a row, which read 8 chunks at once,
@@ -1581,7 +1582,7 @@ pub mod gpu {
         }
     }
 
-    /// y = W x for the pairs of `slots` (grid.y, as in moe_nvfp4_d) on a bank of MXFP8 slots: the expert's e4m3 values as
+    /// y = W x for the pairs of `slots` (grid.x, as in moe_nvfp4_d) on a bank of MXFP8 slots: the expert's e4m3 values as
     /// the checkpoint has them ([rows][k]), then its UE8M0 scales ([rows][k/32], 2^(s-127) each). x is f32, the same for
     /// all pairs (xstride 0) or pair ke's at x + (ke >> xshift) xstride. 8 lanes per row (16-byte chunks of 16 values: a warp reads
     /// 128 contiguous bytes of each of 4 rows), a thread takes 4 rows (r + 16i), 64 rows per block of 128 threads; x
@@ -1592,7 +1593,7 @@ pub mod gpu {
         kdim: u32,
     ) {
         let ke: u32;
-        mov.u32(ke, ctaid.y);
+        mov.u32(ke, ctaid.x);
         let (sa0, slot): (u64, s32);
         mad.wide.u32(sa0, ke, 4, slots);
         ld.global.s32(slot, [sa0]);
@@ -1609,7 +1610,7 @@ pub mod gpu {
         let (t, lr, bk, row0, last): (u32, u32, u32, u32, u32);
         mov.u32(t, tid.x);
         and.b32(lr, t, 7);
-        mov.u32(bk, ctaid.x);
+        mov.u32(bk, ctaid.y);
         shr.u32(row0, t, 3);
         mad.lo.u32(row0, bk, 64, row0);
         let past: pred;

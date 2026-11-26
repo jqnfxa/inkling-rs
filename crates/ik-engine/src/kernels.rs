@@ -235,14 +235,14 @@ impl Kernels {
         pairs: u32,
     ) -> Result<()> {
         assert!(k % 32 == 0 && k <= 2304, "moe_nvfp4_d: k {k}");
-        self.run(s, "moe_nvfp4_d", (rows.div_ceil(64), pairs, 1), 128, &[&bank, &slot_bytes, &slots, &ids, &amax, &denom, &x, &xstride, &xshift, &y, &rows, &k])
+        self.run(s, "moe_nvfp4_d", (pairs, rows.div_ceil(64), 1), 128, &[&bank, &slot_bytes, &slots, &ids, &amax, &denom, &x, &xstride, &xshift, &y, &rows, &k])
     }
 
     /// y = W x for the `pairs` slots on a bank of MXFP8 slots (e4m3 values, then UE8M0 scales): x f32, as moe_nvfp4_d.
     #[allow(clippy::too_many_arguments)]
     pub fn moe_mxfp8_d(&self, s: &Stream, bank: P, slot_bytes: u64, slots: P, x: P, xstride: u32, xshift: u32, y: P, rows: u32, k: u32, pairs: u32) -> Result<()> {
         assert!(k % 128 == 0, "moe_mxfp8_d: k {k}");
-        self.run(s, "moe_mxfp8_d", (rows.div_ceil(64), pairs, 1), 128, &[&bank, &slot_bytes, &slots, &x, &xstride, &xshift, &y, &rows, &k])
+        self.run(s, "moe_mxfp8_d", (pairs, rows.div_ceil(64), 1), 128, &[&bank, &slot_bytes, &slots, &x, &xstride, &xshift, &y, &rows, &k])
     }
 
     pub fn router_topk(&self, s: &Stream, logits: P, bias: P, ids: P, wts: P, scale: f32) -> Result<()> {
