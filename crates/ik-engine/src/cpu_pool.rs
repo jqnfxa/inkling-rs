@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
-use crate::cpu::{Act, Q8, dot_row};
+use crate::cpu::dot_row;
 use crate::cpu_batch::dot_tokens;
 use crate::cuda::HostBuf;
 use crate::experts::Experts;
@@ -53,7 +53,7 @@ unsafe impl Sync for Shared {}
 #[derive(Default)]
 pub struct BatchJob {
     pub layer: usize,
-    pub xq: Vec<Act>,                            // per token
+    pub x: Vec<f32>,                             // [token][n]
     pub misses: Vec<(usize, Vec<(usize, usize)>)>, // (expert, [(token, pair)])
     pub out: usize,                              // host address of [pair][n] outputs
 }
@@ -62,11 +62,11 @@ pub struct BatchJob {
 struct Work {
     batch: Option<BatchJob>,
     bh: Vec<Vec<f32>>,  // batch: gate_up per CPU pair
-    bact: Vec<Act>,     // batch: activations per CPU pair
+    bact: Vec<Vec<f32>>, // batch: activations per CPU pair
     layer: usize,
     misses: Vec<(usize, usize)>, // (k, expert)
-    xq: Act,
-    aq: Vec<Act>, // activations per miss (both forms), written a block per gate_up chunk
+    x: Vec<f32>,
+    acts: Vec<Vec<f32>>, // activations per miss, written a block per gate_up chunk
     out: usize,    // host address of cpu_out [8][n]
 }
 
@@ -157,7 +157,7 @@ fn run_batch(sh: &Shared, cx: &Ctx, t: usize) {
         let (e, toks) = &job.misses[m];
         let gu = ex.gate_up(job.layer, *e);
         let sg = gu.scale();
-        let xs: Vec<&Act> = toks.iter().map(|&(tk, _)| &job.xq[tk]).collect();
+        let xs: Vec<&[f32]> = toks.iter().map(|&(tk, _)| &job.x[tk * n..(tk + 1) * n]).collect();
         let mut out = vec![0f32; toks.len()];
         for r in c * ROWS..((c + 1) * ROWS).min(2 * nff) {
             dot_tokens(&gu, r, &xs, &mut out);
@@ -176,15 +176,12 @@ fn run_batch(sh: &Shared, cx: &Ctx, t: usize) {
         }
         // gate i in row 2i, up i in row 2i + 1
         let h = &w.bh[p];
-        let act: Vec<f32> = (0..nff)
-            .map(|i| {
-                let (gv, uv) = (h[2 * i], h[2 * i + 1]);
-                ex.beta * (gv / ex.beta).tanh() / (1.0 + (-gv).exp()) * ex.lb * (uv / ex.lb).tanh()
-            })
-            .collect();
         // SAFETY: pair p is written by the thread that took it
-        let aq = unsafe { &mut *(w.bact.as_ptr() as *mut Act).add(p) };
-        aq.set(&act, ex.fmt[job.layer]);
+        let act = unsafe { std::slice::from_raw_parts_mut(w.bact[p].as_ptr() as *mut f32, nff) };
+        for (i, a) in act.iter_mut().enumerate() {
+            let (gv, uv) = (h[2 * i], h[2 * i + 1]);
+            *a = ex.beta * (gv / ex.beta).tanh() / (1.0 + (-gv).exp()) * ex.lb * (uv / ex.lb).tanh();
+        }
     }
     barrier(sh);
     let tp2 = std::time::Instant::now();
@@ -198,7 +195,7 @@ fn run_batch(sh: &Shared, cx: &Ctx, t: usize) {
         let (e, toks) = &job.misses[m];
         let dn = ex.down(job.layer, *e);
         let sd = dn.scale();
-        let xs: Vec<&Act> = (0..toks.len()).map(|i| &w.bact[base[m] + i]).collect();
+        let xs: Vec<&[f32]> = (0..toks.len()).map(|i| &w.bact[base[m] + i][..]).collect();
         let mut out = vec![0f32; toks.len()];
         for r in c * ROWS..((c + 1) * ROWS).min(n) {
             dot_tokens(&dn, r, &xs, &mut out);
@@ -289,13 +286,13 @@ fn run_decode(sh: &Shared, cx: &Ctx, t: usize, epoch: u32) {
                 for (i, a) in act.iter_mut().enumerate() {
                     // gate i in row 2i, up i in row 2i + 1
                     let r = 2 * (blk * ACT + i);
-                    let gv = dot_row(&gu, r, &w.xq) * sg;
-                    let uv = dot_row(&gu, r + 1, &w.xq) * sg;
+                    let gv = dot_row(&gu, r, &w.x) * sg;
+                    let uv = dot_row(&gu, r + 1, &w.x) * sg;
                     let s = ex.beta * (gv / ex.beta).tanh() / (1.0 + (-gv).exp());
                     *a = s * ex.lb * (uv / ex.lb).tanh();
                 }
                 // SAFETY: block `blk` of miss m is written by this chunk alone, and read only after all are done
-                unsafe { w.aq[m].put_block(blk, &act, ex.fmt[w.layer]) };
+                unsafe { std::ptr::copy_nonoverlapping(act.as_ptr(), (w.acts[m].as_ptr() as *mut f32).add(blk * ACT), ACT) };
                 sh.gu_done.fetch_add(1, Ordering::Release);
             }
         }
@@ -320,7 +317,7 @@ fn run_decode(sh: &Shared, cx: &Ctx, t: usize, epoch: u32) {
                 // SAFETY: rows blk * DN_ROWS.. of miss k's output are written by this chunk alone
                 let out = unsafe { std::slice::from_raw_parts_mut((w.out as *mut f32).add(k * n), n) };
                 for r in blk * DN_ROWS..(blk + 1) * DN_ROWS {
-                    out[r] = dot_row(&dn, r, &w.aq[m]) * sd;
+                    out[r] = dot_row(&dn, r, &w.acts[m]) * sd;
                 }
                 sh.dn_done.fetch_add(1, Ordering::Release);
             }
@@ -420,7 +417,10 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
             for h in w.bh.iter_mut().take(npairs) {
                 h.resize(2 * nff, 0.0);
             }
-            w.bact.resize_with(npairs.max(w.bact.len()), Act::default);
+            w.bact.resize_with(npairs.max(w.bact.len()), Vec::new);
+            for a in w.bact.iter_mut().take(npairs) {
+                a.resize(nff, 0.0);
+            }
             for c in &sh.next {
                 c.store(0, Ordering::Relaxed);
             }
@@ -476,9 +476,10 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
             w.misses.extend((0..8).filter(|&k| slots[k] < 0).map(|k| (k, ids[k])));
             // SAFETY: host-mapped memory the GPU wrote before seq
             let x = unsafe { std::slice::from_raw_parts(job.add(JOB_X) as *const f32, n) };
-            w.xq.set(x, cx.ex.fmt[layer]);
-            if w.aq.len() < n_miss {
-                w.aq.resize_with(n_miss, || Act { q: Q8::with_len(nff), f: vec![0.0; nff] });
+            w.x.clear();
+            w.x.extend_from_slice(x);
+            if w.acts.len() < n_miss {
+                w.acts.resize_with(n_miss, || vec![0.0; nff]);
             }
             w.out = cx.out;
             let g = sh.epoch.load(Ordering::Relaxed).wrapping_add(1);

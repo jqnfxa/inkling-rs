@@ -121,10 +121,10 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
 - The dense weights stay as the checkpoint stores them: BF16, and F32 for the residual-mix queries and the router
   bias. The GEMVs read BF16. The embedding stays in the mapped file; a token's row is converted on the host.
 - Decode is one CUDA graph per token. At each MoE layer the GPU posts the routing to the CPU through pinned memory
-  (`router_dispatch`), computes the cached experts while the CPU threads compute the misses (AVX2, int8), and waits on
-  a flag (`moe_wait`). No host round trip per layer.
-- The CPU threads take work from shared counters with no barrier; each gate/up chunk also applies the activation and
-  quantizes its block for the down projection.
+  (`router_dispatch`), computes the cached experts while the CPU threads compute the misses (AVX2, in f32), and waits
+  on a flag (`moe_wait`). No host round trip per layer.
+- The CPU threads take work from shared counters with no barrier; each gate/up chunk also applies the activation to
+  its block, which the down projection reads.
 - Prefill runs ubatches of up to 256 tokens. The BF16 GEMVs over the ubatch's tokens and flash-style attention run
   on the GPU. The experts run on the CPU, grouped so each is read once per ubatch. Prefill is slow until tensor-core
   BF16 GEMMs and grouped NVFP4/MXFP8 GEMMs move it to the GPU.

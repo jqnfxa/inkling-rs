@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::checkpoint::{Checkpoint, Dtype};
-use crate::cpu::Act;
 use crate::cpu_pool::Pool;
 use crate::cuda::{self, Ctx, DevBuf, Graph, HostBuf, Result, Stream, VmBuf};
 use crate::experts::{ExpertCache, Experts, Fmt, upload_slot};
@@ -1268,17 +1267,9 @@ impl Engine {
         self.b.host_slots.as_mut_slice::<i32>()[..nt * 8].fill(-1);
         cuda::copy_h2d_async(self.b.slots.ptr, self.b.host_slots.ptr, nt * 8 * 4, &self.s)?;
         self.stats.pf_cpu_pairs += (nt * 8) as u64;
-        let xn = self.b.host_xn.as_slice::<f32>();
-        let fmt = self.ex.fmt[ip];
-        let xq: Vec<Act> = (0..nt)
-            .map(|t| {
-                let mut a = Act::default();
-                a.set(&xn[t * n..(t + 1) * n], fmt);
-                a
-            })
-            .collect();
+        let x = self.b.host_xn.as_slice::<f32>()[..nt * n].to_vec();
         let t3 = std::time::Instant::now();
-        self.pool.run_batch(crate::cpu_pool::BatchJob { layer: ip, xq, misses: groups, out: self.b.cpu_out.ptr as usize });
+        self.pool.run_batch(crate::cpu_pool::BatchJob { layer: ip, x, misses: groups, out: self.b.cpu_out.ptr as usize });
         let t4 = std::time::Instant::now();
         self.stats.pf_host_s += (t3 - t1).as_secs_f64();
         self.stats.pf_cpu_s += (t4 - t3).as_secs_f64();

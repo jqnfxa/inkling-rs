@@ -3,7 +3,7 @@
 //! bound. The references are scalar Rust in f64, with no SIMD: they take the tensors' bytes from `Checkpoint`, and
 //! decode the stored formats and quantize the activations (q8_ref) themselves.
 use ik_engine::checkpoint::{Checkpoint, Dtype};
-use ik_engine::cpu::{Act, dot_row};
+use ik_engine::cpu::dot_row;
 use ik_engine::cuda::{Ctx, DevBuf, Stream};
 use ik_engine::experts::{Fmt, Mat as XMat};
 use ik_engine::kernels::Kernels;
@@ -271,20 +271,8 @@ fn main() -> Result<(), String> {
             let fmt = if nvfp4 { Fmt::NvFp4 } else { Fmt::MxFp8 };
             let (rows, kk) = (t.shape[1], if nvfp4 { 2 * t.shape[2] } else { t.shape[2] });
             let (qb, sb) = (t.nbytes() / t.shape[0], st.nbytes() / st.shape[0]);
-            let mut x: Vec<f32> = (0..kk).map(|_| rnd(&mut seed) * 2.0).collect();
-            untie(&mut x);
-            let mut act = Act::default();
-            act.set(&x, fmt);
-            // x as the kernels should see it: for NVFP4 rows q8_ref's int8 and scales (the engine's checked against
-            // them; its lane scales and sums, which dot_row reads, only through dot_row's results), for MXFP8 the f32
-            let xs: Vec<f64> = if nvfp4 {
-                let q: Vec<i8> = (0..kk).map(|i| act.q.q(i)).collect();
-                check_q8(&format!("cpu quantize layer {l} {w}"), &x, &q, &act.q.d, None, &mut fails);
-                let (qr, dr) = q8_ref(&x);
-                (0..kk).map(|i| qr[i] as f64 * dr[i / 32]).collect()
-            } else {
-                x.iter().map(|&v| v as f64).collect()
-            };
+            let x: Vec<f32> = (0..kk).map(|_| rnd(&mut seed) * 2.0).collect();
+            let xs: Vec<f64> = x.iter().map(|&v| v as f64).collect();
             let factors: Vec<f32> = if nvfp4 {
                 let den = ck.floats(&p("weight_outer_scale_denominator"))?[0];
                 ck.floats(&p("weight_amax"))?.iter().map(|a| a / den).collect()
@@ -294,7 +282,7 @@ fn main() -> Result<(), String> {
             let mut err = 0f64;
             for e in [3usize, 127] {
                 let m = XMat { fmt, q: &ck.bytes(t)[e * qb..][..qb], s: &ck.bytes(st)[e * sb..][..sb], factor: factors[e], rows, k: kk };
-                let got: Vec<f32> = (0..rows).map(|r| dot_row(&m, r, &act) * m.scale()).collect();
+                let got: Vec<f32> = (0..rows).map(|r| dot_row(&m, r, &x) * m.scale()).collect();
                 let (wr, _, _) = expert_ref(&ck, l, w, e)?;
                 let want: Vec<f64> = (0..rows).map(|r| (0..kk).map(|c| wr[r * kk + c] * xs[c]).sum()).collect();
                 err = err.max(rel_err(&got, &want));

@@ -1,7 +1,7 @@
 //! CPU expert kernels on real rows: single-token dots vs the batched kernel, one thread: `ik-cpubench <checkpoint dir>`.
 //! Layer 3 (NVFP4) and the first MXFP8 layer, 8 experts each, read once per pass.
 use ik_engine::checkpoint::Checkpoint;
-use ik_engine::cpu::{Act, dot_row};
+use ik_engine::cpu::dot_row;
 use ik_engine::cpu_batch::dot_tokens;
 use ik_engine::experts::{Experts, Fmt, Mat};
 use ik_engine::hp::Hp;
@@ -19,19 +19,17 @@ fn main() -> Result<(), String> {
     let x: Vec<f32> = (0..hp.n_embd).map(|i| ((i * 7919 % 1000) as f32 / 500.0) - 1.0).collect();
     let layers = [Some(3), ex.fmt.iter().position(|&f| f == Fmt::MxFp8)];
     for layer in layers.into_iter().flatten() {
-        let (mut xq, mut aq) = (Act::default(), Act::default());
-        xq.set(&x, ex.fmt[layer]);
-        aq.set(&x[..hp.n_ff_exp], ex.fmt[layer]);
+        let (xq, aq) = (&x[..], &x[..hp.n_ff_exp]);
         for nt in [1usize, 4, 8] {
-            let xs: Vec<&Act> = (0..nt).map(|_| &xq).collect();
-            let as_: Vec<&Act> = (0..nt).map(|_| &aq).collect();
+            let xs: Vec<&[f32]> = (0..nt).map(|_| xq).collect();
+            let as_: Vec<&[f32]> = (0..nt).map(|_| aq).collect();
             let mut out = vec![0f32; nt];
             let mut s = 0f32;
             let (t0, mut bytes) = (std::time::Instant::now(), 0);
             for e in 0..8 {
                 let gu = ex.gate_up(layer, e);
                 for r in 0..gu.rows {
-                    if nt == 1 { s += dot_row(&gu, r, &xq) } else { dot_tokens(&gu, r, &xs, &mut out); s += out[0] }
+                    if nt == 1 { s += dot_row(&gu, r, xq) } else { dot_tokens(&gu, r, &xs, &mut out); s += out[0] }
                 }
                 bytes += self::bytes(&gu);
             }
@@ -40,7 +38,7 @@ fn main() -> Result<(), String> {
             for e in 8..16 {
                 let dn = ex.down(layer, e);
                 for r in 0..dn.rows {
-                    if nt == 1 { s += dot_row(&dn, r, &aq) } else { dot_tokens(&dn, r, &as_, &mut out); s += out[0] }
+                    if nt == 1 { s += dot_row(&dn, r, aq) } else { dot_tokens(&dn, r, &as_, &mut out); s += out[0] }
                 }
                 bytes2 += self::bytes(&dn);
             }
@@ -81,12 +79,10 @@ fn main() -> Result<(), String> {
     // the pool's ceiling: n threads, each through its own NVFP4 experts for a second, either the same 2 again and again
     // (from the caches) or a new one each time (from RAM)
     let layer = 3;
-    let mut xq = Act::default();
-    xq.set(&x, ex.fmt[layer]);
     for warm in [true, false] {
         for nt in [1usize, 4, 8, 12] {
             let ex = &ex;
-            let xq = &xq;
+            let xq = &x[..];
             let stop = std::sync::atomic::AtomicBool::new(false);
             let bytes = std::sync::atomic::AtomicU64::new(0);
             let t0 = std::time::Instant::now();
