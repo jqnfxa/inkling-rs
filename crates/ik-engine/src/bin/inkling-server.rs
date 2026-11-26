@@ -6,8 +6,8 @@
 //! The sampling flags set the defaults; a request's own temperature, top_k, ... take precedence.
 //! OpenAI-compatible: /v1/chat/completions, /v1/completions, /v1/models, /health; /props as llama-server answers it, and
 //! with --ui the files of a browser UI at / (the llama.cpp chat UI: tools/fetch-ui.sh). --tools gives that UI's model
-//! the server's tools (/tools): it reads, searches and writes files as the user the server runs as, for callers on
-//! this machine only.
+//! the server's tools (/tools): it reads, searches and writes files and runs programs as the user the server runs as,
+//! for callers on this machine only.
 #![recursion_limit = "256"]
 
 use std::sync::Arc;
@@ -69,7 +69,7 @@ fn main() -> Result<(), String> {
     eprintln!("sampling unless a request says otherwise: temp {} top-k {} top-p {} min-p {} repeat-penalty {} presence-penalty {} frequency-penalty {} (last {})", sampling.temperature, sampling.top_k, sampling.top_p, sampling.min_p, sampling.repeat_penalty, sampling.presence_penalty, sampling.frequency_penalty, sampling.repeat_last_n);
     let tools = a.iter().any(|x| x == "--tools");
     if tools {
-        eprintln!("tools on: the chat UI's model may read, search and write files as this user (the UI asks first); only callers on this machine");
+        eprintln!("tools on: the chat UI's model may read, search and write files and run programs as this user (the UI asks first); only callers on this machine");
     }
     let site = server::Site { tools, ..site(&eng, &model, &name, n_ctx, ui.clone(), compaction, notes, sampling) };
     let (tx, rx) = std::sync::mpsc::channel();

@@ -1,5 +1,5 @@
-//! The chat UI's server tools, on with `inkling-server --tools`: the model reads, searches and writes files on this
-//! machine, as the user the server runs as. The llama.cpp chat UI lists them (GET /tools), offers them to the model,
+//! The chat UI's server tools, on with `inkling-server --tools`: the model reads, searches and writes files and runs
+//! programs on this machine, as the user the server runs as. The llama.cpp chat UI lists them (GET /tools), offers them to the model,
 //! asks the user before each call unless told to always allow it, and runs them (POST /tools {"tool", "params"}).
 //! A relative path is taken from the conversation's working directory, which the UI sends (x-tool-cwd).
 //! A result has a shape the UI reads: {"plain_text_response"} is text for the model, {"error"} a failure, and another
@@ -9,7 +9,10 @@ use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::net::IpAddr;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -25,6 +28,12 @@ const WALK_TIME: Duration = Duration::from_secs(10);
 /// grep_search skips larger files, and shows this much of a long line
 const GREP_FILE_BYTES: u64 = 32 << 20;
 const GREP_LINE_CHARS: usize = 400;
+/// a program's output: this much of its start as it comes, and this much of its end at the end
+const OUT_HEAD: usize = 32 << 10;
+const OUT_TAIL: usize = 32 << 10;
+/// a program runs this long unless the call says, and at most this long
+const RUN_SECS: i64 = 120;
+const RUN_MAX_SECS: i64 = 3600;
 /// the keys a model gives a path under (the UI's renderers read all three)
 const PATH: &[&str] = &["path", "file_path", "filePath"];
 
@@ -34,7 +43,8 @@ pub fn list() -> Value {
     let int = |what: &str| json!({"type": "integer", "description": what});
     let string = |what: &str| json!({"type": "string", "description": what});
     let boolean = |what: &str| json!({"type": "boolean", "description": what});
-    Value::Array(vec![
+    let timeout = int("seconds to let it run (default 120, at most 3600)");
+    let mut tools = vec![
         def(
             "read_file",
             "Read a text file: all of it, or lines start_line to end_line (counted from 1). At most 2000 lines or 64 KiB come \
@@ -81,8 +91,35 @@ pub fn list() -> Value {
                    "return_line_numbers": boolean("give line numbers (default true)"), "limit": int("the most lines to give (default 200)")}),
             &["pattern"],
         ),
-        def("get_info", "Get this machine's OS, the working directory and the home directory.", json!({}), &[]),
-    ])
+        def(
+            "exec_shell_command",
+            &format!(
+                "Run a shell command ({} -c) in the working directory, and get its output (stdout and stderr together) \
+                 and its exit code if not 0. Its stdin is empty; after timeout seconds it is killed, with what it \
+                 started. Past 64 KiB of output, only the first and the last 32 KiB are kept.",
+                shell()
+            ),
+            json!({"command": string("the command"), "timeout": timeout}),
+            &["command"],
+        ),
+        def("get_info", "Get this machine's OS, the working directory, the home directory and the shell.", json!({}), &[]),
+    ];
+    if on_path("python3") {
+        tools.push(def(
+            "run_python",
+            "Run a Python 3 program (python3 -c) in the working directory, and get what it prints (stdout and stderr \
+             together) and its exit code if not 0: print what you want to see. Its stdin is empty; after timeout \
+             seconds it is killed. Past 64 KiB of output, only the first and the last 32 KiB are kept.",
+            json!({"code": string("the program"), "timeout": timeout}),
+            &["code"],
+        ));
+    }
+    Value::Array(tools)
+}
+
+/// Whether `name` is a program on PATH.
+fn on_path(name: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
 }
 
 fn def(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
@@ -656,7 +693,237 @@ fn get_info(cwd: &Path) -> Value {
         Some(name) => format!("{name} ({})", std::env::consts::OS),
         None => std::env::consts::OS.to_string(),
     };
-    json!({"os": os, "arch": std::env::consts::ARCH, "cwd": cwd.display().to_string(), "home": home().display().to_string()})
+    json!({"os": os, "arch": std::env::consts::ARCH, "cwd": cwd.display().to_string(), "home": home().display().to_string(), "shell": shell()})
+}
+
+/// Whether `tool` runs a program, which `exec` does.
+pub fn runs(tool: &str) -> bool {
+    matches!(tool, "exec_shell_command" | "run_python")
+}
+
+/// What exec_shell_command runs its command with.
+fn shell() -> &'static str {
+    if Path::new("/bin/bash").is_file() { "/bin/bash" } else { "/bin/sh" }
+}
+
+/// Runs exec_shell_command or run_python. `out` gets the output as it comes, stdout and stderr together, and "" after
+/// 2 s without a call; it says false when nobody listens any more, and the program is killed. Ok(None): it exited 0;
+/// Ok(Some(why)): it didn't (an exit code, a signal, the timeout); Err: it didn't run.
+pub fn exec(tool: &str, p: &Value, cwd: Option<&str>, out: &mut dyn FnMut(&str) -> bool) -> Result<Option<String>, String> {
+    let cwd = workdir(cwd);
+    if !cwd.is_dir() {
+        return Err(format!("the working directory {} doesn't exist", cwd.display()));
+    }
+    let mut cmd = if tool == "run_python" {
+        let code = s(p, &["code", "script", "source"]).filter(|c| !c.trim().is_empty()).ok_or("run_python needs the code")?;
+        let mut c = Command::new("python3");
+        c.args(["-u", "-c", code]);
+        c
+    } else {
+        let line = s(p, &["command", "cmd", "shell_command"]).filter(|c| !c.trim().is_empty()).ok_or("exec_shell_command needs a command")?;
+        let mut c = Command::new(shell());
+        c.args(["-c", line]);
+        c
+    };
+    // seconds; or milliseconds, as the UI's run_javascript takes them
+    let secs = n(p, &["timeout", "timeout_secs", "timeout_seconds"])
+        .or_else(|| n(p, &["timeout_ms"]).map(|ms| ms.saturating_add(999) / 1000))
+        .unwrap_or(RUN_SECS)
+        .clamp(1, RUN_MAX_SECS);
+    let (rd, wr) = std::io::pipe().map_err(|e| e.to_string())?;
+    cmd.current_dir(&cwd).stdin(Stdio::null()).stdout(wr.try_clone().map_err(|e| e.to_string())?).stderr(wr);
+    cmd.env("PAGER", "cat").env("GIT_PAGER", "cat").env("TERM", "dumb");
+    // SAFETY: only async-signal-safe calls, between fork and exec. A session of its own: the server's terminal isn't
+    // its terminal, and a kill takes what it started too. The server's own files (the GPU's) close at exec. And it
+    // goes first when memory runs out, not the server.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, libc::CLOSE_RANGE_CLOEXEC);
+            let fd = libc::open(c"/proc/self/oom_score_adj".as_ptr(), libc::O_WRONLY);
+            if fd >= 0 {
+                libc::write(fd, b"1000".as_ptr().cast(), 4);
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let spawned = cmd.spawn();
+    drop(cmd); // the server's ends of the pipe: the output ends when the program's do
+    let mut child = spawned.map_err(|e| format!("{program}: {e}"))?;
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let (mut rd, mut b) = (rd, vec![0u8; 16 << 10]);
+        loop {
+            match rd.read(&mut b) {
+                Ok(0) => break,
+                Ok(k) => {
+                    if tx.send(b[..k].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+    let last = std::cell::Cell::new(Instant::now());
+    let mut tell = |s: &str| {
+        last.set(Instant::now());
+        out(s)
+    };
+    let deadline = Instant::now() + Duration::from_secs(secs as u64);
+    // the program's group is signalled only while it's unreaped, so that its number can't be another's
+    let (mut text, mut eof, mut ended) = (Output::default(), false, None);
+    let why = loop {
+        if ended.is_none() {
+            ended = child.try_wait().map_err(|e| e.to_string())?.map(|st| (st, Instant::now()));
+            if ended.is_none() && Instant::now() > deadline {
+                kill(&mut child);
+                break Some(format!("timed out after {secs} s, killed"));
+            }
+        }
+        // what it left running may hold the output a while: 0.5 s
+        if let Some((st, at)) = ended
+            && (eof || at.elapsed() > Duration::from_millis(500))
+        {
+            break describe(st);
+        }
+        let got = if eof {
+            std::thread::sleep(Duration::from_millis(50));
+            None
+        } else {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(b) => Some(b),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    eof = true;
+                    None
+                }
+            }
+        };
+        let listens = got.is_none_or(|b| text.push(&b, &mut tell)) && (last.get().elapsed() < Duration::from_secs(2) || tell(""));
+        if !listens {
+            if ended.is_none() {
+                kill(&mut child);
+            }
+            return Ok(Some("stopped: nobody listens any more".into()));
+        }
+    };
+    // what's still on its way: until the output ends, 0.5 s at most
+    let until = Instant::now() + Duration::from_millis(500);
+    while let Ok(b) = rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+        text.push(&b, &mut tell);
+    }
+    text.end(&mut tell);
+    Ok(why)
+}
+
+/// Kills `child`, unreaped, and what it started (the process group it leads, setsid), and reaps it.
+fn kill(child: &mut Child) {
+    // SAFETY: a signal to a process group
+    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    let _ = child.wait();
+}
+
+/// How a program ended, unless well.
+fn describe(st: ExitStatus) -> Option<String> {
+    match (st.code(), st.signal()) {
+        (Some(0), _) => None,
+        (Some(c), _) => Some(format!("exit code {c}")),
+        (None, Some(sig)) => Some(format!("killed by signal {sig}")),
+        _ => Some("ended abnormally".into()),
+    }
+}
+
+/// The reply to an exec_shell_command or run_python that isn't streamed, as the UI shows a streamed one: its output,
+/// then "Error: why" if it failed.
+pub fn reply(text: String, why: Option<String>) -> Value {
+    match why {
+        None => json!({"plain_text_response": text}),
+        Some(w) => json!({"error": format!("{text}\nError: {w}")}),
+    }
+}
+
+/// A program's output on its way to the model: its first OUT_HEAD bytes as they come, its last OUT_TAIL at the end.
+#[derive(Default)]
+struct Output {
+    /// bytes so far
+    n: usize,
+    /// the end past OUT_HEAD, OUT_TAIL of it at most
+    tail: VecDeque<u8>,
+    /// the start of a character that the last bytes sent cut off
+    carry: Vec<u8>,
+}
+
+impl Output {
+    /// Takes `b`: what's in the head goes to `out` now. False: `out` said nobody listens.
+    fn push(&mut self, b: &[u8], out: &mut dyn FnMut(&str) -> bool) -> bool {
+        let head = OUT_HEAD.saturating_sub(self.n).min(b.len());
+        self.n += b.len();
+        self.tail.extend(&b[head..]);
+        let over = self.tail.len().saturating_sub(OUT_TAIL);
+        self.tail.drain(..over);
+        head == 0 || self.send(&b[..head], out)
+    }
+
+    /// Sends the tail, after a note of what was left out between; "(no output)" if there was none.
+    fn end(&mut self, out: &mut dyn FnMut(&str) -> bool) {
+        let mut tail: Vec<u8> = self.tail.drain(..).collect();
+        let gap = self.n - self.n.min(OUT_HEAD) - tail.len();
+        if gap > 0 {
+            self.flush(out);
+            // the tail from the start of a character
+            let cut = tail.iter().position(|&c| c & 0xC0 != 0x80).unwrap_or(tail.len());
+            tail.drain(..cut);
+            out(&format!("\n[... {} bytes of output left out ...]\n", gap + cut));
+        }
+        self.send(&tail, out);
+        self.flush(out);
+        if self.n == 0 {
+            out("(no output)");
+        }
+    }
+
+    /// Sends `b` as text, but for a character cut off at its end, which waits for the next bytes.
+    fn send(&mut self, b: &[u8], out: &mut dyn FnMut(&str) -> bool) -> bool {
+        self.carry.extend_from_slice(b);
+        let mut t = String::new();
+        loop {
+            match std::str::from_utf8(&self.carry) {
+                Ok(v) => {
+                    t.push_str(v);
+                    self.carry.clear();
+                    break;
+                }
+                Err(e) => {
+                    let ok = e.valid_up_to();
+                    t.push_str(std::str::from_utf8(&self.carry[..ok]).unwrap_or_default());
+                    match e.error_len() {
+                        Some(bad) => {
+                            t.push('\u{FFFD}');
+                            self.carry.drain(..ok + bad);
+                        }
+                        None => {
+                            self.carry.drain(..ok);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        t.is_empty() || out(&t)
+    }
+
+    /// Sends a cut-off character's bytes as they are (U+FFFD).
+    fn flush(&mut self, out: &mut dyn FnMut(&str) -> bool) {
+        if !self.carry.is_empty() {
+            let t = String::from_utf8_lossy(&self.carry).into_owned();
+            self.carry.clear();
+            out(&t);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -693,6 +960,40 @@ mod tests {
         assert!(caller_ok(lo, 8080, None, None).is_err());
         assert!(caller_ok(lo, 8080, Some("127.0.0.1:9090"), None).is_err());
         assert!(caller_ok("192.168.1.5".parse().unwrap(), 8080, Some("192.168.1.5:8080"), None).is_err()); // another machine
+    }
+
+    #[test]
+    fn programs() {
+        let run = |tool: &str, p: Value| {
+            let mut text = String::new();
+            let why = exec(tool, &p, None, &mut |s| {
+                text.push_str(s);
+                true
+            });
+            reply(text, why.unwrap())
+        };
+        let said = |v: Value| v["plain_text_response"].as_str().or(v["error"].as_str()).unwrap().to_string();
+        assert_eq!(run("exec_shell_command", json!({"command": "echo out; echo err >&2; exit 3"})), json!({"error": "out\nerr\n\nError: exit code 3"}));
+        assert_eq!(run("exec_shell_command", json!({"command": "true"})), json!({"plain_text_response": "(no output)"}));
+        assert_eq!(run("exec_shell_command", json!({"command": "kill -9 $$"})), json!({"error": "(no output)\nError: killed by signal 9"}));
+        // the timeout kills what the command started too
+        let t0 = Instant::now();
+        let r = said(run("exec_shell_command", json!({"command": "sleep 30 & echo $!; wait", "timeout": 1})));
+        assert!(t0.elapsed() < Duration::from_secs(5) && r.ends_with("\n\nError: timed out after 1 s, killed"), "{r}");
+        let state = |pid: &str| fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|s| s.rsplit_once(") ")?.1.chars().next());
+        let pid = r.lines().next().unwrap();
+        while state(pid).is_some_and(|c| c != 'Z') && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(state(pid).is_none_or(|c| c == 'Z'), "the command's sleep {pid} lives on");
+        // past 64 KiB, the start and the end: the character the head's end cuts is one U+FFFD, the tail starts at one
+        let r = said(run("exec_shell_command", json!({"command": "printf a; head -c 100000 /dev/zero | tr '\\0' x | sed 's/x/é/g'; echo; echo end"})));
+        let kept = OUT_TAIL - 1;
+        let want = format!("a{}\u{FFFD}\n[... {} bytes of output left out ...]\n{}\nend\n", "é".repeat((OUT_HEAD - 1) / 2), 200_006 - OUT_HEAD - kept, "é".repeat((kept - 5) / 2));
+        assert!(r == want, "{} bytes, not {}: {:?}", r.len(), want.len(), r.chars().skip(16380).take(60).collect::<String>());
+        if on_path("python3") {
+            assert_eq!(run("run_python", json!({"code": "import sys\nprint(sys.version_info[0])\nsys.exit(2)"})), json!({"error": "3\n\nError: exit code 2"}));
+        }
     }
 
     #[test]

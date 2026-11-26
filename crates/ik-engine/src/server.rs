@@ -872,6 +872,19 @@ fn query(path: &str, key: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// Whether the client of a reply that comes at the end is still there: its end of the connection isn't closed.
+fn connected(s: &TcpStream) -> bool {
+    if s.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let r = s.peek(&mut [0u8; 1]);
+    let _ = s.set_nonblocking(false);
+    match r {
+        Ok(k) => k > 0,
+        Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
+    }
+}
+
 const CORS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n";
 
 fn respond(s: &mut TcpStream, code: u16, body: &Value) {
@@ -1107,8 +1120,39 @@ fn handle(mut stream: TcpStream, jobs: Sender<Job>, tok: Arc<Tokenizer>, model: 
             }
             let r: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
             let tool = r.get("tool").and_then(Value::as_str).unwrap_or("");
+            let params = r.get("params").cloned().unwrap_or(json!({}));
+            if crate::tools::runs(tool) {
+                let cwd = req.tool_cwd.as_deref();
+                if r.get("stream").and_then(Value::as_bool) == Some(true) {
+                    // the UI's live output: {"chunk"} events, then {"done"}, with the "error" if it failed
+                    if write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n").is_err() {
+                        return;
+                    }
+                    let mut send = |v: &str| {
+                        let ev = if v.is_empty() { ": keepalive\n\n".to_string() } else { format!("data: {}\n\n", json!({"chunk": v})) };
+                        stream.write_all(ev.as_bytes()).and_then(|_| stream.flush()).is_ok()
+                    };
+                    let done = match crate::tools::exec(tool, &params, cwd, &mut send) {
+                        Ok(None) => json!({"done": true}),
+                        Ok(Some(e)) | Err(e) => json!({"done": true, "error": e}),
+                    };
+                    let _ = write!(stream, "data: {done}\n\ndata: [DONE]\n\n");
+                    return;
+                }
+                let mut text = String::new();
+                let end = crate::tools::exec(tool, &params, cwd, &mut |v| {
+                    text.push_str(v);
+                    // the reply comes at the end: is the client still there?
+                    !v.is_empty() || connected(&stream)
+                });
+                let body = match end {
+                    Ok(why) => crate::tools::reply(text, why),
+                    Err(e) => json!({"error": e}),
+                };
+                return respond(&mut stream, 200, &body);
+            }
             let raw = req.resp_type.as_deref() == Some("base64");
-            match crate::tools::call(tool, r.get("params").unwrap_or(&json!({})), req.tool_cwd.as_deref(), raw) {
+            match crate::tools::call(tool, &params, req.tool_cwd.as_deref(), raw) {
                 Some(v) => respond(&mut stream, 200, &v),
                 None => respond(&mut stream, 404, &json!({"error": format!("no tool {tool:?}")})),
             }

@@ -104,15 +104,21 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
 - The KV cache is reused when a prompt extends the previous one. When a chat UI sends the history again, the cache is
   rolled back to the end of the last prompt.
 - `--tools` gives the chat UI's model the server tools it knows: `read_file`, `write_file`, `edit_file`,
-  `file_glob_search`, `grep_search` and `get_info` (`GET /tools` lists them, `POST /tools {"tool", "params"}` runs
-  one; without `--tools` both answer 403, which the UI reads as "off"). They act as the user the server runs as, and
-  the UI asks before each call unless told to always allow it. A relative path is taken from the conversation's working
-  directory (the UI's `x-tool-cwd`). `POST /tools` answers only connections from this machine whose `Host` is
+  `file_glob_search`, `grep_search`, `exec_shell_command` and `get_info`, and `run_python` if `python3` is on the PATH
+  (`GET /tools` lists them, `POST /tools {"tool", "params"}` runs one; without `--tools` both answer 403, which the UI
+  reads as "off"). They act as the user the server runs as, and the UI asks before each call unless told to always
+  allow it. A relative path, and a program's working directory, is the conversation's working directory (the UI's
+  `x-tool-cwd`). `POST /tools` answers only connections from this machine whose `Host` is
   `localhost` or a loopback address on the server's port, and whose `Origin`, if they send one, is the server's own
   page: another site's page can't use the tools, nor one whose DNS name was rebound to 127.0.0.1. Other users of the
   same machine can, so use `--tools` on a machine that is yours alone. The searches walk nearest first, skip hidden
   directories, `node_modules` and build caches (a `CACHEDIR.TAG` inside, as in cargo's `target`) unless the search
-  starts in one, and stop after 500k entries or 10 s.
+  starts in one, and stop after 500k entries or 10 s. A command (`bash -c`) or a Python program (`python3 -c`) gets an
+  empty stdin and a session of its own; its output, stdout and stderr together, streams to the UI as it comes, its
+  first and last 32 KiB. It is killed with what it started after its `timeout` (120 s unless the call says, an hour at
+  most), or when the client goes away. It runs inside the server's memory limit (`MEM_MAX`, which the model mostly
+  fills), and goes first when that runs out (`oom_score_adj` 1000): a program that needs more is killed, not the
+  server.
 
 ## Design
 
