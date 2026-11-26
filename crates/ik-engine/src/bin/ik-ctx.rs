@@ -31,8 +31,9 @@ fn main() -> Result<(), String> {
         free >> 20,
         total >> 20
     );
-    let sizes: Vec<String> = e.pf_sizes().iter().map(|&(t, b)| format!("{t} tokens {} MiB", b >> 20)).collect();
-    eprintln!("prefill's region by ubatch: {}", sizes.join(", "));
+    let (sizes, floor) = e.pf_sizes();
+    let sizes: Vec<String> = sizes.iter().map(|&(t, b)| format!("{t} tokens {} MiB", b >> 20)).collect();
+    eprintln!("prefill's region by ubatch: {}; room for {floor} beside the KV rows", sizes.join(", "));
     let text = std::fs::read_to_string(&a[2]).map_err(|x| x.to_string())?;
     let mut ids = tok.encode("<|message_user|><|content_text|>", true);
     ids.extend(tok.encode(&text, false));

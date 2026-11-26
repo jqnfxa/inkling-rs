@@ -29,8 +29,9 @@ const GPU_EXPERTS: bool = true;
 const MSG: [usize; 4] = [0, 2, 3, 1];
 
 /// Tokens of a prefill ubatch, at most; the SWA rings hold this many rows past the window.
-pub const T_MAX: usize = 256;
-/// The ubatch that the KV rows in VRAM leave prefill's region room for, at any context.
+pub const T_MAX: usize = 1024;
+/// The fewest tokens of the layout that the KV rows in VRAM leave prefill's region room for: a context too long to fit
+/// beside the region for T_MAX tokens leaves room for fewer, down to this (Engine::floor).
 const T_FLOOR: usize = 256;
 /// The fewest tokens that prefill's buffers are laid out for: a prompt takes the layout for the least power of two from
 /// this up that holds it, as far as the VRAM beside the KV rows goes (pf_plan).
@@ -375,6 +376,9 @@ pub struct Engine {
     /// the tokens that prefill's buffers are laid out for (place), and the region's bytes in each layout (T_MIN up)
     tm: usize,
     pf_sizes: Vec<(usize, usize)>,
+    /// the layout that the KV rows in VRAM leave the region room for: for T_MAX tokens, or fewer down to T_FLOOR when
+    /// the whole context would not fit beside it
+    floor: usize,
     ring: Vec<u32>,
     conv: Vec<DevBuf>, // per slot: k [kv][3], v [kv][3], post [n][3], ffn [n][3]
     sc: Scratch,
@@ -618,6 +622,7 @@ impl Engine {
             pf_on: false,
             tm: T_FLOOR,
             pf_sizes: vec![],
+            floor: T_FLOOR,
             ring,
             conv,
             sc,
@@ -646,31 +651,41 @@ impl Engine {
             let r = (budget / per_step * KV_STEP).min(all);
             cap.map_or(r, |c| r.min(c.div_ceil(KV_STEP) * KV_STEP))
         };
-        // the VRAM rows leave prefill's region room in its layout for T_FLOOR tokens, with the stage if there are host
-        // rows
+        // the VRAM rows leave prefill's region room in its layout for T_MAX tokens, or for fewer down to T_FLOOR where
+        // the whole context would not fit beside it, with the stage if there are host rows. Decode gains little from
+        // the rows that a smaller region would leave in VRAM: past them the expert cache has their memory instead.
         let host_ok = VmBuf::host_pages_supported(e.ctx.device);
-        e.place(T_FLOOR);
-        let mut vram_rows = if host_ok { rows_for(e.vram_budget.saturating_sub(e.region.bytes())) } else { all };
-        if vram_rows < all {
-            e.kv_cpu = true;
-            e.place(T_FLOOR);
-            vram_rows = rows_for(e.vram_budget.saturating_sub(e.region.bytes()));
-        }
-        let (need_vram, need_host) = (e.kv_bytes(vram_rows), e.kv_bytes(all) - e.kv_bytes(vram_rows));
         let host_free = host_mem_free().saturating_sub(HOST_MARGIN);
-        let kv_budget = e.vram_budget.saturating_sub(e.region.bytes());
-        if need_vram > kv_budget || need_host > host_free {
-            let per = per_step / KV_STEP;
-            let most = if host_ok { (kv_budget / per_step * KV_STEP) + host_free / per } else { kv_budget / per };
-            return Err(format!(
-                "a context of {} tokens needs {} MiB of KV cache; there are {} MiB of VRAM for it and the experts{}: {} tokens at most",
-                e.n_ctx,
-                e.kv_bytes(all) >> 20,
-                kv_budget >> 20,
-                if host_ok { format!(", and {} MiB of host memory past that", host_free >> 20) } else { String::new() },
-                most
-            ));
-        }
+        let mut t = T_MAX;
+        let vram_rows = loop {
+            e.kv_cpu = false;
+            e.place(t);
+            let mut vram_rows = if host_ok { rows_for(e.vram_budget.saturating_sub(e.region.bytes())) } else { all };
+            if vram_rows < all {
+                e.kv_cpu = true;
+                e.place(t);
+                vram_rows = rows_for(e.vram_budget.saturating_sub(e.region.bytes()));
+            }
+            let (need_vram, need_host) = (e.kv_bytes(vram_rows), e.kv_bytes(all) - e.kv_bytes(vram_rows));
+            let kv_budget = e.vram_budget.saturating_sub(e.region.bytes());
+            if need_vram <= kv_budget && need_host <= host_free {
+                break vram_rows;
+            }
+            if t == T_FLOOR {
+                let per = per_step / KV_STEP;
+                let most = if host_ok { (kv_budget / per_step * KV_STEP) + host_free / per } else { kv_budget / per };
+                return Err(format!(
+                    "a context of {} tokens needs {} MiB of KV cache; there are {} MiB of VRAM for it and the experts{}: {} tokens at most",
+                    e.n_ctx,
+                    e.kv_bytes(all) >> 20,
+                    kv_budget >> 20,
+                    if host_ok { format!(", and {} MiB of host memory past that", host_free >> 20) } else { String::new() },
+                    most
+                ));
+            }
+            t /= 2;
+        };
+        e.floor = t;
         for v in e.kv_vm.iter_mut().flatten().flatten() {
             v.set_host_from(vram_rows * KV_ROW);
         }
@@ -706,14 +721,15 @@ impl Engine {
             e.pf_sizes.push((t, e.region.bytes()));
             t *= 2;
         }
-        e.place(T_FLOOR);
+        e.place(e.floor);
         e.plan_kv(T_MAX)?;
         Ok(e)
     }
 
-    /// Prefill's layouts: the most tokens of a ubatch, and the bytes of the region then.
-    pub fn pf_sizes(&self) -> &[(usize, usize)] {
-        &self.pf_sizes
+    /// Prefill's layouts: the most tokens of a ubatch, and the bytes of the region then; and the layout that the KV rows
+    /// in VRAM leave room for at any context.
+    pub fn pf_sizes(&self) -> (&[(usize, usize)], usize) {
+        (&self.pf_sizes, self.floor)
     }
 
     /// Bytes of the full-attention KV caches in host memory now.
@@ -819,10 +835,10 @@ impl Engine {
 
     /// Lays prefill's buffers out for a prompt of `len` tokens that ends at position `end`: for the fewest tokens of a
     /// layout that hold it in one ubatch, or the most whose region fits beside the KV rows in VRAM then. The layout for
-    /// T_FLOOR tokens always fits (new).
+    /// `floor` tokens always fits (new).
     fn pf_plan(&mut self, len: usize, end: usize) -> Result<()> {
         let room = self.pf_room(end);
-        let fit = self.pf_sizes.iter().filter(|&&(t, b)| t <= T_FLOOR || b <= room).map(|&(t, _)| t).max().unwrap_or(T_FLOOR);
+        let fit = self.pf_sizes.iter().filter(|&&(t, b)| t <= self.floor || b <= room).map(|&(t, _)| t).max().unwrap_or(self.floor);
         let need = self.pf_sizes.iter().map(|&(t, _)| t).find(|&t| t >= len).unwrap_or(T_MAX);
         let tm = need.min(fit);
         if tm != self.tm {
@@ -1265,7 +1281,7 @@ impl Engine {
             return Err(format!("context of {} tokens is full", self.n_ctx));
         }
         // a ubatch that feed or extend did not lay the buffers out for
-        if nt > self.tm || (self.tm > T_FLOOR && self.pf_size(self.tm) > self.pf_room(self.pos + nt)) {
+        if nt > self.tm || (self.tm > self.floor && self.pf_size(self.tm) > self.pf_room(self.pos + nt)) {
             self.pf_plan(nt, self.pos + nt)?;
             if nt > self.tm {
                 return Err(format!("a ubatch of {nt} tokens does not fit beside the KV cache in VRAM; {} do", self.tm));

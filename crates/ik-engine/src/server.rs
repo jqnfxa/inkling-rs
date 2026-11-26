@@ -14,6 +14,10 @@ use serde_json::{Value, json};
 use crate::chat::{self, Delta, Parser};
 use crate::compact;
 use crate::engine::{Engine, T_MAX};
+
+/// Tokens of a progress note's branch, its request and its text, at most; the checkpoint comes back from T_MAX.
+const NOTE_BRANCH: usize = 256;
+const _: () = assert!(NOTE_BRANCH <= T_MAX);
 use crate::sampler::{Sampler, SamplingParams};
 use crate::tokenizer::Tokenizer;
 
@@ -174,13 +178,13 @@ fn take_note(eng: &mut Engine, tok: &Tokenizer, nt: &mut Noter, params: &Samplin
     nt.since = 0;
     nt.wait = 0;
     let req = tok.encode(&compact::note_request(nt.system), true);
-    // the branch stays within T_MAX tokens, which the checkpoint can come back from
-    if req.len() + 24 > T_MAX || eng.tokens.len() + T_MAX >= eng.n_ctx {
+    // the branch stays within NOTE_BRANCH tokens
+    if req.len() + 24 > NOTE_BRANCH || eng.tokens.len() + NOTE_BRANCH >= eng.n_ctx {
         return Ok(true);
     }
     eng.checkpoint()?;
     let logits = eng.extend(&req, &mut |_| {})?;
-    let out = generate(eng, tok, logits, T_MAX - req.len(), params, &mut |_, _| true)?.unwrap_or_default();
+    let out = generate(eng, tok, logits, NOTE_BRANCH - req.len(), params, &mut |_, _| true)?.unwrap_or_default();
     eng.back_to_checkpoint()?;
     nt.secs += t0.elapsed().as_secs_f64();
     let text = compact::clean_note(&format!("{}{}", compact::NOTE_START, tok.decode(&out, false)));

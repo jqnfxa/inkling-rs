@@ -125,7 +125,7 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
   on a flag (`moe_wait`). No host round trip per layer.
 - The CPU threads take work from shared counters with no barrier; each gate/up chunk also applies the activation to
   its block, which the down projection reads.
-- Prefill runs ubatches of up to 256 tokens. The dense matrices run as a tiled BF16 GEMM and attention by tiles of 16
+- Prefill runs ubatches of up to 1024 tokens. The dense matrices run as a tiled BF16 GEMM and attention by tiles of 16
   tokens and 32 keys, on the GPU, and so do the pairs of the cached experts: a cached NVFP4 expert with at least 12 of
   the ubatch's tokens runs them in one kernel by tiles of 128 rows and 32 tokens, each weight decoded once a tile, and
   the others a pair at a time. The other experts are grouped by expert, each read once per ubatch for all its tokens.
@@ -137,7 +137,7 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
   `IK_PF_STREAM=0` turns the stream off.
 - Activations stay f32; the engine adds no quantization. The KV caches hold K and V in f16, as the reference code keeps
   them in BF16: the f32 values the kernels compute, rounded once (2048 bytes each per position and layer pass). The
-  sliding-window passes' caches are rings of 1280 positions (the window and a ubatch). Perplexity over the first 2048
+  sliding-window passes' caches are rings of 2048 positions (the window and a ubatch). Perplexity over the first 2048
   tokens of `/usr/share/common-licenses/GPL-3` is 1.5174, against 1.5265 with the int8 and int4 caches of before; but
   a new order of f32 sums alone moves it 0.3% on this text, so it does not tell the two apart. The kernels are checked
   against f64 instead (`ik-wcheck`).
@@ -163,8 +163,10 @@ rest, so a short chat runs with the whole budget whatever `--ctx` is, and each 1
 slots back. A new chat that is shorter than the last gives the pages back to the expert cache. Prefill's buffers (a
 ubatch's activations, the expert stream's staging slots) are mapped the same way, only while prefill runs: decode
 gets their pages as expert slots (49 more on an RTX 3050 Laptop), which fill at its first token. They are laid out for
-each prompt, for the least power of two from 32 tokens that holds it in one ubatch: a short chat message maps 52 MiB, a
-256-token ubatch 148 MiB.
+each prompt, for the least power of two from 32 tokens that holds it in one ubatch, up to 1024: a short chat message
+maps 52 MiB, a 1024-token ubatch 482 MiB. The KV rows in VRAM leave room for the 1024-token layout, or for 512 or 256
+tokens where the whole `--ctx` would not fit beside it, so the longest context stays as long. At 8k of context prefill
+runs 200 t/s by 1024-token ubatches, against 137 by 256.
 
 Decode slows as the context fills, from fewer expert slots and from attention over more keys. The table was measured
 with the int4 caches of before, when full attention took about 0.22 ms per token for each 8k tokens; the f16 caches

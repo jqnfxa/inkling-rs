@@ -1,5 +1,5 @@
 //! Branch check: a sequence that goes on straight, against the same sequence with a branch of `len` tokens (at most
-//! T_MAX) taken at a checkpoint and dropped: `ik-branch <checkpoint dir> [branch tokens, 256]`. The logits after it
+//! T_MAX) taken at a checkpoint and dropped: `ik-branch <checkpoint dir> [branch tokens, T_MAX]`. The logits after it
 //! should be the ones without it.
 use ik_engine::engine::{Engine, Options, T_MAX, threads_from_env};
 
@@ -10,7 +10,7 @@ fn main() -> Result<(), String> {
     let len: usize = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(T_MAX).min(T_MAX);
     // a prompt longer than the sliding window, so that the rings have wrapped
     let pa = tok.encode(&"The history of the bicycle begins in the early nineteenth century. ".repeat(100), false);
-    let branch = tok.encode(&"Pause, and write a note about something else entirely: the weather, the sea, the mountains. ".repeat(20), false);
+    let branch = tok.encode(&"Pause, and write a note about something else entirely: the weather, the sea, the mountains. ".repeat(50), false);
     let am = |v: &[f32]| v.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).unwrap().0 as u32;
     let run = |e: &mut Engine, forced: Option<&[u32]>, with_branch: bool| -> Result<(Vec<u32>, Vec<Vec<f32>>), String> {
         e.reset()?;
