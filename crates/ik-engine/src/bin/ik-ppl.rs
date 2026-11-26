@@ -1,15 +1,14 @@
-//! Perplexity of a text, decoded a token at a time: `ik-ppl <model.gguf> <text file> [n_tokens] [skip]`.
-//! Scores tokens skip.. of the first n_tokens (the first ones have too little context to say much). IK_KV_F16 and the
-//! other switches of the engine apply, to compare.
+//! Perplexity of a text, decoded a token at a time: `ik-ppl <checkpoint dir> <text file> [n_tokens] [skip]`.
+//! Scores tokens skip.. of the first n_tokens (the first ones have too little context to say much). The engine's switches
+//! (IK_* variables) apply, to compare.
 use ik_engine::engine::{Engine, Options, threads_from_env};
-use ik_engine::tokenizer::Tokenizer;
 
 fn main() -> Result<(), String> {
     let a: Vec<String> = std::env::args().collect();
     let n: usize = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(1024);
     let skip: usize = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(64);
     let mut e = Engine::new(std::path::Path::new(&a[1]), Options { n_ctx: n + 8, cache_slots: usize::MAX, threads: threads_from_env(), graph: true, upload_budget: 4 })?;
-    let tok = Tokenizer::from_gguf(&e.g)?;
+    let tok = e.ck.tokenizer()?;
     let text = std::fs::read_to_string(&a[2]).map_err(|x| x.to_string())?;
     let ids = tok.encode(&text, false);
     let n = n.min(ids.len());

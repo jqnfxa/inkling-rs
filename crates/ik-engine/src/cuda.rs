@@ -33,8 +33,6 @@ unsafe extern "C" {
     fn cuMemHostAlloc(p: *mut *mut c_void, n: usize, flags: c_uint) -> CUresult;
     fn cuMemFreeHost(p: *mut c_void) -> CUresult;
     fn cuMemHostGetDevicePointer_v2(d: *mut CUdeviceptr, p: *mut c_void, flags: c_uint) -> CUresult;
-    fn cuMemHostRegister_v2(p: *mut c_void, n: usize, flags: c_uint) -> CUresult;
-    fn cuMemHostUnregister(p: *mut c_void) -> CUresult;
     fn cuMemcpyHtoD_v2(dst: CUdeviceptr, src: *const c_void, n: usize) -> CUresult;
     fn cuMemcpyDtoH_v2(dst: *mut c_void, src: CUdeviceptr, n: usize) -> CUresult;
     fn cuMemcpyHtoDAsync_v2(dst: CUdeviceptr, src: *const c_void, n: usize, s: CUstream) -> CUresult;
@@ -42,6 +40,8 @@ unsafe extern "C" {
     fn cuMemcpyDtoDAsync_v2(dst: CUdeviceptr, src: CUdeviceptr, n: usize, s: CUstream) -> CUresult;
     fn cuMemsetD8Async(dst: CUdeviceptr, v: u8, n: usize, s: CUstream) -> CUresult;
     fn cuStreamCreate(s: *mut CUstream, flags: c_uint) -> CUresult;
+    fn cuStreamCreateWithPriority(s: *mut CUstream, flags: c_uint, priority: c_int) -> CUresult;
+    fn cuCtxGetStreamPriorityRange(least: *mut c_int, greatest: *mut c_int) -> CUresult;
     fn cuStreamDestroy_v2(s: CUstream) -> CUresult;
     fn cuStreamSynchronize(s: CUstream) -> CUresult;
     fn cuStreamWaitEvent(s: CUstream, e: CUevent, flags: c_uint) -> CUresult;
@@ -53,7 +53,6 @@ unsafe extern "C" {
     fn cuEventElapsedTime(ms: *mut f32, a: CUevent, b: CUevent) -> CUresult;
     fn cuModuleLoadDataEx(m: *mut CUmodule, image: *const c_void, n: c_uint, opts: *mut c_int, vals: *mut *mut c_void) -> CUresult;
     fn cuModuleGetFunction(f: *mut CUfunction, m: CUmodule, name: *const c_char) -> CUresult;
-    fn cuFuncSetAttribute(f: CUfunction, attr: c_int, v: c_int) -> CUresult;
     fn cuLaunchKernel(
         f: CUfunction, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, by: c_uint, bz: c_uint,
         shared: c_uint, s: CUstream, params: *mut *mut c_void, extra: *mut *mut c_void,
@@ -116,16 +115,11 @@ macro_rules! ck {
 
 /// The primary context of a device, current on the thread that made it.
 pub struct Ctx {
-    ctx: CUcontext,
     pub device: CUdevice,
     pub name: String,
     pub sm_count: u32,
     pub cc: (u32, u32),
 }
-
-// SAFETY: a context handle may be made current on any thread.
-unsafe impl Send for Ctx {}
-unsafe impl Sync for Ctx {}
 
 impl Ctx {
     pub fn new(ordinal: i32) -> Result<Ctx> {
@@ -144,12 +138,7 @@ impl Ctx {
         };
         let sm_count = attr(16)?; // CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT
         let cc = (attr(75)?, attr(76)?);
-        Ok(Ctx { ctx, device, name: unsafe { CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned(), sm_count, cc })
-    }
-
-    /// Makes the context current on the calling thread.
-    pub fn bind(&self) -> Result<()> {
-        ck!(cuCtxSetCurrent(self.ctx))
+        Ok(Ctx { device, name: unsafe { CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned(), sm_count, cc })
     }
 
     pub fn sync(&self) -> Result<()> {
@@ -180,9 +169,19 @@ impl Stream {
         ck!(cuStreamCreate(&mut s, 1))?; // CU_STREAM_NON_BLOCKING
         Ok(Stream(s))
     }
+    /// new_nonblocking at the context's highest priority: once a block of another stream's kernel ends, a waiting block
+    /// of this one's starts first.
+    pub fn new_nonblocking_high() -> Result<Stream> {
+        let (mut least, mut greatest) = (0, 0);
+        ck!(cuCtxGetStreamPriorityRange(&mut least, &mut greatest))?;
+        let mut s = null_mut();
+        ck!(cuStreamCreateWithPriority(&mut s, 1, greatest))?;
+        Ok(Stream(s))
+    }
     pub fn sync(&self) -> Result<()> {
         ck!(cuStreamSynchronize(self.0))
     }
+    /// The work queued on the stream from now on waits for the work the event was recorded after.
     pub fn wait(&self, e: &Event) -> Result<()> {
         ck!(cuStreamWaitEvent(self.0, e.0, 0))
     }
@@ -253,10 +252,11 @@ impl Drop for Graph {
     }
 }
 
-/// Device memory, in bytes.
+/// Device memory, in bytes: its own allocation, or a view of memory that something else owns (a Region's).
 pub struct DevBuf {
     pub ptr: CUdeviceptr,
     pub len: usize,
+    owned: bool,
 }
 unsafe impl Send for DevBuf {}
 unsafe impl Sync for DevBuf {}
@@ -265,7 +265,11 @@ impl DevBuf {
     pub fn new(len: usize) -> Result<DevBuf> {
         let mut ptr = 0;
         ck!(cuMemAlloc_v2(&mut ptr, len.max(1)))?;
-        Ok(DevBuf { ptr, len })
+        Ok(DevBuf { ptr, len, owned: true })
+    }
+    /// `len` bytes at `ptr`, which the view does not free.
+    pub fn view(ptr: CUdeviceptr, len: usize) -> DevBuf {
+        DevBuf { ptr, len, owned: false }
     }
     pub fn zeroed(len: usize, s: &Stream) -> Result<DevBuf> {
         let b = DevBuf::new(len)?;
@@ -284,11 +288,6 @@ impl DevBuf {
         let n = size_of_val(data);
         assert!(off + n <= self.len, "upload of {n} bytes at {off} past {}", self.len);
         ck!(cuMemcpyHtoD_v2(self.ptr + off as u64, data.as_ptr() as *const c_void, n))
-    }
-    pub fn upload_async<T: Copy>(&self, off: usize, data: &[T], s: &Stream) -> Result<()> {
-        let n = size_of_val(data);
-        assert!(off + n <= self.len);
-        ck!(cuMemcpyHtoDAsync_v2(self.ptr + off as u64, data.as_ptr() as *const c_void, n, s.0))
     }
     pub fn download<T: Copy + Default>(&self, n: usize) -> Result<Vec<T>> {
         self.download_at(0, n)
@@ -310,12 +309,53 @@ impl DevBuf {
 
 impl Drop for DevBuf {
     fn drop(&mut self) {
-        unsafe { cuMemFree_v2(self.ptr) };
+        if self.owned {
+            unsafe { cuMemFree_v2(self.ptr) };
+        }
+    }
+}
+
+/// Buffers at fixed addresses in one VmBuf that is mapped only at times: views handed out one after another, usable
+/// while `on`. Prefill's buffers live in one, whose pages are the expert cache's while decode runs.
+pub struct Region {
+    vm: VmBuf,
+    used: usize,
+}
+
+impl Region {
+    /// Addresses for `len` bytes of views; no memory yet.
+    pub fn reserve(len: usize, dev: CUdevice) -> Result<Region> {
+        Ok(Region { vm: VmBuf::reserve(len, dev)?, used: 0 })
+    }
+
+    /// A view of `len` bytes after the last one, at a multiple of 256 bytes.
+    pub fn take(&mut self, len: usize) -> DevBuf {
+        let at = self.used.next_multiple_of(256);
+        assert!(at + len <= self.vm.len, "region of {} bytes: {len} more at {at}", self.vm.len);
+        self.used = at + len;
+        DevBuf::view(self.vm.ptr + at as u64, len)
+    }
+
+    /// The memory that the views take when mapped: whole pages.
+    pub fn bytes(&self) -> usize {
+        self.vm.pages_for(self.used)
+    }
+
+    /// Forgets the views, to lay them out again; the region must have no memory.
+    pub fn clear(&mut self) {
+        assert_eq!(self.vm.mapped(), 0);
+        self.used = 0;
+    }
+
+    /// Maps the views' pages (zeroed on `s`) or releases them. The caller makes sure no work in flight uses them.
+    pub fn set(&mut self, on: bool, s: &Stream) -> Result<()> {
+        self.vm.resize(if on { self.used } else { 0 }, s)
     }
 }
 
 /// Device memory at a fixed address range whose pages are backed on demand: the first `mapped()` bytes are usable.
-/// Kernels and CUDA graphs keep the address while pages come and go, so memory can move between buffers.
+/// Kernels and CUDA graphs keep the address while pages come and go, so memory can move between buffers. Pages from
+/// `host_from` on are page-locked host memory at the same addresses: kernels read and write them over PCIe.
 pub struct VmBuf {
     pub ptr: CUdeviceptr,
     /// the reserved bytes, a whole number of pages
@@ -323,20 +363,33 @@ pub struct VmBuf {
     pages: Vec<u64>,
     page: usize,
     dev: CUdevice,
+    host_from: usize,
 }
 unsafe impl Send for VmBuf {}
 unsafe impl Sync for VmBuf {}
 
 impl VmBuf {
-    fn prop(dev: CUdevice) -> CUmemAllocationProp {
-        CUmemAllocationProp { ty: 1, handle_types: 0, location: CUmemLocation { ty: 1, id: dev }, win32: null_mut(), flags: [0; 8] }
+    fn prop(dev: CUdevice, host: bool) -> CUmemAllocationProp {
+        // CU_MEM_LOCATION_TYPE_HOST_NUMA = 3, node 0
+        let location = if host { CUmemLocation { ty: 3, id: 0 } } else { CUmemLocation { ty: 1, id: dev } };
+        CUmemAllocationProp { ty: 1, handle_types: 0, location, win32: null_mut(), flags: [0; 8] }
     }
 
     /// The page size: the driver's minimum granularity (2 MiB on current GPUs).
     pub fn granularity(dev: CUdevice) -> Result<usize> {
         let mut g = 0;
-        ck!(cuMemGetAllocationGranularity(&mut g, &Self::prop(dev), 0))?;
+        ck!(cuMemGetAllocationGranularity(&mut g, &Self::prop(dev, false), 0))?;
         Ok(g)
+    }
+
+    /// Whether pages can be host memory (CU_DEVICE_ATTRIBUTE_HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED), and
+    /// host pages are no larger than device pages.
+    pub fn host_pages_supported(dev: CUdevice) -> bool {
+        let mut v = 0;
+        let mut g = usize::MAX;
+        // SAFETY: plain queries
+        let ok = unsafe { cuDeviceGetAttribute(&mut v, 141, dev) == 0 && v != 0 && cuMemGetAllocationGranularity(&mut g, &Self::prop(dev, true), 0) == 0 };
+        ok && Self::granularity(dev).is_ok_and(|p| p % g == 0)
     }
 
     /// Reserves addresses for `len` bytes (rounded up to pages); no memory is mapped yet.
@@ -345,7 +398,75 @@ impl VmBuf {
         let len = len.max(1).div_ceil(page) * page;
         let mut ptr = 0;
         ck!(cuMemAddressReserve(&mut ptr, len, page, 0, 0))?;
-        Ok(VmBuf { ptr, len, pages: vec![], page, dev })
+        Ok(VmBuf { ptr, len, pages: vec![], page, dev, host_from: usize::MAX })
+    }
+
+    /// Pages mapped from now on at byte `bytes` (rounded up to pages) and past it are host memory.
+    pub fn set_host_from(&mut self, bytes: usize) {
+        self.host_from = self.pages_for(bytes) / self.page;
+    }
+
+    /// The mapped bytes in host memory.
+    pub fn host_bytes(&self) -> usize {
+        self.pages.len().saturating_sub(self.host_from) * self.page
+    }
+
+    /// The byte from which pages are host memory.
+    pub fn split(&self) -> usize {
+        self.host_from.saturating_mul(self.page)
+    }
+
+    /// Moves the split between device and host pages to byte `bytes` (rounded up to pages): each mapped page on the
+    /// wrong side moves over with its contents (move_page), one at a time with the split, which so stays true if one
+    /// fails. Pages mapped later follow the split. The caller makes sure no work in flight uses the pages that move.
+    pub fn move_split(&mut self, bytes: usize, scratch: CUdeviceptr, s: &Stream) -> Result<()> {
+        let new = self.pages_for(bytes) / self.page;
+        if new > self.host_from {
+            for i in self.host_from..new.min(self.pages.len()) {
+                self.move_page(i, false, scratch, s)?;
+                self.host_from = i + 1;
+            }
+        } else {
+            for i in (new..self.host_from.min(self.pages.len())).rev() {
+                self.move_page(i, true, scratch, s)?;
+                self.host_from = i;
+            }
+        }
+        self.host_from = new;
+        Ok(())
+    }
+
+    /// Gives mapped page `i` new memory, in host memory or VRAM, with its contents: the new memory is mapped first at
+    /// `scratch` (a page of addresses with nothing mapped) to copy them over on `s`, then in place of the old.
+    fn move_page(&mut self, i: usize, host: bool, scratch: CUdeviceptr, s: &Stream) -> Result<()> {
+        let (at, page) = (self.ptr + (i * self.page) as u64, self.page);
+        // the device reads and writes all pages; the host its own too
+        let desc = [CUmemAccessDesc { location: CUmemLocation { ty: 1, id: self.dev }, flags: 3 }, CUmemAccessDesc { location: CUmemLocation { ty: 3, id: 0 }, flags: 3 }];
+        let nd = 1 + host as usize;
+        let mut h = 0;
+        ck!(cuMemCreate(&mut h, page, &Self::prop(self.dev, host), 0))?;
+        let copied = ck!(cuMemMap(scratch, page, 0, h, 0)).and_then(|_| {
+            let r = ck!(cuMemSetAccess(scratch, page, desc.as_ptr(), nd)).and_then(|_| ck!(cuMemcpyDtoDAsync_v2(scratch, at, page, s.0))).and_then(|_| s.sync());
+            let u = ck!(cuMemUnmap(scratch, page));
+            r.and(u)
+        });
+        let moved = copied.and_then(|_| ck!(cuMemUnmap(at, page))).and_then(|_| {
+            ck!(cuMemMap(at, page, 0, h, 0)).and_then(|_| ck!(cuMemSetAccess(at, page, desc.as_ptr(), nd))).inspect_err(|_| {
+                // back to the old memory, which still holds the contents
+                // SAFETY: the addresses are this buffer's, the old memory its own
+                unsafe {
+                    cuMemUnmap(at, page);
+                    cuMemMap(at, page, 0, self.pages[i], 0);
+                    cuMemSetAccess(at, page, desc.as_ptr(), 3 - nd);
+                }
+            })
+        });
+        if let Err(e) = moved {
+            // SAFETY: the new memory is mapped nowhere now
+            unsafe { cuMemRelease(h) };
+            return Err(e);
+        }
+        ck!(cuMemRelease(std::mem::replace(&mut self.pages[i], h)))
     }
 
     /// The bytes that `bytes` of content take: whole pages.
@@ -368,20 +489,32 @@ impl VmBuf {
                 ck!(cuMemRelease(h))?;
             }
         } else if want > have {
-            let prop = Self::prop(self.dev);
             for i in have..want {
                 let mut h = 0;
-                ck!(cuMemCreate(&mut h, self.page, &prop, 0))?;
+                ck!(cuMemCreate(&mut h, self.page, &Self::prop(self.dev, i >= self.host_from), 0))?;
                 if let Err(e) = ck!(cuMemMap(self.ptr + (i * self.page) as u64, self.page, 0, h, 0)) {
                     unsafe { cuMemRelease(h) };
                     return Err(e);
                 }
                 self.pages.push(h);
             }
-            let (at, n) = (self.ptr + (have * self.page) as u64, (want - have) * self.page);
-            let desc = CUmemAccessDesc { location: CUmemLocation { ty: 1, id: self.dev }, flags: 3 };
-            ck!(cuMemSetAccess(at, n, &desc, 1))?;
-            ck!(cuMemsetD8Async(at, 0, n, s.0))?;
+            // the device reads and writes all pages; the host its own too
+            let desc = [CUmemAccessDesc { location: CUmemLocation { ty: 1, id: self.dev }, flags: 3 }, CUmemAccessDesc { location: CUmemLocation { ty: 3, id: 0 }, flags: 3 }];
+            let at = |i: usize| self.ptr + (i * self.page) as u64;
+            let host = want.min(self.host_from).max(have);
+            for (from, to, nd) in [(have, host, 1), (host, want, 2)] {
+                if to > from {
+                    ck!(cuMemSetAccess(at(from), (to - from) * self.page, desc.as_ptr(), nd))?;
+                }
+            }
+            // zeroed: the new device pages at once, the host pages one at a time (a memset over two host pages, or
+            // over a device page and a host one, is refused: invalid argument)
+            if host > have {
+                ck!(cuMemsetD8Async(at(have), 0, (host - have) * self.page, s.0))?;
+            }
+            for i in host..want {
+                ck!(cuMemsetD8Async(at(i), 0, self.page, s.0))?;
+            }
         }
         Ok(())
     }
@@ -457,15 +590,6 @@ impl Drop for HostBuf {
     }
 }
 
-/// Page-locks an existing host range (the mapped model file) so that uploads from it run as DMA.
-pub fn register_host(p: *const u8, len: usize) -> Result<()> {
-    ck!(cuMemHostRegister_v2(p as *mut c_void, len, 0x01)) // PORTABLE
-}
-
-pub fn unregister_host(p: *const u8) -> Result<()> {
-    ck!(cuMemHostUnregister(p as *mut c_void))
-}
-
 pub struct Module(CUmodule);
 unsafe impl Send for Module {}
 unsafe impl Sync for Module {}
@@ -516,9 +640,6 @@ impl Arg for f32 {
 }
 
 impl Func {
-    pub fn set_max_shared(&self, bytes: u32) -> Result<()> {
-        ck!(cuFuncSetAttribute(self.0, 8, bytes as c_int)) // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
-    }
     /// Launches the kernel on `s`; `args` are the parameters in order.
     pub fn launch(&self, s: &Stream, grid: (u32, u32, u32), block: (u32, u32, u32), shared: u32, args: &[&dyn Arg]) -> Result<()> {
         let mut ps: Vec<*mut c_void> = args.iter().map(|a| a.ptr()).collect();

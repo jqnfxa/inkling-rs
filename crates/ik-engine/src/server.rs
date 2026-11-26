@@ -14,6 +14,10 @@ use serde_json::{Value, json};
 use crate::chat::{self, Delta, Parser};
 use crate::compact;
 use crate::engine::{Engine, T_MAX};
+
+/// Tokens of a progress note's branch, its request and its text, at most; the checkpoint comes back from T_MAX.
+const NOTE_BRANCH: usize = 256;
+const _: () = assert!(NOTE_BRANCH <= T_MAX);
 use crate::sampler::{Sampler, SamplingParams};
 use crate::tokenizer::Tokenizer;
 
@@ -174,13 +178,13 @@ fn take_note(eng: &mut Engine, tok: &Tokenizer, nt: &mut Noter, params: &Samplin
     nt.since = 0;
     nt.wait = 0;
     let req = tok.encode(&compact::note_request(nt.system), true);
-    // the branch stays within T_MAX tokens, which the checkpoint can come back from
-    if req.len() + 24 > T_MAX || eng.tokens.len() + T_MAX >= eng.n_ctx {
+    // the branch stays within NOTE_BRANCH tokens
+    if req.len() + 24 > NOTE_BRANCH || eng.tokens.len() + NOTE_BRANCH >= eng.n_ctx {
         return Ok(true);
     }
     eng.checkpoint()?;
     let logits = eng.extend(&req, &mut |_| {})?;
-    let out = generate(eng, tok, logits, T_MAX - req.len(), params, &mut |_, _| true)?.unwrap_or_default();
+    let out = generate(eng, tok, logits, NOTE_BRANCH - req.len(), params, &mut |_, _| true)?.unwrap_or_default();
     eng.back_to_checkpoint()?;
     nt.secs += t0.elapsed().as_secs_f64();
     let text = compact::clean_note(&format!("{}{}", compact::NOTE_START, tok.decode(&out, false)));
@@ -795,6 +799,12 @@ struct Request {
     path: String,
     /// X-Conversation-Id (the llama.cpp UI's, "<conversation>::<model>"): the stream is a resumable session
     conv: Option<String>,
+    /// Host and Origin, which POST /tools checks
+    host: Option<String>,
+    origin: Option<String>,
+    /// the llama.cpp UI's x-tool-cwd (the conversation's working directory) and x-resp-type, for POST /tools
+    tool_cwd: Option<String>,
+    resp_type: Option<String>,
     body: Vec<u8>,
 }
 
@@ -805,7 +815,7 @@ fn read_request(s: &mut BufReader<TcpStream>) -> Option<Request> {
     let method = it.next()?.to_string();
     let path = it.next()?.to_string();
     let mut len = 0usize;
-    let mut conv = None;
+    let (mut conv, mut host, mut origin, mut tool_cwd, mut resp_type) = (None, None, None, None, None);
     loop {
         let mut h = String::new();
         if s.read_line(&mut h).ok()? == 0 {
@@ -818,8 +828,16 @@ fn read_request(s: &mut BufReader<TcpStream>) -> Option<Request> {
         if let Some((k, v)) = h.split_once(':') {
             if k.eq_ignore_ascii_case("content-length") {
                 len = v.trim().parse().ok()?;
-            } else if k.eq_ignore_ascii_case("x-conversation-id") && !v.trim().is_empty() {
-                conv = Some(v.trim().to_string());
+            } else if !v.trim().is_empty() {
+                let to = match k.to_ascii_lowercase().as_str() {
+                    "x-conversation-id" => &mut conv,
+                    "host" => &mut host,
+                    "origin" => &mut origin,
+                    "x-tool-cwd" => &mut tool_cwd,
+                    "x-resp-type" => &mut resp_type,
+                    _ => continue,
+                };
+                *to = Some(v.trim().to_string());
             }
         }
     }
@@ -828,7 +846,7 @@ fn read_request(s: &mut BufReader<TcpStream>) -> Option<Request> {
     }
     let mut body = vec![0u8; len];
     s.read_exact(&mut body).ok()?;
-    Some(Request { method, path, conv, body })
+    Some(Request { method, path, conv, host, origin, tool_cwd, resp_type, body })
 }
 
 /// A query parameter, percent-decoded.
@@ -854,6 +872,19 @@ fn query(path: &str, key: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// Whether the client of a reply that comes at the end is still there: its end of the connection isn't closed.
+fn connected(s: &TcpStream) -> bool {
+    if s.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let r = s.peek(&mut [0u8; 1]);
+    let _ = s.set_nonblocking(false);
+    match r {
+        Ok(k) => k > 0,
+        Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
+    }
+}
+
 const CORS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n";
 
 fn respond(s: &mut TcpStream, code: u16, body: &Value) {
@@ -861,6 +892,7 @@ fn respond(s: &mut TcpStream, code: u16, body: &Value) {
     let reason = match code {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         _ => "Internal Server Error",
     };
@@ -901,6 +933,8 @@ pub struct Site {
     pub notes: compact::Notes,
     /// sampling settings unless a request says otherwise
     pub sampling: SamplingParams,
+    /// the chat UI's server tools (--tools): files and search on this machine, for the model
+    pub tools: bool,
 }
 
 /// The request's `reasoning_summary` (or `reasoning.summary`) and `reasoning_summary_interval` over the server's.
@@ -1076,8 +1110,54 @@ fn handle(mut stream: TcpStream, jobs: Sender<Job>, tok: Arc<Tokenizer>, model: 
         }
         ("GET", "/health") | ("GET", "/v1/health") => respond(&mut stream, 200, &json!({"status": "ok"})),
         ("GET", "/props") => respond(&mut stream, 200, &site.props),
-        // llama-server's own tools (--tools): none here
-        ("GET", "/tools") => respond(&mut stream, 200, &json!([])),
+        // the chat UI's server tools; 403 tells it they're off
+        ("GET", "/tools") if site.tools => respond(&mut stream, 200, &crate::tools::list()),
+        ("POST", "/tools") if site.tools => {
+            let caller = stream.peer_addr().and_then(|peer| Ok((peer, stream.local_addr()?.port())));
+            let ok = caller.map_err(|e| e.to_string()).and_then(|(peer, port)| crate::tools::caller_ok(peer.ip(), port, req.host.as_deref(), req.origin.as_deref()));
+            if let Err(e) = ok {
+                return respond(&mut stream, 403, &json!({"error": e}));
+            }
+            let r: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            let tool = r.get("tool").and_then(Value::as_str).unwrap_or("");
+            let params = r.get("params").cloned().unwrap_or(json!({}));
+            if crate::tools::runs(tool) {
+                let cwd = req.tool_cwd.as_deref();
+                if r.get("stream").and_then(Value::as_bool) == Some(true) {
+                    // the UI's live output: {"chunk"} events, then {"done"}, with the "error" if it failed
+                    if write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n").is_err() {
+                        return;
+                    }
+                    let mut send = |v: &str| {
+                        let ev = if v.is_empty() { ": keepalive\n\n".to_string() } else { format!("data: {}\n\n", json!({"chunk": v})) };
+                        stream.write_all(ev.as_bytes()).and_then(|_| stream.flush()).is_ok()
+                    };
+                    let done = match crate::tools::exec(tool, &params, cwd, &mut send) {
+                        Ok(None) => json!({"done": true}),
+                        Ok(Some(e)) | Err(e) => json!({"done": true, "error": e}),
+                    };
+                    let _ = write!(stream, "data: {done}\n\ndata: [DONE]\n\n");
+                    return;
+                }
+                let mut text = String::new();
+                let end = crate::tools::exec(tool, &params, cwd, &mut |v| {
+                    text.push_str(v);
+                    // the reply comes at the end: is the client still there?
+                    !v.is_empty() || connected(&stream)
+                });
+                let body = match end {
+                    Ok(why) => crate::tools::reply(text, why),
+                    Err(e) => json!({"error": e}),
+                };
+                return respond(&mut stream, 200, &body);
+            }
+            let raw = req.resp_type.as_deref() == Some("base64");
+            match crate::tools::call(tool, &params, req.tool_cwd.as_deref(), raw) {
+                Some(v) => respond(&mut stream, 200, &v),
+                None => respond(&mut stream, 404, &json!({"error": format!("no tool {tool:?}")})),
+            }
+        }
+        ("GET", "/tools") | ("POST", "/tools") => respond(&mut stream, 403, &json!({"error": "the tools are off: start the server with --tools"})),
         ("POST", "/v1/streams/lookup") => {
             let r: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
             let keys: Vec<&str> = r.get("conversation_ids").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();

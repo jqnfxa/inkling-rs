@@ -1,8 +1,8 @@
 //! GPU kernels of the Inkling-2-Mini engine, written in kernite. The engine loads `gpu::PTX` with the driver API.
 //!
 //! Layout conventions: vectors are f32, one token at a time (grid.y walks tokens where a kernel takes several).
-//! Q8_0 matrices are repacked at load: `qs` is [rows][k] int8, `d` is [rows][k/32] f16 (Marlin-style: aligned 16-byte loads).
-//! Q4_K and Q5_0 experts keep the GGUF block layout, so that a cache upload is a plain copy.
+//! The weights are read as the checkpoint stores them: the dense matrices in BF16, the experts in NVFP4 (E2M1 codes,
+//! an E4M3 scale per 16 values) or MXFP8 (E4M3 values, a UE8M0 scale per 32).
 
 #![allow(long_running_const_eval)]
 
@@ -37,15 +37,6 @@ pub mod gpu {
             let o: f32;
             shfl.sync.bfly.b32(o, v, sh, 31, 0xffff_ffff);
             max.f32(v, v, o);
-        }
-    }
-
-    /// Sum of `v` over the 16 lanes of a half warp.
-    fn half_sum(v: f32) {
-        for sh in [8, 4, 2, 1] {
-            let o: f32;
-            shfl.sync.bfly.b32(o, v, sh, 31, 0xffff_ffff);
-            add.rn.f32(v, v, o);
         }
     }
 
@@ -104,24 +95,6 @@ pub mod gpu {
         fma.rn.f32(y, e, -2.0, 1.0);
     }
 
-    /// acc += the 4 signed bytes of `w` times x0..x3
-    fn fma_s8x4(acc: f32, w: u32, x0: f32, x1: f32, x2: f32, x3: f32) {
-        let b: s32;
-        let f: f32;
-        bfe.s32(b, w, 0, 8);
-        cvt.rn.f32.s32(f, b);
-        fma.rn.f32(acc, f, x0, acc);
-        bfe.s32(b, w, 8, 8);
-        cvt.rn.f32.s32(f, b);
-        fma.rn.f32(acc, f, x1, acc);
-        bfe.s32(b, w, 16, 8);
-        cvt.rn.f32.s32(f, b);
-        fma.rn.f32(acc, f, x2, acc);
-        bfe.s32(b, w, 24, 8);
-        cvt.rn.f32.s32(f, b);
-        fma.rn.f32(acc, f, x3, acc);
-    }
-
     /// Copies `n` floats of global `src` to shared `dst`, by all threads of the block, then waits.
     fn stage(dst: u32, src: u64, n: u32) {
         let (i, nt): (u32, u32);
@@ -146,100 +119,311 @@ pub mod gpu {
         bar.sync(0);
     }
 
-    // ---------------------------------------------------------------- Q8_0 GEMV
+    // ---------------------------------------------------------------- BF16 (the checkpoint's dense weights, as stored)
 
-    /// y[r] = sum_c W[r][c] x[c] for a repacked Q8_0 matrix (`qs` [rows][k] int8, `d` [rows][k/32] f16).
-    /// k is a multiple of 16 and at most 4608. A half warp takes a row, 16 rows per block of 256 threads.
-    /// grid.y walks tokens: x advances by k floats, y by `y_stride`.
-    #[maxntid(256)]
-    pub unsafe extern "ptx-kernel" fn gemv_q8(qs: *const u8, d: *const u16, x: *const f32, y: *mut f32, rows: u32, k: u32, y_stride: u32) {
-        let xs: shared<[f32; 4608], 16>;
-        let (base, tok, xoff): (u32, u32, u32);
-        mov.u32(tok, ctaid.y);
-        mul.lo.u32(xoff, tok, k);
-        let xt: u64;
-        mad.wide.u32(xt, xoff, 4, x);
-        mov.u32(base, xs);
-        stage(base, xt, k);
+    /// The bf16 at `a` as f32.
+    fn ld_bf16(f: f32, a: u64) {
+        let h: u16;
+        let u: u32;
+        ld.global.nc.u16(h, [a]);
+        cvt.u32.u16(u, h);
+        shl.b32(u, u, 16);
+        mov.b32(f, u);
+    }
 
-        let (t, hl, hw, row): (u32, u32, u32, u32);
+    /// The two bf16 of `w` as f32: `lo` the one in its low half (the first in memory).
+    fn bf16x2(lo: f32, hi: f32, w: u32) {
+        let (a, b): (u32, u32);
+        shl.b32(a, w, 16);
+        and.b32(b, w, 0xFFFF_0000);
+        mov.b32(lo, a);
+        mov.b32(hi, b);
+    }
+
+    /// acc += the two bf16 of `w` times xa (the first) and xb.
+    fn fma_bf16x2(acc: f32, w: u32, xa: f32, xb: f32) {
+        let (lo, hi): (f32, f32);
+        bf16x2(lo, hi, w);
+        fma.rn.f32(acc, lo, xa, acc);
+        fma.rn.f32(acc, hi, xb, acc);
+    }
+
+    /// The bf16 `h` as f32.
+    fn bf16f(f: f32, h: u16) {
+        let u: u32;
+        cvt.u32.u16(u, h);
+        shl.b32(u, u, 16);
+        mov.b32(f, u);
+    }
+
+    /// The 4 static taps of channel c of a short convolution as f32, w0 the oldest token's and w3 the current one's,
+    /// from the checkpoint's BF16 weights: a `[c][4]` conv1d weight (oldest first), or with `LAG` the `[lag][c_total]`
+    /// static weight of a dynamic convolution (lag 0 the current token).
+    fn conv_w<const LAG: u32>(w0: f32, w1: f32, w2: f32, w3: f32, w: u64, c: u32, c_total: u32) {
+        if LAG == 0 {
+            let (wa, p0, p1): (u64, u32, u32);
+            let c4: u32;
+            shl.b32(c4, c, 2);
+            mad.wide.u32(wa, c4, 2, w);
+            ld.global.nc.v2.u32((p0, p1), [wa]);
+            bf16x2(w0, w1, p0);
+            bf16x2(w2, w3, p1);
+        }
+        if LAG == 1 {
+            let (a, st): (u64, u64);
+            mad.wide.u32(a, c, 2, w);
+            mul.wide.u32(st, c_total, 2);
+            ld_bf16(w3, a);
+            add.u64(a, a, st);
+            ld_bf16(w2, a);
+            add.u64(a, a, st);
+            ld_bf16(w1, a);
+            add.u64(a, a, st);
+            ld_bf16(w0, a);
+        }
+    }
+
+    /// y[r] = sum_c W[r][c] x[c] for a BF16 matrix W [rows][k] (row-major, as the checkpoint has it) and f32 x.
+    /// A warp takes rows 2w and 2w + 1 of the block's 16, a lane 8 columns of each at a time (16-byte loads, 512
+    /// contiguous bytes of a row per warp); x comes through L1. k a multiple of 256.
+    fn gemv_bf16_body(w: u64, x: u64, y: u64, rows: u32, k: u32, b: u32) {
+        let (t, lane, wp, r0, r1, last): (u32, u32, u32, u32, u32, u32);
         mov.u32(t, tid.x);
-        and.b32(hl, t, 15);
-        shr.u32(hw, t, 4);
-        let b: u32;
-        mov.u32(b, ctaid.x);
-        mad.lo.u32(row, b, 16, hw);
+        and.b32(lane, t, 31);
+        shr.u32(wp, t, 5);
+        shl.b32(r0, b, 4);
+        mad.lo.u32(r0, wp, 2, r0);
         let past: pred;
-        setp.ge.u32(past, row, rows);
+        setp.ge.u32(past, r0, rows);
         if past {
             ret();
         }
-
-        let (rowq, nblk, rowd): (u32, u32, u32);
-        mul.lo.u32(rowq, row, k);
-        shr.u32(nblk, k, 5);
-        mul.lo.u32(rowd, row, nblk);
-
-        let acc: f32;
-        mov.f32(acc, 0.0);
-        let c: u32;
-        shl.b32(c, hl, 4);
+        // an odd last row: the warp's second row repeats it, and is not stored
+        add.u32(r1, r0, 1);
+        sub.u32(last, rows, 1);
+        min.u32(r1, r1, last);
+        let (c, o0, o1): (u32, u32, u32);
+        shl.b32(c, lane, 3);
+        mad.lo.u32(o0, r0, k, c);
+        mad.lo.u32(o1, r1, k, c);
+        let (a0, a1, xa): (u64, u64, u64);
+        mad.wide.u32(a0, o0, 2, w);
+        mad.wide.u32(a1, o1, 2, w);
+        mad.wide.u32(xa, c, 4, x);
+        let (acc0, acc1): (f32, f32);
+        mov.f32(acc0, 0.0);
+        mov.f32(acc1, 0.0);
         label(top);
         let done: pred;
         setp.ge.u32(done, c, k);
         if done {
             bra(end);
         }
-        let i: u32;
-        let (at, dat): (u64, u64);
-        add.u32(i, rowq, c);
-        mad.wide.u32(at, i, 1, qs);
-        let (w0, w1, w2, w3): (u32, u32, u32, u32);
-        ld.global.nc.v4.u32((w0, w1, w2, w3), [at]);
-        let j: u32;
-        let h: f16;
-        shr.u32(j, c, 5);
-        add.u32(j, j, rowd);
-        mad.wide.u32(dat, j, 2, d);
-        ld.global.nc.b16(h, [dat]);
-        let sc: f32;
-        cvt.f32.f16(sc, h);
-        let xa: u32;
-        mad.lo.u32(xa, c, 4, base);
-        let (x0, x1, x2, x3): (f32, f32, f32, f32);
-        let s: f32;
-        mov.f32(s, 0.0);
-        ld.shared.v4.f32((x0, x1, x2, x3), [xa]);
-        fma_s8x4(s, w0, x0, x1, x2, x3);
-        ld.shared.v4.f32((x0, x1, x2, x3), [xa + 16]);
-        fma_s8x4(s, w1, x0, x1, x2, x3);
-        ld.shared.v4.f32((x0, x1, x2, x3), [xa + 32]);
-        fma_s8x4(s, w2, x0, x1, x2, x3);
-        ld.shared.v4.f32((x0, x1, x2, x3), [xa + 48]);
-        fma_s8x4(s, w3, x0, x1, x2, x3);
-        fma.rn.f32(acc, s, sc, acc);
+        let p: [u32; 4];
+        let q: [u32; 4];
+        let xv: [f32; 8];
+        ld.global.nc.v4.u32((p[0], p[1], p[2], p[3]), [a0]);
+        ld.global.nc.v4.u32((q[0], q[1], q[2], q[3]), [a1]);
+        ld.global.nc.v4.f32((xv[0], xv[1], xv[2], xv[3]), [xa]);
+        ld.global.nc.v4.f32((xv[4], xv[5], xv[6], xv[7]), [xa + 16]);
+        for j in 0..4 {
+            fma_bf16x2(acc0, p[j], xv[2 * j], xv[2 * j + 1]);
+            fma_bf16x2(acc1, q[j], xv[2 * j], xv[2 * j + 1]);
+        }
+        add.u64(a0, a0, 512);
+        add.u64(a1, a1, 512);
+        add.u64(xa, xa, 1024);
         add.u32(c, c, 256);
         bra(top);
         label(end);
+        warp_sum(acc0);
+        warp_sum(acc1);
+        // lane 0 stores the first row, lane 1 the second (if there is one)
+        let (st0, st1): (pred, pred);
+        let ya: u64;
+        mad.wide.u32(ya, r0, 4, y);
+        setp.eq.u32(st0, lane, 0);
+        if st0 {
+            st.global.f32([ya], acc0);
+        }
+        setp.lt.u32(past, r0, last);
+        setp.eq.and.u32(st1, lane, 1, past);
+        if st1 {
+            st.global.f32([ya + 4], acc1);
+        }
+    }
 
-        half_sum(acc);
-        let first: pred;
-        setp.eq.u32(first, hl, 0);
-        if first {
-            let o: u32;
-            let yat: u64;
-            mad.lo.u32(o, tok, y_stride, row);
-            mad.wide.u32(yat, o, 4, y);
-            st.global.f32([yat], acc);
+    /// gemv_bf16_body on token ctaid.y: x advances by k floats a token, y by `y_stride`.
+    #[reqntid(256)]
+    pub unsafe extern "ptx-kernel" fn gemv_bf16(w: *const u16, x: *const f32, y: *mut f32, rows: u32, k: u32, y_stride: u32) {
+        let (b, tk, o): (u32, u32, u32);
+        mov.u32(b, ctaid.x);
+        mov.u32(tk, ctaid.y);
+        let (xt, yt): (u64, u64);
+        mul.lo.u32(o, tk, k);
+        mad.wide.u32(xt, o, 4, x);
+        mul.lo.u32(o, tk, y_stride);
+        mad.wide.u32(yt, o, 4, y);
+        gemv_bf16_body(w, xt, yt, rows, k, b);
+    }
+
+    /// gemv_bf16_body of matrix ctaid.z, from tab[4 z ..]: w, x, y, rows. Blocks past a matrix's rows return at once:
+    /// the grid is sized for the largest.
+    #[reqntid(256)]
+    pub unsafe extern "ptx-kernel" fn gemv_bf16t(tab: *const u64, k: u32) {
+        let (z, b, zi, b16): (u32, u32, u32, u32);
+        mov.u32(z, ctaid.z);
+        mov.u32(b, ctaid.x);
+        let (ta, wz, xz, yz): (u64, u64, u64, u64);
+        let rows: u32;
+        shl.b32(zi, z, 2);
+        mad.wide.u32(ta, zi, 8, tab);
+        ld.global.u32(rows, [ta + 24]);
+        shl.b32(b16, b, 4);
+        let idle: pred;
+        setp.ge.u32(idle, b16, rows);
+        if idle {
+            ret();
+        }
+        ld.global.u64(wz, [ta]);
+        ld.global.u64(xz, [ta + 8]);
+        ld.global.u64(yz, [ta + 16]);
+        gemv_bf16_body(wz, xz, yz, rows, k, b);
+    }
+
+    /// y[t][r] = sum_c W[r][c] x[t][c] for a BF16 matrix W [rows][k] (row-major, as the checkpoint has it) and f32 x
+    /// [nt][k]; y[t] at t y_stride floats. A block takes 128 rows by 128 tokens, so that W is read once for 128 tokens,
+    /// and a thread 8 by 8 of them: rows 4 tr .. 4 tr + 4 and 64 + 4 tr .., tokens 4 tt .. and 64 + 4 tt .. (tid =
+    /// 16 tt + tr), each summed over c in order. c goes by 16: W's [128][16] and x's [128][16] wait in shared memory
+    /// as f32 turned to [16][128], in two buffers each, so that one fills while the other is read. Rows past `rows` and
+    /// tokens past `nt` read the last one and are not stored. k a multiple of 16.
+    #[reqntid(256)]
+    #[minnctapersm(2)]
+    pub unsafe extern "ptx-kernel" fn gemm_bf16(w: *const u16, x: *const f32, y: *mut f32, rows: u32, k: u32, nt: u32, y_stride: u32) {
+        let ash: shared<[f32; 4096], 16>;
+        let bsh: shared<[f32; 4096], 16>;
+        let (t, tr, tt, r0, t0): (u32, u32, u32, u32, u32);
+        mov.u32(t, tid.x);
+        and.b32(tr, t, 15);
+        shr.u32(tt, t, 4);
+        mov.u32(r0, ctaid.x);
+        shl.b32(r0, r0, 7);
+        mov.u32(t0, ctaid.y);
+        shl.b32(t0, t0, 7);
+        // the tiles' loads: thread t brings 8 columns (kh = 8 (t / 128) ..) of W's row t % 128 and of x's token t % 128
+        let (lr, kh, wr, xt, lim, o): (u32, u32, u32, u32, u32, u32);
+        and.b32(lr, t, 127);
+        shr.u32(kh, t, 7);
+        shl.b32(kh, kh, 3);
+        add.u32(wr, r0, lr);
+        sub.u32(lim, rows, 1);
+        min.u32(wr, wr, lim);
+        add.u32(xt, t0, lr);
+        sub.u32(lim, nt, 1);
+        min.u32(xt, xt, lim);
+        let (wa, xa): (u64, u64);
+        mad.lo.u32(o, wr, k, kh);
+        mad.wide.u32(wa, o, 2, w);
+        mad.lo.u32(o, xt, k, kh);
+        mad.wide.u32(xa, o, 4, x);
+        // column kh + j of that row goes to [kh + j][lr] of a buffer, at sto + 512 j; a warp's 32 rows to 32 banks
+        let (abase, bbase, sto, ard, brd): (u32, u32, u32, u32, u32);
+        mov.u32(abase, ash);
+        mov.u32(bbase, bsh);
+        mad.lo.u32(sto, kh, 128, lr);
+        shl.b32(sto, sto, 2);
+        // a thread reads [c][4 tr ..] and [c][64 + 4 tr ..] of W's buffer, [c][4 tt ..] and [c][64 + 4 tt ..] of x's
+        mad.lo.u32(ard, tr, 16, abase);
+        mad.lo.u32(brd, tt, 16, bbase);
+        let acc: [f32; 64];
+        for i in 0..64 {
+            mov.f32(acc[i], 0.0);
+        }
+        let wv: [u32; 4];
+        let xv: [f32; 8];
+        ld.global.nc.v4.u32((wv[0], wv[1], wv[2], wv[3]), [wa]);
+        ld.global.nc.v4.f32((xv[0], xv[1], xv[2], xv[3]), [xa]);
+        ld.global.nc.v4.f32((xv[4], xv[5], xv[6], xv[7]), [xa + 16]);
+        // buf: the byte offset of the buffers filled and read in this step, 0 or 8192. A step fills them, waits for
+        // the block, loads the next step's columns and reads them: a warp can fill a buffer only once every warp has
+        // passed the wait after the step that read it.
+        let (buf, k0, sa, sb, ar, br): (u32, u32, u32, u32, u32, u32);
+        mov.u32(buf, 0);
+        mov.u32(k0, 0);
+        label(top);
+        add.u32(sa, abase, buf);
+        add.u32(sa, sa, sto);
+        add.u32(sb, bbase, buf);
+        add.u32(sb, sb, sto);
+        for q in 0..4 {
+            let (lo, hi): (f32, f32);
+            bf16x2(lo, hi, wv[q]);
+            st.shared.f32([sa + (1024 * q)], lo);
+            st.shared.f32([sa + (1024 * q + 512)], hi);
+        }
+        for j in 0..8 {
+            st.shared.f32([sb + (512 * j)], xv[j]);
+        }
+        bar.sync(0);
+        let more: pred;
+        add.u32(k0, k0, 16);
+        setp.lt.u32(more, k0, k);
+        if more {
+            add.u64(wa, wa, 32);
+            add.u64(xa, xa, 64);
+            ld.global.nc.v4.u32((wv[0], wv[1], wv[2], wv[3]), [wa]);
+            ld.global.nc.v4.f32((xv[0], xv[1], xv[2], xv[3]), [xa]);
+            ld.global.nc.v4.f32((xv[4], xv[5], xv[6], xv[7]), [xa + 16]);
+        }
+        add.u32(ar, ard, buf);
+        add.u32(br, brd, buf);
+        for c in 0..16 {
+            let a: [f32; 8];
+            let b: [f32; 8];
+            ld.shared.v4.f32((a[0], a[1], a[2], a[3]), [ar + (512 * c)]);
+            ld.shared.v4.f32((a[4], a[5], a[6], a[7]), [ar + (512 * c + 256)]);
+            ld.shared.v4.f32((b[0], b[1], b[2], b[3]), [br + (512 * c)]);
+            ld.shared.v4.f32((b[4], b[5], b[6], b[7]), [br + (512 * c + 256)]);
+            for i in 0..8 {
+                for j in 0..8 {
+                    fma.rn.f32(acc[8 * i + j], a[i], b[j], acc[8 * i + j]);
+                }
+            }
+        }
+        xor.b32(buf, buf, 8192);
+        if more {
+            bra(top);
+        }
+        // y[t][r] for rows r0 + 4 tr + i % 4 + 64 (i / 4) and tokens t0 + 4 tt + j % 4 + 64 (j / 4)
+        let (rb, tb): (u32, u32);
+        mad.lo.u32(rb, tr, 4, r0);
+        mad.lo.u32(tb, tt, 4, t0);
+        for i in 0..8 {
+            let r: u32;
+            let rin: pred;
+            add.u32(r, rb, i % 4 + 64 * (i / 4));
+            setp.lt.u32(rin, r, rows);
+            for j in 0..8 {
+                let (tk, yo): (u32, u32);
+                let ya: u64;
+                let ok: pred;
+                add.u32(tk, tb, j % 4 + 64 * (j / 4));
+                setp.lt.and.u32(ok, tk, nt, rin);
+                mad.lo.u32(yo, tk, y_stride, r);
+                mad.wide.u32(ya, yo, 4, y);
+                if ok {
+                    st.global.f32([ya], acc[8 * i + j]);
+                }
+            }
         }
     }
 
     // ---------------------------------------------------------------- norms
 
-    /// y = x / rms(x) * w (without w where `HAS_W` is 0), over n floats; grid.x walks vectors.
+    /// y = x / rms(x) * w (w BF16; without w where `HAS_W` is 0), over n floats; grid.x walks vectors.
     #[maxntid(1024)]
     #[instances(0, 1)]
-    pub unsafe extern "ptx-kernel" fn rms_norm<const HAS_W: u32>(x: *const f32, w: *const f32, y: *mut f32, n: u32, eps: f32, xs: u32, ys: u32) {
+    pub unsafe extern "ptx-kernel" fn rms_norm<const HAS_W: u32>(x: *const f32, w: *const u16, y: *mut f32, n: u32, eps: f32, xs: u32, ys: u32) {
         let red: shared<[f32; 32], 16>;
         let (v, off, offy): (u32, u32, u32);
         mov.u32(v, ctaid.x);
@@ -294,8 +478,8 @@ pub mod gpu {
         if HAS_W == 1 {
             let wat: u64;
             let wv: f32;
-            mad.wide.u32(wat, i, 4, w);
-            ld.global.nc.f32(wv, [wat]);
+            mad.wide.u32(wat, i, 2, w);
+            ld_bf16(wv, wat);
             mul.rn.f32(g, g, wv);
         }
         mad.wide.u32(yat, i, 4, yv);
@@ -312,7 +496,7 @@ pub mod gpu {
     #[maxntid(256)]
     #[instances(0, 1)]
     pub unsafe extern "ptx-kernel" fn clip_rows<const HAS_S: u32>(
-        x: *const f32, s: *const f32, y: *mut f32, d: u32, rows: u32, s_rows: u32, thr: f32, eps: f32, post: *const f32,
+        x: *const f32, s: *const u16, y: *mut f32, d: u32, rows: u32, s_rows: u32, thr: f32, eps: f32, post: *const f32,
         rpt: u32, x_tstride: u32, y_tstride: u32,
     ) {
         let (lane, row): (u32, u32);
@@ -375,7 +559,7 @@ pub mod gpu {
         }
     }
 
-    /// `v = x[xoff + idx] * s[soff + idx]`, or `x[xoff + idx]` alone where `HAS_S` is 0.
+    /// `v = x[xoff + idx] * s[soff + idx]` (s BF16), or `x[xoff + idx]` alone where `HAS_S` is 0.
     fn load_scaled<const HAS_S: u32>(v: f32, x: u64, s: u64, xoff: u32, soff: u32, idx: u32) {
         let i: u32;
         let at: u64;
@@ -387,194 +571,22 @@ pub mod gpu {
             let sat: u64;
             let w: f32;
             add.u32(j, soff, idx);
-            mad.wide.u32(sat, j, 4, s);
-            ld.global.nc.f32(w, [sat]);
+            mad.wide.u32(sat, j, 2, s);
+            ld_bf16(w, sat);
             mul.rn.f32(v, v, w);
         }
-    }
-
-    // ---------------------------------------------------------------- depth mixing
-
-    /// Attention over depth: the states are `ptrs[0..ns]` (n floats each), each RMS-normalized; query `q` of `qs[blockIdx.x]`
-    /// scores them by `dot/sqrt(n)`, and `out[blockIdx.x]` is the softmax-weighted sum of the normalized states.
-    #[maxntid(1024)]
-    pub unsafe extern "ptx-kernel" fn mix(ptrs: *const u64, ns: u32, qs: *const f32, out: *mut f32, n: u32) {
-        let (tk, nq, tko): (u32, u32, u32);
-        mov.u32(tk, ctaid.y);
-        mov.u32(nq, nctaid.x);
-        mul.lo.u32(tko, tk, n);
-        let red: shared<[f32; 32], 16>;
-        let sc: shared<[f32; 32], 16>;
-        let r: u32;
-        mov.u32(r, red);
-        let (qi, qoff): (u32, u32);
-        mov.u32(qi, ctaid.x);
-        mul.lo.u32(qoff, qi, n);
-        let (qv, ov, ooff): (u64, u64, u32);
-        mad.wide.u32(qv, qoff, 4, qs);
-        mad.lo.u32(ooff, tk, nq, qi);
-        mul.lo.u32(ooff, ooff, n);
-        mad.wide.u32(ov, ooff, 4, out);
-        let (t, nt): (u32, u32);
-        mov.u32(t, tid.x);
-        mov.u32(nt, ntid.x);
-        let (nf, inv_sqrt_n): (f32, f32);
-        cvt.rn.f32.u32(nf, n);
-        sqrt.rn.f32(inv_sqrt_n, nf);
-        rcp.rn.f32(inv_sqrt_n, inv_sqrt_n);
-
-        // per state: rms scale and score, kept in shared memory: sc[2j] = 1/rms, sc[2j+1] = score
-        let j: u32;
-        mov.u32(j, 0);
-        label(st_top);
-        let st_done: pred;
-        setp.ge.u32(st_done, j, ns);
-        if st_done {
-            bra(st_end);
-        }
-        let (pat, sv): (u64, u64);
-        mad.wide.u32(pat, j, 8, ptrs);
-        ld.global.u64(sv, [pat]);
-        mad.wide.u32(sv, tko, 4, sv);
-        let (ss, dq): (f32, f32);
-        mov.f32(ss, 0.0);
-        mov.f32(dq, 0.0);
-        let i: u32;
-        mov.u32(i, t);
-        label(el_top);
-        let el_done: pred;
-        setp.ge.u32(el_done, i, n);
-        if el_done {
-            bra(el_end);
-        }
-        let (a, b): (u64, u64);
-        let (xv, qv2): (f32, f32);
-        mad.wide.u32(a, i, 4, sv);
-        ld.global.f32(xv, [a]);
-        mad.wide.u32(b, i, 4, qv);
-        ld.global.nc.f32(qv2, [b]);
-        fma.rn.f32(ss, xv, xv, ss);
-        fma.rn.f32(dq, xv, qv2, dq);
-        add.u32(i, i, nt);
-        bra(el_top);
-        label(el_end);
-        block_sum(ss, r);
-        block_sum(dq, r);
-        let (rs, score): (f32, f32);
-        div.rn.f32(rs, ss, nf);
-        add.rn.f32(rs, rs, 0.000_001);
-        sqrt.rn.f32(rs, rs);
-        rcp.rn.f32(rs, rs);
-        mul.rn.f32(score, dq, rs);
-        mul.rn.f32(score, score, inv_sqrt_n);
-        let first: pred;
-        setp.eq.u32(first, t, 0);
-        if first {
-            let (base, at): (u32, u32);
-            mov.u32(base, sc);
-            mad.lo.u32(at, j, 8, base);
-            st.shared.f32([at], rs);
-            st.shared.f32([at + 4], score);
-        }
-        add.u32(j, j, 1);
-        bra(st_top);
-        label(st_end);
-        bar.sync(0);
-
-        // softmax over the states, in every thread
-        let (m, l): (f32, f32);
-        mov.f32(m, -3.0e38);
-        let sbase: u32;
-        mov.u32(sbase, sc);
-        mov.u32(j, 0);
-        label(mx_top);
-        let mx_done: pred;
-        setp.ge.u32(mx_done, j, ns);
-        if mx_done {
-            bra(mx_end);
-        }
-        let at3: u32;
-        let s3: f32;
-        mad.lo.u32(at3, j, 8, sbase);
-        ld.shared.f32(s3, [at3 + 4]);
-        max.f32(m, m, s3);
-        add.u32(j, j, 1);
-        bra(mx_top);
-        label(mx_end);
-        mov.f32(l, 0.0);
-        mov.u32(j, 0);
-        label(sm_top);
-        let sm_done: pred;
-        setp.ge.u32(sm_done, j, ns);
-        if sm_done {
-            bra(sm_end);
-        }
-        let at4: u32;
-        let (s4, e4): (f32, f32);
-        mad.lo.u32(at4, j, 8, sbase);
-        ld.shared.f32(s4, [at4 + 4]);
-        sub.rn.f32(s4, s4, m);
-        exp(e4, s4);
-        add.rn.f32(l, l, e4);
-        add.u32(j, j, 1);
-        bra(sm_top);
-        label(sm_end);
-        let il: f32;
-        rcp.rn.f32(il, l);
-
-        // out = sum_j p_j * x_j / rms_j
-        mov.u32(i, t);
-        label(o_top);
-        let o_done: pred;
-        setp.ge.u32(o_done, i, n);
-        if o_done {
-            bra(o_end);
-        }
-        let acc: f32;
-        mov.f32(acc, 0.0);
-        mov.u32(j, 0);
-        label(w_top);
-        let w_done: pred;
-        setp.ge.u32(w_done, j, ns);
-        if w_done {
-            bra(w_end);
-        }
-        let at5: u32;
-        let (r5, s5, p5, x5): (f32, f32, f32, f32);
-        let (pat5, sv5, xa5): (u64, u64, u64);
-        mad.lo.u32(at5, j, 8, sbase);
-        ld.shared.f32(r5, [at5]);
-        ld.shared.f32(s5, [at5 + 4]);
-        sub.rn.f32(s5, s5, m);
-        exp(p5, s5);
-        mul.rn.f32(p5, p5, il);
-        mul.rn.f32(p5, p5, r5);
-        mad.wide.u32(pat5, j, 8, ptrs);
-        ld.global.u64(sv5, [pat5]);
-        mad.wide.u32(sv5, tko, 4, sv5);
-        mad.wide.u32(xa5, i, 4, sv5);
-        ld.global.f32(x5, [xa5]);
-        fma.rn.f32(acc, p5, x5, acc);
-        add.u32(j, j, 1);
-        bra(w_top);
-        label(w_end);
-        let oat: u64;
-        mad.wide.u32(oat, i, 4, ov);
-        st.global.f32([oat], acc);
-        add.u32(i, i, nt);
-        bra(o_top);
-        label(o_end);
     }
 
     // ---------------------------------------------------------------- short convolution
 
     /// Causal short convolution of 4 taps with a residual, for one token: per channel c,
-    /// `y = (x + sum_k w[c][k] * h[k] + dyn) * scale` where h = (state[c][0..3], x), then state[c] = (h[1], h[2], x).
+    /// `y = (x + sum_k w[c][k] * h[k] + dyn) * scale` where h = (state[c][0..3], x), then state[c] = (h[1], h[2], x);
+    /// w the checkpoint's BF16 weight (see conv_w: `[c][4]`, or `[lag][c]` where DYN).
     /// With `DYN`, `dyn = sum_lag h[3 - lag] * taps[head(c)][lag]`, head(c) = c / (c_total / n_heads).
     #[maxntid(256)]
     #[instances(0, 1)]
     pub unsafe extern "ptx-kernel" fn conv4<const DYN: u32>(
-        x: *const f32, w: *const f32, state: *mut f32, taps: *const f32, y: *mut f32, c_total: u32, head_dim: u32, scale: f32,
+        x: *const f32, w: *const u16, state: *mut f32, taps: *const f32, y: *mut f32, c_total: u32, head_dim: u32, scale: f32,
     ) {
         let (b, nt, t, c): (u32, u32, u32, u32);
         mov.u32(b, ctaid.x);
@@ -586,12 +598,9 @@ pub mod gpu {
         if past {
             ret();
         }
-        let (xa, wa, sa): (u64, u64, u64);
-        let c4: u32;
+        let (xa, sa): (u64, u64);
         let c3: u32;
         mad.wide.u32(xa, c, 4, x);
-        shl.b32(c4, c, 2);
-        mad.wide.u32(wa, c4, 4, w);
         mul.lo.u32(c3, c, 3);
         mad.wide.u32(sa, c3, 4, state);
         let (xv, h0, h1, h2): (f32, f32, f32, f32);
@@ -600,7 +609,7 @@ pub mod gpu {
         ld.global.f32(h1, [sa + 4]);
         ld.global.f32(h2, [sa + 8]);
         let (w0, w1, w2, w3): (f32, f32, f32, f32);
-        ld.global.nc.v4.f32((w0, w1, w2, w3), [wa]);
+        conv_w::<DYN>(w0, w1, w2, w3, w, c, c_total);
         let o: f32;
         mul.rn.f32(o, w0, h0);
         fma.rn.f32(o, w1, h1, o);
@@ -633,10 +642,9 @@ pub mod gpu {
 
     // ---------------------------------------------------------------- loop control
 
-    /// The input of a controller's down projection: `g = (rms(cur), rms(msg))`, 2n floats.
+    /// The input of a controller's down projection: `g = (rms(cur), rms(msg))`, 2n floats; token ctaid.y.
     #[maxntid(1024)]
     pub unsafe extern "ptx-kernel" fn ctrl_in(cur: *const f32, msg: *const f32, g: *mut f32, n: u32) {
-        let red: shared<[f32; 32], 16>;
         let (tk, to, to2): (u32, u32, u32);
         let (curt, msgt, gt): (u64, u64, u64);
         mov.u32(tk, ctaid.y);
@@ -645,6 +653,27 @@ pub mod gpu {
         mad.wide.u32(curt, to, 4, cur);
         mad.wide.u32(msgt, to, 4, msg);
         mad.wide.u32(gt, to2, 4, g);
+        ctrl_in_f32(curt, msgt, gt, n);
+    }
+
+    /// ctrl_in of controller ctaid.z (one token): cur and msg at tab[2 z], tab[2 z + 1]; g at g + 2 n z.
+    #[maxntid(1024)]
+    pub unsafe extern "ptx-kernel" fn ctrl_in_z(tab: *const u64, g: *mut f32, n: u32) {
+        let (z, zi, go): (u32, u32, u32);
+        mov.u32(z, ctaid.z);
+        let (ta, cz, mz, gz): (u64, u64, u64, u64);
+        shl.b32(zi, z, 1);
+        mad.wide.u32(ta, zi, 8, tab);
+        ld.global.u64(cz, [ta]);
+        ld.global.u64(mz, [ta + 8]);
+        mul.lo.u32(go, zi, n);
+        mad.wide.u32(gz, go, 4, g);
+        ctrl_in_f32(cz, mz, gz, n);
+    }
+
+    /// g[0..n] = cur / rms(cur), g[n..2n] = msg / rms(msg).
+    fn ctrl_in_f32(curt: u64, msgt: u64, gt: u64, n: u32) {
+        let red: shared<[f32; 32], 16>;
         let r: u32;
         mov.u32(r, red);
         let (t, nt): (u32, u32);
@@ -708,9 +737,9 @@ pub mod gpu {
     }
 
     /// The controller's output: `y = cur - tanh(F gate) * cur + tanh(G gate) * msg`, per channel, where G and F are
-    /// repacked Q8_0 [n][64] (`gq`/`gd`, `fq`/`fd`) and gate is 64 floats.
+    /// the checkpoint's BF16 gain and forget projections [n][64] and gate is 64 floats.
     /// The body of ctrl_out, for token tk.
-    fn ctrl_out_body(cur: u64, msg: u64, gate: u64, gq: u64, gd: u64, fq: u64, fd: u64, y: u64, n: u32, tk: u32) {
+    fn ctrl_out_body(cur: u64, msg: u64, gate: u64, gw: u64, fw: u64, y: u64, n: u32, tk: u32) {
         let gs: shared<[f32; 64], 16>;
         let base: u32;
         mov.u32(base, gs);
@@ -733,8 +762,8 @@ pub mod gpu {
             ret();
         }
         let (gain, forget): (f32, f32);
-        q8_row64(gain, gq, gd, c, base);
-        q8_row64(forget, fq, fd, c, base);
+        bf16_row64(gain, gw, c, base);
+        bf16_row64(forget, fw, c, base);
         tanh(gain, gain);
         tanh(forget, forget);
         let (ca, ma, ya): (u64, u64, u64);
@@ -754,91 +783,49 @@ pub mod gpu {
 
     #[maxntid(256)]
     pub unsafe extern "ptx-kernel" fn ctrl_out(
-        cur: *const f32, msg: *const f32, gate: *const f32, gq: *const u8, gd: *const u16, fq: *const u8, fd: *const u16, y: *mut f32, n: u32,
+        cur: *const f32, msg: *const f32, gate: *const f32, gw: *const u16, fw: *const u16, y: *mut f32, n: u32,
     ) {
         let tk: u32;
         mov.u32(tk, ctaid.y);
-        ctrl_out_body(cur, msg, gate, gq, gd, fq, fd, y, n, tk);
+        ctrl_out_body(cur, msg, gate, gw, fw, y, n, tk);
     }
 
-    /// gemv_q8d of matrix ctaid.z, everything from tab[6 z ..]: qs, d, xq, xd, y, rows. Blocks past a matrix's rows return
-    /// before they stage x: the grid is sized for the largest.
-    #[reqntid(256)]
-    pub unsafe extern "ptx-kernel" fn gemv_q8dt(tab: *const u64, k: u32) {
-        let (z, b, zi, b16): (u32, u32, u32, u32);
-        mov.u32(z, ctaid.z);
-        mov.u32(b, ctaid.x);
-        let (ta, qz, dz, xqz, xdz, yz): (u64, u64, u64, u64, u64, u64);
-        let rows: u32;
-        mul.lo.u32(zi, z, 6);
-        mad.wide.u32(ta, zi, 8, tab);
-        ld.global.u32(rows, [ta + 40]);
-        shl.b32(b16, b, 4);
-        let idle: pred;
-        setp.ge.u32(idle, b16, rows);
-        if idle {
-            ret();
-        }
-        ld.global.u64(qz, [ta]);
-        ld.global.u64(dz, [ta + 8]);
-        ld.global.u64(xqz, [ta + 16]);
-        ld.global.u64(xdz, [ta + 24]);
-        ld.global.u64(yz, [ta + 32]);
-        gemv_q8d_body(qz, dz, xqz, xdz, yz, rows, k, b);
-    }
-
-    /// ctrl_out of controller ctaid.z (one token): cur, msg, gq, gd, fq, fd, y at tab[7 z ..]; its gate at gate + 64 z.
+    /// ctrl_out of controller ctaid.z (one token): cur, msg, gw, fw, y at tab[5 z ..]; its gate at gate + 64 z.
     #[reqntid(256)]
     pub unsafe extern "ptx-kernel" fn ctrl_outz(tab: *const u64, gate: *const f32, n: u32) {
         let (z, zi, tk): (u32, u32, u32);
         mov.u32(z, ctaid.z);
         mov.u32(tk, 0);
-        let (ta, cz, mz, gqz, gdz, fqz, fdz, yz, gz): (u64, u64, u64, u64, u64, u64, u64, u64, u64);
-        mul.lo.u32(zi, z, 7);
+        let (ta, cz, mz, gwz, fwz, yz, gz): (u64, u64, u64, u64, u64, u64, u64);
+        mul.lo.u32(zi, z, 5);
         mad.wide.u32(ta, zi, 8, tab);
         ld.global.u64(cz, [ta]);
         ld.global.u64(mz, [ta + 8]);
-        ld.global.u64(gqz, [ta + 16]);
-        ld.global.u64(gdz, [ta + 24]);
-        ld.global.u64(fqz, [ta + 32]);
-        ld.global.u64(fdz, [ta + 40]);
-        ld.global.u64(yz, [ta + 48]);
+        ld.global.u64(gwz, [ta + 16]);
+        ld.global.u64(fwz, [ta + 24]);
+        ld.global.u64(yz, [ta + 32]);
         shl.b32(zi, z, 6);
         mad.wide.u32(gz, zi, 4, gate);
-        ctrl_out_body(cz, mz, gz, gqz, gdz, fqz, fdz, yz, n, tk);
+        ctrl_out_body(cz, mz, gz, gwz, fwz, yz, n, tk);
     }
 
-    /// v = row `r` of a repacked Q8_0 [*][64] matrix times the 64 floats at shared `xs`.
-    fn q8_row64(v: f32, qs: u64, d: u64, r: u32, xs: u32) {
+    /// v = row `r` of a BF16 [*][64] matrix times the 64 floats at shared `xs`.
+    fn bf16_row64(v: f32, w: u64, r: u32, xs: u32) {
         mov.f32(v, 0.0);
-        let (qa, da): (u64, u64);
+        let wa: u64;
         let r64: u32;
-        let r2: u32;
         shl.b32(r64, r, 6);
-        mad.wide.u32(qa, r64, 1, qs);
-        shl.b32(r2, r, 1);
-        mad.wide.u32(da, r2, 2, d);
-        for blk in 0..2 {
-            let s: f32;
-            mov.f32(s, 0.0);
-            for q4 in 0..2 {
-                let (w0, w1, w2, w3): (u32, u32, u32, u32);
-                ld.global.nc.v4.u32((w0, w1, w2, w3), [qa + (blk * 32 + q4 * 16)]);
-                let (x0, x1, x2, x3): (f32, f32, f32, f32);
-                ld.shared.v4.f32((x0, x1, x2, x3), [xs + ((blk * 32 + q4 * 16) * 4)]);
-                fma_s8x4(s, w0, x0, x1, x2, x3);
-                ld.shared.v4.f32((x0, x1, x2, x3), [xs + ((blk * 32 + q4 * 16) * 4 + 16)]);
-                fma_s8x4(s, w1, x0, x1, x2, x3);
-                ld.shared.v4.f32((x0, x1, x2, x3), [xs + ((blk * 32 + q4 * 16) * 4 + 32)]);
-                fma_s8x4(s, w2, x0, x1, x2, x3);
-                ld.shared.v4.f32((x0, x1, x2, x3), [xs + ((blk * 32 + q4 * 16) * 4 + 48)]);
-                fma_s8x4(s, w3, x0, x1, x2, x3);
-            }
-            let h: f16;
-            let sc: f32;
-            ld.global.nc.b16(h, [da + (blk * 2)]);
-            cvt.f32.f16(sc, h);
-            fma.rn.f32(v, s, sc, v);
+        mad.wide.u32(wa, r64, 2, w);
+        for q in 0..8 {
+            let (p0, p1, p2, p3): (u32, u32, u32, u32);
+            ld.global.nc.v4.u32((p0, p1, p2, p3), [wa + (q * 16)]);
+            let (x0, x1, x2, x3): (f32, f32, f32, f32);
+            ld.shared.v4.f32((x0, x1, x2, x3), [xs + (q * 32)]);
+            fma_bf16x2(v, p0, x0, x1);
+            fma_bf16x2(v, p1, x2, x3);
+            ld.shared.v4.f32((x0, x1, x2, x3), [xs + (q * 32 + 16)]);
+            fma_bf16x2(v, p2, x0, x1);
+            fma_bf16x2(v, p3, x2, x3);
         }
     }
 
@@ -992,296 +979,6 @@ pub mod gpu {
         }
     }
 
-    // ---------------------------------------------------------------- attention
-
-    /// Stores the K and V of one token (`nkv` floats each) as f16 at cache row `slot`, which is `pos % ring` for a ring
-    /// buffer and `pos` where `ring` is 0; pos is `params[0]`.
-    #[maxntid(256)]
-    pub unsafe extern "ptx-kernel" fn kv_store(k: *const f32, v: *const f32, kc: *mut u16, vc: *mut u16, params: *const u32, ring: u32, nkv: u32) {
-        let (b, nt, t, c): (u32, u32, u32, u32);
-        mov.u32(b, ctaid.x);
-        mov.u32(nt, ntid.x);
-        mov.u32(t, tid.x);
-        mad.lo.u32(c, b, nt, t);
-        let past: pred;
-        setp.ge.u32(past, c, nkv);
-        if past {
-            ret();
-        }
-        let (pos, slot): (u32, u32);
-        ld.global.u32(pos, [params]);
-        mov.u32(slot, pos);
-        let is_ring: pred;
-        setp.ne.u32(is_ring, ring, 0);
-        if is_ring {
-            rem.u32(slot, pos, ring);
-        }
-        let (ka, va, kca, vca): (u64, u64, u64, u64);
-        let (kv, vv): (f32, f32);
-        let (kh, vh): (f16, f16);
-        let o: u32;
-        mad.wide.u32(ka, c, 4, k);
-        mad.wide.u32(va, c, 4, v);
-        ld.global.f32(kv, [ka]);
-        ld.global.f32(vv, [va]);
-        cvt.rn.f16.f32(kh, kv);
-        cvt.rn.f16.f32(vh, vv);
-        mad.lo.u32(o, slot, nkv, c);
-        mad.wide.u32(kca, o, 2, kc);
-        mad.wide.u32(vca, o, 2, vc);
-        st.global.b16([kca], kh);
-        st.global.b16([vca], vh);
-    }
-
-    /// Decode attention of one token, a block per query head (128 dims), 8 kv heads, `group` query heads per kv head.
-    /// score_j = scale * q.k_j + rb[min(d_j, extent)] . r - sink, d_j = pos - pos_j; the pad row (d >= extent) is zero.
-    /// The softmax has an extra zero logit (the sink, already subtracted from the scores). pos is `params[0]`.
-    /// The cache holds pos_j = j (`ring` 0), or a ring of `ring` rows where row s holds the last position = s mod ring.
-    #[reqntid(256)]
-    pub unsafe extern "ptx-kernel" fn attn_decode(
-        q: *const f32, r: *const f32, sink: *const f32, rb: *const f32, kc: *const u16, vc: *const u16, out: *mut f32,
-        params: *const u32, ring: u32, extent: u32, group: u32, scale: f32,
-    ) {
-        let ms: shared<[f32; 8], 16>;
-        let ls: shared<[f32; 8], 16>;
-        let accs: shared<[f32; 1024], 16>;
-        let (h, t, lane, w, kvh): (u32, u32, u32, u32, u32);
-        mov.u32(h, ctaid.x);
-        mov.u32(t, tid.x);
-        and.b32(lane, t, 31);
-        shr.u32(w, t, 5);
-        div.u32(kvh, h, group);
-
-        // q: 4 dims per lane; r: one dim per lane below 16
-        let (qo, qa): (u32, u64);
-        mad.lo.u32(qo, h, 128, 0);
-        shl.b32(qo, h, 7);
-        let l4: u32;
-        shl.b32(l4, lane, 2);
-        add.u32(qo, qo, l4);
-        mad.wide.u32(qa, qo, 4, q);
-        let (q0, q1, q2, q3): (f32, f32, f32, f32);
-        ld.global.v4.f32((q0, q1, q2, q3), [qa]);
-        mul.rn.f32(q0, q0, scale);
-        mul.rn.f32(q1, q1, scale);
-        mul.rn.f32(q2, q2, scale);
-        mul.rn.f32(q3, q3, scale);
-        let rv: f32;
-        mov.f32(rv, 0.0);
-        let rl: pred;
-        setp.lt.u32(rl, lane, 16);
-        let (ro, ra): (u32, u64);
-        shl.b32(ro, h, 4);
-        add.u32(ro, ro, lane);
-        mad.wide.u32(ra, ro, 4, r);
-        if rl {
-            ld.global.f32(rv, [ra]);
-        }
-        let (sk, sa): (f32, u64);
-        mad.wide.u32(sa, h, 4, sink);
-        ld.global.f32(sk, [sa]);
-
-        let (pos, nk): (u32, u32);
-        ld.global.u32(pos, [params]);
-        add.u32(nk, pos, 1);
-        let is_ring: pred;
-        setp.ne.u32(is_ring, ring, 0);
-        if is_ring {
-            min.u32(nk, nk, ring);
-        }
-        let pmod: u32;
-        mov.u32(pmod, pos);
-        if is_ring {
-            rem.u32(pmod, pos, ring);
-        }
-
-        let (m, l, a0, a1, a2, a3): (f32, f32, f32, f32, f32, f32);
-        mov.f32(m, -3.0e38);
-        mov.f32(l, 0.0);
-        mov.f32(a0, 0.0);
-        mov.f32(a1, 0.0);
-        mov.f32(a2, 0.0);
-        mov.f32(a3, 0.0);
-        let kvo: u32;
-        shl.b32(kvo, kvh, 7);
-        add.u32(kvo, kvo, l4);
-
-        let j: u32;
-        mov.u32(j, w);
-        label(top);
-        let done: pred;
-        setp.ge.u32(done, j, nk);
-        if done {
-            bra(end);
-        }
-        // distance of row j
-        let dist: u32;
-        sub.u32(dist, pos, j);
-        if is_ring {
-            add.u32(dist, pmod, ring);
-            sub.u32(dist, dist, j);
-            rem.u32(dist, dist, ring);
-        }
-        let (ko, ka, va): (u32, u64, u64);
-        mad.lo.u32(ko, j, 1024, kvo);
-        mad.wide.u32(ka, ko, 2, kc);
-        mad.wide.u32(va, ko, 2, vc);
-        let (k0, k1, k2, k3): (f16, f16, f16, f16);
-        ld.global.v4.b16((k0, k1, k2, k3), [ka]);
-        let (kf0, kf1, kf2, kf3): (f32, f32, f32, f32);
-        cvt.f32.f16(kf0, k0);
-        cvt.f32.f16(kf1, k1);
-        cvt.f32.f16(kf2, k2);
-        cvt.f32.f16(kf3, k3);
-        let s: f32;
-        mul.rn.f32(s, q0, kf0);
-        fma.rn.f32(s, q1, kf1, s);
-        fma.rn.f32(s, q2, kf2, s);
-        fma.rn.f32(s, q3, kf3, s);
-        // relative bias: lanes below 16 add rb[d][lane] * r[lane]
-        let inb: pred;
-        setp.lt.u32(inb, dist, extent);
-        let (bo, ba): (u32, u64);
-        let bv: f32;
-        mad.lo.u32(bo, dist, 16, lane);
-        mad.wide.u32(ba, bo, 4, rb);
-        and.pred(inb, inb, rl);
-        if inb {
-            ld.global.nc.f32(bv, [ba]);
-            fma.rn.f32(s, bv, rv, s);
-        }
-        warp_sum(s);
-        sub.rn.f32(s, s, sk);
-        // online softmax
-        let (mn, alpha, p): (f32, f32, f32);
-        max.f32(mn, m, s);
-        sub.rn.f32(alpha, m, mn);
-        exp(alpha, alpha);
-        sub.rn.f32(p, s, mn);
-        exp(p, p);
-        fma.rn.f32(l, l, alpha, p);
-        mov.f32(m, mn);
-        let (v0, v1, v2, v3): (f16, f16, f16, f16);
-        ld.global.v4.b16((v0, v1, v2, v3), [va]);
-        let (vf0, vf1, vf2, vf3): (f32, f32, f32, f32);
-        cvt.f32.f16(vf0, v0);
-        cvt.f32.f16(vf1, v1);
-        cvt.f32.f16(vf2, v2);
-        cvt.f32.f16(vf3, v3);
-        mul.rn.f32(a0, a0, alpha);
-        fma.rn.f32(a0, p, vf0, a0);
-        mul.rn.f32(a1, a1, alpha);
-        fma.rn.f32(a1, p, vf1, a1);
-        mul.rn.f32(a2, a2, alpha);
-        fma.rn.f32(a2, p, vf2, a2);
-        mul.rn.f32(a3, a3, alpha);
-        fma.rn.f32(a3, p, vf3, a3);
-        add.u32(j, j, 8);
-        bra(top);
-        label(end);
-
-        // combine the 8 warps and the zero sink logit
-        let (mb, lb, ab): (u32, u32, u32);
-        mov.u32(mb, ms);
-        mov.u32(lb, ls);
-        mov.u32(ab, accs);
-        let first: pred;
-        setp.eq.u32(first, lane, 0);
-        let wa: u32;
-        mad.lo.u32(wa, w, 4, mb);
-        if first {
-            st.shared.f32([wa], m);
-        }
-        mad.lo.u32(wa, w, 4, lb);
-        if first {
-            st.shared.f32([wa], l);
-        }
-        let aa: u32;
-        mad.lo.u32(aa, w, 128, lane);
-        shl.b32(aa, aa, 2);
-        add.u32(aa, aa, ab);
-        // lane holds dims 4*lane..4*lane+3 of warp w: accs[w][4*lane..]
-        mad.lo.u32(aa, w, 512, ab);
-        mad.lo.u32(aa, lane, 16, aa);
-        st.shared.v4.f32([aa], (a0, a1, a2, a3));
-        bar.sync(0);
-        let dimth: pred;
-        setp.lt.u32(dimth, t, 128);
-        if !dimth {
-            ret();
-        }
-        let mm: f32;
-        mov.f32(mm, 0.0);
-        for k in 0..8 {
-            let mk: f32;
-            ld.shared.f32(mk, [mb + (k * 4)]);
-            max.f32(mm, mm, mk);
-        }
-        let (ll, acc): (f32, f32);
-        sub.rn.f32(ll, 0.0, mm);
-        exp(ll, ll);
-        mov.f32(acc, 0.0);
-        for k in 0..8 {
-            let (mk, lk, ak, ek): (f32, f32, f32, f32);
-            ld.shared.f32(mk, [mb + (k * 4)]);
-            ld.shared.f32(lk, [lb + (k * 4)]);
-            sub.rn.f32(ek, mk, mm);
-            exp(ek, ek);
-            fma.rn.f32(ll, lk, ek, ll);
-            let ao: u32;
-            mad.lo.u32(ao, t, 4, ab);
-            ld.shared.f32(ak, [ao + (k * 512)]);
-            fma.rn.f32(acc, ak, ek, acc);
-        }
-        div.rn.f32(acc, acc, ll);
-        let (oo, oa): (u32, u64);
-        shl.b32(oo, h, 7);
-        add.u32(oo, oo, t);
-        mad.wide.u32(oa, oo, 4, out);
-        st.global.f32([oa], acc);
-    }
-
-    // ---------------------------------------------------------------- MoE experts on the GPU
-
-    /// out[c] = sum_k wts[k] * (slots[k] >= 0 ? gpu[k][c] : cpu[k][c]); `cpu` may be host-mapped memory.
-    #[maxntid(256)]
-    pub unsafe extern "ptx-kernel" fn moe_combine(gpu: *const f32, cpu: *const f32, slots: *const i32, wts: *const f32, out: *mut f32, n: u32) {
-        let (b, nt, t, c): (u32, u32, u32, u32);
-        mov.u32(b, ctaid.x);
-        mov.u32(nt, ntid.x);
-        mov.u32(t, tid.x);
-        mad.lo.u32(c, b, nt, t);
-        let past: pred;
-        setp.ge.u32(past, c, n);
-        if past {
-            ret();
-        }
-        let acc: f32;
-        mov.f32(acc, 0.0);
-        for k in 0..8 {
-            let s: s32;
-            let wv: f32;
-            ld.global.s32(s, [slots + (k * 4)]);
-            ld.global.f32(wv, [wts + (k * 4)]);
-            let on_gpu: pred;
-            setp.ge.s32(on_gpu, s, 0);
-            let (o, ga, ca): (u32, u64, u64);
-            let v: f32;
-            mad.lo.u32(o, n, k, c);
-            mad.wide.u32(ga, o, 4, gpu);
-            mad.wide.u32(ca, o, 4, cpu);
-            if on_gpu {
-                ld.global.f32(v, [ga]);
-            } else {
-                ld.volatile.global.f32(v, [ca]);
-            }
-            fma.rn.f32(acc, wv, v, acc);
-        }
-        let oa: u64;
-        mad.wide.u32(oa, c, 4, out);
-        st.global.f32([oa], acc);
-    }
-
     // ---------------------------------------------------------------- elementwise
 
     /// y = a + b over n floats.
@@ -1306,6 +1003,81 @@ pub mod gpu {
         ld.global.f32(bv, [ba]);
         add.rn.f32(av, av, bv);
         st.global.f32([ya], av);
+    }
+
+    /// Row i of dst = row sidx[i] of src, rows of n floats (a multiple of 4), for the rows i of grid.y. A thread per 4
+    /// floats.
+    #[maxntid(128)]
+    pub unsafe extern "ptx-kernel" fn gather_rows(src: *const f32, sidx: *const u32, dst: *mut f32, n: u32) {
+        let (bk, nt, t, c, i): (u32, u32, u32, u32, u32);
+        mov.u32(bk, ctaid.x);
+        mov.u32(nt, ntid.x);
+        mov.u32(t, tid.x);
+        mov.u32(i, ctaid.y);
+        mad.lo.u32(c, bk, nt, t);
+        shl.b32(c, c, 2);
+        let past: pred;
+        setp.ge.u32(past, c, n);
+        if past {
+            ret();
+        }
+        let si: u32;
+        let ia: u64;
+        mad.wide.u32(ia, i, 4, sidx);
+        ld.global.u32(si, [ia]);
+        let (so, dof): (u32, u32);
+        mad.lo.u32(so, si, n, c);
+        mad.lo.u32(dof, i, n, c);
+        let (sa, da): (u64, u64);
+        mad.wide.u32(sa, so, 4, src);
+        mad.wide.u32(da, dof, 4, dst);
+        let (v0, v1, v2, v3): (f32, f32, f32, f32);
+        ld.global.v4.f32((v0, v1, v2, v3), [sa]);
+        st.global.v4.f32([da], (v0, v1, v2, v3));
+    }
+
+    /// Row didx[i] of dst += wts[widx[i]] * row i of src, rows of n floats (a multiple of 4), for the rows i of grid.y:
+    /// the expert stream adds an expert's outputs to its tokens' rows, each weighted by its pair. The rows didx[i] of a
+    /// launch are distinct (an expert has a token once). A thread per 4 floats.
+    #[maxntid(128)]
+    pub unsafe extern "ptx-kernel" fn add_rows_w(src: *const f32, dst: *mut f32, didx: *const u32, wts: *const f32, widx: *const u32, n: u32) {
+        let (bk, nt, t, c, i): (u32, u32, u32, u32, u32);
+        mov.u32(bk, ctaid.x);
+        mov.u32(nt, ntid.x);
+        mov.u32(t, tid.x);
+        mov.u32(i, ctaid.y);
+        mad.lo.u32(c, bk, nt, t);
+        shl.b32(c, c, 2);
+        let past: pred;
+        setp.ge.u32(past, c, n);
+        if past {
+            ret();
+        }
+        let (di, wi): (u32, u32);
+        let (ia, ja): (u64, u64);
+        mad.wide.u32(ia, i, 4, didx);
+        mad.wide.u32(ja, i, 4, widx);
+        ld.global.u32(di, [ia]);
+        ld.global.u32(wi, [ja]);
+        let wv: f32;
+        let wa: u64;
+        mad.wide.u32(wa, wi, 4, wts);
+        ld.global.f32(wv, [wa]);
+        let (so, dof): (u32, u32);
+        mad.lo.u32(so, i, n, c);
+        mad.lo.u32(dof, di, n, c);
+        let (sa, da): (u64, u64);
+        mad.wide.u32(sa, so, 4, src);
+        mad.wide.u32(da, dof, 4, dst);
+        let (v0, v1, v2, v3): (f32, f32, f32, f32);
+        let (a0, a1, a2, a3): (f32, f32, f32, f32);
+        ld.global.v4.f32((v0, v1, v2, v3), [sa]);
+        ld.global.v4.f32((a0, a1, a2, a3), [da]);
+        fma.rn.f32(a0, wv, v0, a0);
+        fma.rn.f32(a1, wv, v1, a1);
+        fma.rn.f32(a2, wv, v2, a2);
+        fma.rn.f32(a3, wv, v3, a3);
+        st.global.v4.f32([da], (a0, a1, a2, a3));
     }
 
     /// y = x * sigmoid(g) over n floats.
@@ -1366,7 +1138,7 @@ pub mod gpu {
 
     /// Posts the MoE job of one layer to the CPU through host-mapped `job`, and the slots of the 8 selected experts:
     /// slots[k] = map[ids[k]] (-1 if not cached). Job layout (bytes): seq u32 @0, layer @4, ids @8, slots @40, x @128.
-    /// seq = params[3] * 64 + step + 1 is written last, after a system fence.
+    /// seq = params[3] * 256 + step + 1 (STEPS of ik-engine's cpu_pool) is written last, after a system fence.
     #[reqntid(256)]
     pub unsafe extern "ptx-kernel" fn moe_dispatch(
         ids: *const u32, map: *const i32, slots: *mut i32, x: *const f32, job: *mut u32, params: *const u32, step: u32, layer: u32, n: u32,
@@ -1418,7 +1190,62 @@ pub mod gpu {
             let (tok, seq): (u32, u32);
             st.volatile.global.u32([job + 4], layer);
             ld.global.u32(tok, [params + 12]);
-            mad.lo.u32(seq, tok, 64, step);
+            mad.lo.u32(seq, tok, 256, step);
+            add.u32(seq, seq, 1);
+            membar.sys();
+            st.volatile.global.u32([job], seq);
+        }
+    }
+
+    /// Posts a job of `step` to the CPU team through host-mapped `job`, as moe_dispatch does: `word` @4, the token's
+    /// position params[0] @8, from byte 128 on the na floats of a, then the nb of b and the nc of c; the seq last, after a
+    /// system fence.
+    #[reqntid(256)]
+    pub unsafe extern "ptx-kernel" fn job_post(
+        a: *const f32, na: u32, b: *const f32, nb: u32, c: *const f32, nc: u32, job: *mut u32, params: *const u32, step: u32, word: u32,
+    ) {
+        let t: u32;
+        mov.u32(t, tid.x);
+        let (n1, n2, i): (u32, u32, u32);
+        add.u32(n1, na, nb);
+        add.u32(n2, n1, nc);
+        mov.u32(i, t);
+        label(top);
+        let done: pred;
+        setp.ge.u32(done, i, n2);
+        if done {
+            bra(end);
+        }
+        let (inb, inc): (pred, pred);
+        setp.ge.u32(inb, i, na);
+        setp.ge.u32(inc, i, n1);
+        let (ib, ic, ji): (u32, u32, u32);
+        sub.u32(ib, i, na);
+        sub.u32(ic, i, n1);
+        let (sa, sb, scc, src, ja): (u64, u64, u64, u64, u64);
+        mad.wide.u32(sa, i, 4, a);
+        mad.wide.u32(sb, ib, 4, b);
+        mad.wide.u32(scc, ic, 4, c);
+        selp.b64(src, sb, sa, inb);
+        selp.b64(src, scc, src, inc);
+        let v: f32;
+        ld.global.f32(v, [src]);
+        add.u32(ji, i, 32);
+        mad.wide.u32(ja, ji, 4, job);
+        st.volatile.global.f32([ja], v);
+        add.u32(i, i, 256);
+        bra(top);
+        label(end);
+        bar.sync(0);
+        let first: pred;
+        setp.eq.u32(first, t, 0);
+        if first {
+            let (tok, seq, pos): (u32, u32, u32);
+            st.volatile.global.u32([job + 4], word);
+            ld.global.u32(pos, [params]);
+            st.volatile.global.u32([job + 8], pos);
+            ld.global.u32(tok, [params + 12]);
+            mad.lo.u32(seq, tok, 256, step);
             add.u32(seq, seq, 1);
             membar.sys();
             st.volatile.global.u32([job], seq);
@@ -1438,7 +1265,7 @@ pub mod gpu {
         }
         let (tok, seq): (u32, u32);
         ld.global.u32(tok, [params + 12]);
-        mad.lo.u32(seq, tok, 64, step);
+        mad.lo.u32(seq, tok, 256, step);
         add.u32(seq, seq, 1);
         let (t0, now, lim): (u64, u64, u64);
         mov.u64(t0, globaltimer);
@@ -1463,225 +1290,13 @@ pub mod gpu {
         label(end);
     }
 
-    // ================================================================ int8 (dp4a) kernels
+    // ---------------------------------------------------------------- MoE experts on the GPU
 
-    /// Sum of the s32 `v` over the warp.
-    fn warp_isum(v: s32) {
-        for sh in [16, 8, 4, 2, 1] {
-            let o: s32;
-            shfl.sync.bfly.b32(o, v, sh, 31, 0xffff_ffff);
-            add.s32(v, v, o);
-        }
-    }
-
-    /// Quantizes the f32 `v` of each lane as int8 of the warp's block of 32: q = round(v / d), d = max|v| / 127;
-    /// lanes 0, 4, .. store 4 bytes each at `qa` (byte address of the block), lane 0 stores d and d * sum(q).
-    fn q8_warp(v: f32, lane: u32, qa: u64, da: u64, sa: u64) {
-        let (a, amax, d, id): (f32, f32, f32, f32);
-        abs.f32(a, v);
-        mov.f32(amax, a);
-        warp_max(amax);
-        div.rn.f32(d, amax, 127.0);
-        let nz: pred;
-        setp.gt.f32(nz, amax, 0.0);
-        mov.f32(id, 0.0);
-        if nz {
-            rcp.rn.f32(id, d);
-        }
-        let qf: f32;
-        mul.rn.f32(qf, v, id);
-        let qi: s32;
-        cvt.rni.s32.f32(qi, qf);
-        let sum: s32;
-        mov.s32(sum, qi);
-        warp_isum(sum);
-        // gather 4 bytes into lanes 0 mod 4
-        let (b0, b1, b2, b3, w): (u32, u32, u32, u32, u32);
-        and.b32(b0, qi, 255);
-        shfl.sync.down.b32(b1, b0, 1, 31, 0xffff_ffff);
-        shfl.sync.down.b32(b2, b0, 2, 31, 0xffff_ffff);
-        shfl.sync.down.b32(b3, b0, 3, 31, 0xffff_ffff);
-        shl.b32(b1, b1, 8);
-        shl.b32(b2, b2, 16);
-        shl.b32(b3, b3, 24);
-        or.b32(w, b0, b1);
-        or.b32(w, w, b2);
-        or.b32(w, w, b3);
-        let (l4, four): (u32, pred);
-        and.b32(l4, lane, 3);
-        setp.eq.u32(four, l4, 0);
-        let wa: u64;
-        cvt.u64.u32(wa, lane);
-        add.u64(wa, wa, qa);
-        if four {
-            st.global.u32([wa], w);
-        }
-        let first: pred;
-        setp.eq.u32(first, lane, 0);
-        let (sf, ds): (f32, f32);
-        cvt.rn.f32.s32(sf, sum);
-        mul.rn.f32(ds, d, sf);
-        if first {
-            st.global.f32([da], d);
-            st.global.f32([sa], ds);
-        }
-    }
-
-    /// x (n f32) -> q8_1: q [n] int8, d [n/32], s [n/32] = d * sum(q). A warp per block of 32; grid.y walks vectors.
+    /// The SITU activation of the cached experts' gate_up ([pair][2 nff], the checkpoint's rows: gate i is row 2i, up i
+    /// row 2i + 1): beta tanh(g/beta) sigmoid(g) lb tanh(u/lb), f32 (`af` [pair][nff]). A warp per block of 32, grid.y =
+    /// the pairs, as in moe_nvfp4_d.
     #[maxntid(256)]
-    pub unsafe extern "ptx-kernel" fn quant_q8_1(x: *const f32, q: *mut u8, d: *mut f32, s: *mut f32, n: u32) {
-        let (lane, b): (u32, u32);
-        warp_row(lane, b);
-        let (nb, vtok): (u32, u32);
-        shr.u32(nb, n, 5);
-        mov.u32(vtok, ctaid.y);
-        let past: pred;
-        setp.ge.u32(past, b, nb);
-        if past {
-            ret();
-        }
-        let (gb, i): (u32, u32);
-        mad.lo.u32(gb, vtok, nb, b);
-        shl.b32(i, gb, 5);
-        add.u32(i, i, lane);
-        let (xa, qa, da, sa): (u64, u64, u64, u64);
-        let v: f32;
-        mad.wide.u32(xa, i, 4, x);
-        ld.global.f32(v, [xa]);
-        let qb: u32;
-        shl.b32(qb, gb, 5);
-        mad.wide.u32(qa, qb, 1, q);
-        mad.wide.u32(da, gb, 4, d);
-        mad.wide.u32(sa, gb, 4, s);
-        q8_warp(v, lane, qa, da, sa);
-    }
-
-    /// Copies `nbytes` (a multiple of 4) of global `src` to shared `dst`, by all threads of the block (no wait).
-    fn stage_bytes(dst: u32, src: u64, nbytes: u32) {
-        let (i, nt, nw): (u32, u32, u32);
-        mov.u32(i, tid.x);
-        mov.u32(nt, ntid.x);
-        shr.u32(nw, nbytes, 2);
-        label(top);
-        let done: pred;
-        setp.ge.u32(done, i, nw);
-        if done {
-            bra(end);
-        }
-        let at: u64;
-        let sat: u32;
-        let v: u32;
-        mad.wide.u32(at, i, 4, src);
-        ld.global.u32(v, [at]);
-        mad.lo.u32(sat, i, 4, dst);
-        st.shared.u32([sat], v);
-        add.u32(i, i, nt);
-        bra(top);
-        label(end);
-    }
-
-    /// y[r] = W x for a repacked Q8_0 matrix (`qs` [rows][k] int8, `dw` [rows][k/32] f16) and q8_1 x (`xq`, `xd`).
-    /// k is a multiple of 32 (x read through L1). A half warp per row, 16 rows per block.
-    /// The body of gemv_q8d, for block b.
-    fn gemv_q8d_body(qs: u64, dw: u64, xq: u64, xd: u64, y: u64, rows: u32, k: u32, b: u32) {
-        // x straight from global memory: every block reads it, L1 keeps it
-        let nb: u32;
-        shr.u32(nb, k, 5);
-        let (t, hl, hw, row): (u32, u32, u32, u32);
-        mov.u32(t, tid.x);
-        and.b32(hl, t, 15);
-        shr.u32(hw, t, 4);
-        mad.lo.u32(row, b, 16, hw);
-        let past: pred;
-        setp.ge.u32(past, row, rows);
-        if past {
-            ret();
-        }
-        let (rowq, rowd): (u32, u32);
-        mul.lo.u32(rowq, row, k);
-        mul.lo.u32(rowd, row, nb);
-        let acc: f32;
-        mov.f32(acc, 0.0);
-        let c: u32;
-        shl.b32(c, hl, 4);
-        label(top);
-        let done: pred;
-        setp.ge.u32(done, c, k);
-        if done {
-            bra(end);
-        }
-        let (i, j): (u32, u32);
-        let (at, dat): (u64, u64);
-        add.u32(i, rowq, c);
-        mad.wide.u32(at, i, 1, qs);
-        let (w0, w1, w2, w3): (u32, u32, u32, u32);
-        ld.global.nc.v4.u32((w0, w1, w2, w3), [at]);
-        let xa: u64;
-        mad.wide.u32(xa, c, 1, xq);
-        let (x0, x1, x2, x3): (u32, u32, u32, u32);
-        ld.global.nc.v4.u32((x0, x1, x2, x3), [xa]);
-        let isum: s32;
-        mov.s32(isum, 0);
-        dp4a.s32.s32(isum, w0, x0, isum);
-        dp4a.s32.s32(isum, w1, x1, isum);
-        dp4a.s32.s32(isum, w2, x2, isum);
-        dp4a.s32.s32(isum, w3, x3, isum);
-        shr.u32(j, c, 5);
-        let (h, ja, dxa): (f16, u32, u64);
-        add.u32(ja, j, rowd);
-        mad.wide.u32(dat, ja, 2, dw);
-        ld.global.nc.b16(h, [dat]);
-        let (sw, sx, f): (f32, f32, f32);
-        cvt.f32.f16(sw, h);
-        mad.wide.u32(dxa, j, 4, xd);
-        ld.global.nc.f32(sx, [dxa]);
-        mul.rn.f32(sw, sw, sx);
-        cvt.rn.f32.s32(f, isum);
-        fma.rn.f32(acc, f, sw, acc);
-        add.u32(c, c, 256);
-        bra(top);
-        label(end);
-        half_sum(acc);
-        let first: pred;
-        setp.eq.u32(first, hl, 0);
-        if first {
-            let yat: u64;
-            mad.wide.u32(yat, row, 4, y);
-            st.global.f32([yat], acc);
-        }
-    }
-
-    #[maxntid(256)]
-    pub unsafe extern "ptx-kernel" fn gemv_q8d(qs: *const u8, dw: *const u16, xq: *const u8, xd: *const f32, y: *mut f32, rows: u32, k: u32) {
-        let b: u32;
-        mov.u32(b, ctaid.x);
-        gemv_q8d_body(qs, dw, xq, xd, y, rows, k, b);
-    }
-
-    /// gemv_q8d of matrix ctaid.z: qs and d at tab[2 z], tab[2 z + 1]; x of matrix z at xq + z k, xd + z k/32, y at y + z rows.
-    #[reqntid(256)]
-    pub unsafe extern "ptx-kernel" fn gemv_q8dz(tab: *const u64, xq: *const u8, xd: *const f32, y: *mut f32, rows: u32, k: u32) {
-        let (z, b, zi): (u32, u32, u32);
-        mov.u32(z, ctaid.z);
-        mov.u32(b, ctaid.x);
-        let (ta, qz, dz, xqz, xdz, yz): (u64, u64, u64, u64, u64, u64);
-        mul.lo.u32(zi, z, 2);
-        mad.wide.u32(ta, zi, 8, tab);
-        ld.global.u64(qz, [ta]);
-        ld.global.u64(dz, [ta + 8]);
-        mul.lo.u32(zi, z, k);
-        mad.wide.u32(xqz, zi, 1, xq);
-        shr.u32(zi, zi, 5);
-        mad.wide.u32(xdz, zi, 4, xd);
-        mul.lo.u32(zi, z, rows);
-        mad.wide.u32(yz, zi, 4, y);
-        gemv_q8d_body(qz, dz, xqz, xdz, yz, rows, k, b);
-    }
-
-    /// The SITU activation of the cached experts' gate_up ([8][2 nff]), quantized as q8_1: aq [8][nff], ad, as [8][nff/32].
-    /// A warp per block of 32, grid.y = 8 experts.
-    #[maxntid(256)]
-    pub unsafe extern "ptx-kernel" fn situ_q8(gu: *const f32, slots: *const i32, aq: *mut u8, ad: *mut f32, asum: *mut f32, nff: u32, beta: f32, lb: f32) {
+    pub unsafe extern "ptx-kernel" fn situ(gu: *const f32, slots: *const i32, af: *mut f32, nff: u32, beta: f32, lb: f32) {
         let ke: u32;
         mov.u32(ke, ctaid.y);
         let (sa, slot): (u64, s32);
@@ -1701,19 +1316,16 @@ pub mod gpu {
         if past {
             ret();
         }
-        let (i, gi, ui, base): (u32, u32, u32, u32);
+        let (i, gi, base, ai): (u32, u32, u32, u32);
         shl.b32(i, b, 5);
         add.u32(i, i, lane);
         shl.b32(base, nff, 1);
         mul.lo.u32(base, base, ke);
-        add.u32(gi, base, i);
-        add.u32(ui, gi, nff);
-        let (ga, ua): (u64, u64);
+        mad.lo.u32(gi, i, 2, base);
+        let ga: u64;
         let (gv, uv, a, sg, tu, ib, il): (f32, f32, f32, f32, f32, f32, f32);
         mad.wide.u32(ga, gi, 4, gu);
-        mad.wide.u32(ua, ui, 4, gu);
-        ld.global.f32(gv, [ga]);
-        ld.global.f32(uv, [ua]);
+        ld.global.v2.f32((gv, uv), [ga]);
         rcp.rn.f32(ib, beta);
         rcp.rn.f32(il, lb);
         mul.rn.f32(a, gv, ib);
@@ -1725,165 +1337,100 @@ pub mod gpu {
         tanh(tu, tu);
         mul.rn.f32(tu, tu, lb);
         mul.rn.f32(a, a, tu);
-        let (gb, qb): (u32, u32);
-        mad.lo.u32(gb, ke, nb, b);
-        shl.b32(qb, gb, 5);
-        let (qa, da, s2): (u64, u64, u64);
-        mad.wide.u32(qa, qb, 1, aq);
-        mad.wide.u32(da, gb, 4, ad);
-        mad.wide.u32(s2, gb, 4, asum);
-        q8_warp(a, lane, qa, da, s2);
+        let afa: u64;
+        mad.lo.u32(ai, ke, nff, i);
+        mad.wide.u32(afa, ai, 4, af);
+        st.global.f32([afa], a);
     }
 
-    /// The UE4M3 scale byte `b` as f32, halved as ggml decodes it: 2^(e-8) (1 + m/8), or m 2^-10 when e = 0; 0x7F is 0.
-    fn ue4m3(f: f32, b: u32) {
-        let (e, bits, m): (u32, u32, u32);
-        and.b32(e, b, 0x78);
-        and.b32(bits, b, 0x7F);
-        shl.b32(bits, bits, 20);
-        add.u32(bits, bits, 0x3B80_0000);
-        mov.b32(f, bits);
-        let (sub, nan): (pred, pred);
-        setp.eq.u32(sub, e, 0);
-        if sub {
-            let mf: f32;
-            and.b32(m, b, 7);
-            cvt.rn.f32.u32(mf, m);
-            mul.rn.f32(f, mf, 0.0009765625);
-        }
-        setp.eq.u32(nan, bits, 0x4B70_0000);
-        if nan {
-            mov.f32(f, 0.0);
-        }
-    }
-
-    /// The 8 E2M1 codes of w (its nibbles) as int8 of the doubled values, 13 instructions: `lo` those of the low
-    /// nibbles of its 4 bytes, `hi` of the high ones. prmt looks up 4 nibbles at a time in the magnitudes `pa`/`pb`
-    /// ({0,1,2,3}, {4,6,8,12}) and the negatives `na`/`nb` (bit 3 masked off: in a prmt selector it replicates the
-    /// sign), the sign picks between the two (selector byte k, or 4 + k), the last two sort low and high nibbles apart.
-    fn fp4x8(lo: u32, hi: u32, w: u32, pa: u32, pb: u32, na: u32, nb: u32) {
-        let (m, s, m1, s1, p, n, a, b): (u32, u32, u32, u32, u32, u32, u32, u32);
-        and.b32(m, w, 0x7777_7777);
-        shr.u32(s, w, 1);
-        and.b32(s, s, 0x4444_4444);
-        or.b32(s, s, 0x3210_3210);
-        prmt.b32(p, pa, pb, m);
-        prmt.b32(n, na, nb, m);
-        prmt.b32(a, p, n, s);
-        shr.u32(m1, m, 16);
-        shr.u32(s1, s, 16);
-        prmt.b32(p, pa, pb, m1);
-        prmt.b32(n, na, nb, m1);
-        prmt.b32(b, p, n, s1);
-        prmt.b32(lo, a, b, 0x6420);
-        prmt.b32(hi, a, b, 0x7531);
-    }
-
-    /// acc += one 16-byte NVFP4 chunk (w0..w3, its group's scale word `sc`) times x: x0..x3 for its low nibbles, x4..x7
-    /// for the high ones, `xlo`, `xhi` their scales; `ph` = 8 h, the shift to the chunk's two scale bytes h and 2 + h.
-    /// UE4M3 byte b: (b & 0x7F) << 20 is the f32 2^(e-127) (1 + m/8), or m 2^-129 when e = 0 (a subnormal); times
-    /// `f119` = 2^119, exactly, the scale halved as ggml decodes it (0x7F, NaN, is 0: experts::repack makes it 0x00).
-    fn nv4_chunk(
-        acc: f32, w0: u32, w1: u32, w2: u32, w3: u32, sc: u32, x0: u32, x1: u32, x2: u32, x3: u32, x4: u32, x5: u32, x6: u32, x7: u32,
-        xlo: f32, xhi: f32, ph: u32, f119: f32, pa: u32, pb: u32, na: u32, nb: u32,
-    ) {
-        let (l0, l1, l2, l3, h0, h1, h2, h3): (u32, u32, u32, u32, u32, u32, u32, u32);
-        fp4x8(l0, h0, w0, pa, pb, na, nb);
-        fp4x8(l1, h1, w1, pa, pb, na, nb);
-        fp4x8(l2, h2, w2, pa, pb, na, nb);
-        fp4x8(l3, h3, w3, pa, pb, na, nb);
-        let (dlo, dhi): (u32, u32);
-        mov.u32(dlo, 0);
-        mov.u32(dhi, 0);
-        dp4a.s32.s32(dlo, l0, x0, dlo);
-        dp4a.s32.s32(dlo, l1, x1, dlo);
-        dp4a.s32.s32(dlo, l2, x2, dlo);
-        dp4a.s32.s32(dlo, l3, x3, dlo);
-        dp4a.s32.s32(dhi, h0, x4, dhi);
-        dp4a.s32.s32(dhi, h1, x5, dhi);
-        dp4a.s32.s32(dhi, h2, x6, dhi);
-        dp4a.s32.s32(dhi, h3, x7, dhi);
-        let (st, blo, bhi): (u32, u32, u32);
-        shr.u32(st, sc, ph);
-        shl.b32(blo, st, 20);
-        and.b32(blo, blo, 0x07F0_0000);
-        shl.b32(bhi, st, 4);
-        and.b32(bhi, bhi, 0x07F0_0000);
-        let (slo, shi, flo, fhi): (f32, f32, f32, f32);
-        mov.b32(slo, blo);
-        mov.b32(shi, bhi);
-        mul.rn.f32(slo, slo, f119);
-        mul.rn.f32(shi, shi, f119);
-        cvt.rn.f32.s32(flo, dlo);
-        cvt.rn.f32.s32(fhi, dhi);
-        mul.rn.f32(slo, slo, xlo);
-        mul.rn.f32(shi, shi, xhi);
-        fma.rn.f32(acc, flo, slo, acc);
-        fma.rn.f32(acc, fhi, shi, acc);
-    }
-
-    /// y = W x for the 8 experts of `slots` (grid.y) on an NVFP4 bank in the slot layout of experts.rs: rows of k/2
-    /// bytes (value j of each 64 in the low nibble of byte j, 32 + j in the high one), the UE4M3 scales (k/16 a row),
-    /// then the expert's f32 scale. x is q8_1 (int8 `xq`, `xd` per 32), the same for all experts (xstride 0) or each
-    /// expert's at xq + ke xstride. 8 lanes per row (16-byte chunks: a warp reads 128 contiguous bytes of each of 4
-    /// rows), a thread takes 4 rows (r + 16i), 64 rows per block of 128 threads: 8 experts of 2304 rows fit the GPU in
-    /// one wave. x is read through L1, not staged. k a multiple of 64.
+    /// y = W x for the pairs of `slots` (grid.x: a token's 8 experts, or in prefill 8 pairs a token of several tokens, or
+    /// the pairs of one expert; grid.y the blocks of 64 rows, so that the pairs of a block of rows run side by side and
+    /// those of one expert read it from L2) on a bank of ModelOpt NVFP4 slots: the expert's codes as the checkpoint has
+    /// them ([rows][k/2], element 2j of a row in the low nibble of byte j), then its E4M3 scales ([rows][k/16]). The
+    /// expert's factor is amax[ids[ke]] / denom[0]. x is f32, the same for all pairs (xstride 0) or pair ke's at
+    /// x + (ke >> xshift) xstride: shift 3 for each token's own x. 8 lanes per row (16-byte chunks of 32 elements, two
+    /// scale blocks: a warp reads 128 contiguous bytes of each of 4 rows), a thread takes 4 rows (r + 16i), 64 rows per
+    /// block of 128 threads; x from shared memory. k a multiple of 32, at most 2304.
+    ///
+    /// The values are decoded exactly. Codes k and k + 4 of a word (nibbles at bits 4k, 4k + 16) shift to an f16x2 of
+    /// them times 2^-14: e1 e0 m to bits 11..9 of each half (f16's exponent bias of 15 against E2M1's 1, and with
+    /// e1 e0 = 0 the subnormals of both), the sign from bit 12 to 15. Their f32 are exact, and so is the scale: (b & 0x7F)
+    /// << 20 is the f32 of the E4M3 b times 2^-120 (subnormal ones too), times 2^120. The factor takes the 2^14.
+    ///
+    /// Four blocks an SM, 128 registers a thread: with fewer, ptxas moves the next chunk's loads down to where they are
+    /// used (3 % slower on an RTX 3050).
     #[reqntid(128)]
-    pub unsafe extern "ptx-kernel" fn moe_nv4_d(
-        bank: *const u8, slot_bytes: u64, slots: *const i32, xq: *const u8, xd: *const f32, xstride: u32, y: *mut f32, rows: u32, kdim: u32,
+    #[minnctapersm(4)]
+    pub unsafe extern "ptx-kernel" fn moe_nvfp4_d(
+        bank: *const u8, slot_bytes: u64, slots: *const i32, ids: *const u32, amax: *const f32, denom: *const f32, x: *const f32,
+        xstride: u32, xshift: u32, y: *mut f32, rows: u32, kdim: u32,
     ) {
         let ke: u32;
-        mov.u32(ke, ctaid.y);
-        let (sa, slot): (u64, s32);
-        mad.wide.u32(sa, ke, 4, slots);
-        ld.global.s32(slot, [sa]);
+        mov.u32(ke, ctaid.x);
+        let (sa0, slot): (u64, s32);
+        mad.wide.u32(sa0, ke, 4, slots);
+        ld.global.s32(slot, [sa0]);
         let none: pred;
         setp.lt.s32(none, slot, 0);
         if none {
             ret();
         }
-        // x straight from global memory: every block of the expert reads it, L1 keeps it
-        let (aoff, boff): (u32, u32);
-        mul.lo.u32(aoff, ke, xstride);
-        shr.u32(boff, aoff, 5);
-        let (xk, dk): (u64, u64);
-        mad.wide.u32(xk, aoff, 1, xq);
-        mad.wide.u32(dk, boff, 4, xd);
+        let aoff: u32;
+        shr.u32(aoff, ke, xshift);
+        mul.lo.u32(aoff, aoff, xstride);
+        let xk: u64;
+        mad.wide.u32(xk, aoff, 4, x);
         let (t, lr, bk, row0, last): (u32, u32, u32, u32, u32);
         mov.u32(t, tid.x);
         and.b32(lr, t, 7);
-        mov.u32(bk, ctaid.x);
+        mov.u32(bk, ctaid.y);
         shr.u32(row0, t, 3);
         mad.lo.u32(row0, bk, 64, row0);
+        // x to shared memory, chunk c's 32 floats at byte 144 c: the 8 lanes of a row, which read 8 chunks at once,
+        // then reach 8 different sets of banks. Float4 i goes to 144 (i / 8) + 16 (i % 8), by all the block's threads
+        // before any leaves.
+        let xs: shared<[f32; 2592], 16>;
+        let (xb, i, n4): (u32, u32, u32);
+        mov.u32(xb, xs);
+        mov.u32(i, t);
+        shr.u32(n4, kdim, 2);
+        label(fill);
+        let filled: pred;
+        setp.ge.u32(filled, i, n4);
+        if filled {
+            bra(staged);
+        }
+        let (ga, so, hi, lo): (u64, u32, u32, u32);
+        let (v0, v1, v2, v3): (f32, f32, f32, f32);
+        mad.wide.u32(ga, i, 16, xk);
+        ld.global.nc.v4.f32((v0, v1, v2, v3), [ga]);
+        shr.u32(hi, i, 3);
+        and.b32(lo, i, 7);
+        mad.lo.u32(so, hi, 144, xb);
+        mad.lo.u32(so, lo, 16, so);
+        st.shared.v4.f32([so], (v0, v1, v2, v3));
+        add.u32(i, i, 128);
+        bra(fill);
+        label(staged);
+        bar.sync(0);
         let past: pred;
         setp.ge.u32(past, row0, rows);
         if past {
             ret();
         }
         sub.u32(last, rows, 1);
-        let (sl, base, sca): (u64, u64, u64);
+        let (sl, base): (u64, u64);
         cvt.u64.s32(sl, slot);
         mul.lo.u64(sl, sl, slot_bytes);
         add.u64(base, bank, sl);
-        let (half, qbytes, sk, sbytes, o): (u32, u32, u32, u32, u32);
+        let (half, qbytes, sk, nc, c): (u32, u32, u32, u32, u32);
         shr.u32(half, kdim, 1);
         mul.lo.u32(qbytes, rows, half);
         shr.u32(sk, kdim, 4);
-        mul.lo.u32(sbytes, rows, sk);
-        add.u32(o, qbytes, sbytes);
-        cvt.u64.u32(sca, o);
-        add.u64(sca, sca, base);
-        // a lane's chunks c = lr + 8i: group g = c/2 = lr/2 + 4i, half h = c%2 = lr%2. The low nibbles are values
-        // 64g + 16h.., the high ones 64g + 32 + 16h..; their weight scales are bytes h and 2 + h of the group's 4, their
-        // x scales those of blocks 2g, 2g + 1.
-        let (nc, c, h, ph, g0, xoff): (u32, u32, u32, u32, u32, u32);
-        let (xo, xda): (u64, u64);
         shr.u32(nc, kdim, 5);
         mov.u32(c, lr);
-        and.b32(h, lr, 1);
-        shl.b32(ph, h, 3);
-        shr.u32(g0, lr, 1);
-        // the thread's rows row0 + 16 r (past the end: the last row, computed, not stored), their chunk and scale words
+        // the thread's rows row0 + 16 r (past the end: the last row, computed, not stored): chunk c of a row is bytes
+        // 16c.., its scales bytes 2c, 2c + 1
         let (qa, sa): ([u64; 4], [u64; 4]);
         for r in 0..4 {
             let (rr, so): (u32, u32);
@@ -1892,55 +1439,115 @@ pub mod gpu {
             mad.wide.u32(qa[r], rr, half, base);
             mad.wide.u32(qa[r], lr, 16, qa[r]);
             mad.lo.u32(so, rr, sk, qbytes);
-            mad.lo.u32(so, g0, 4, so);
+            mad.lo.u32(so, lr, 2, so);
             cvt.u64.u32(sa[r], so);
             add.u64(sa[r], sa[r], base);
         }
-        shl.b32(xoff, g0, 6);
-        mad.lo.u32(xoff, h, 16, xoff);
-        mad.wide.u32(xo, xoff, 1, xk);
-        mad.wide.u32(xda, g0, 8, dk);
-        let (pa, pb, na, nbt): (u32, u32, u32, u32);
-        mov.u32(pa, 0x0302_0100);
-        mov.u32(pb, 0x0C08_0604);
-        mov.u32(na, 0xFDFE_FF00);
-        mov.u32(nbt, 0xF4F8_FAFC);
-        let (k119, f119): (u32, f32);
-        mov.u32(k119, 0x7B00_0000);
-        mov.b32(f119, k119);
+        // chunk c's x: elements 32c..32c + 32, at shared 144 c
+        let xo: u32;
+        mad.lo.u32(xo, lr, 144, xb);
+        let (k120, f120): (u32, f32);
+        mov.u32(k120, 0x7B80_0000);
+        mov.b32(f120, k120);
         let acc: [f32; 4];
         for r in 0..4 {
             mov.f32(acc[r], 0.0);
         }
-        label(top);
         let done: pred;
         setp.ge.u32(done, c, nc);
         if done {
             bra(end);
         }
-        let (w0, w1, w2, w3, sc): ([u32; 4], [u32; 4], [u32; 4], [u32; 4], [u32; 4]);
+        // Chunk c's codes and scales are in half h of w and s16 while half h of the loop sums them, and the next chunk
+        // loads into the other half meanwhile: each load has a chunk's arithmetic to arrive in. Past the last chunk
+        // the addresses stay, and the last half loads its own chunk again, which nothing sums.
+        let (w, s16): ([u32; 32], [u16; 8]);
         for r in 0..4 {
-            ld.global.nc.v4.u32((w0[r], w1[r], w2[r], w3[r]), [qa[r]]);
+            ld.global.nc.v4.u32((w[4 * r], w[4 * r + 1], w[4 * r + 2], w[4 * r + 3]), [qa[r]]);
         }
         for r in 0..4 {
-            ld.global.nc.u32(sc[r], [sa[r]]);
+            ld.global.nc.u16(s16[r], [sa[r]]);
         }
-        let (x0, x1, x2, x3, x4, x5, x6, x7): (u32, u32, u32, u32, u32, u32, u32, u32);
-        ld.global.nc.v4.u32((x0, x1, x2, x3), [xo]);
-        ld.global.nc.v4.u32((x4, x5, x6, x7), [xo + 32]);
-        let (xlo, xhi): (f32, f32);
-        ld.global.nc.v2.f32((xlo, xhi), [xda]);
-        for r in 0..4 {
-            nv4_chunk(acc[r], w0[r], w1[r], w2[r], w3[r], sc[r], x0, x1, x2, x3, x4, x5, x6, x7, xlo, xhi, ph, f119, pa, pb, na, nbt);
+        label(top);
+        for h in 0..2 {
+            let (cn, more, sq, ss): (u32, pred, u64, u64);
+            add.u32(cn, c, 8);
+            setp.lt.u32(more, cn, nc);
+            selp.b64(sq, 128, 0, more);
+            selp.b64(ss, 16, 0, more);
+            for r in 0..4 {
+                add.u64(qa[r], qa[r], sq);
+                add.u64(sa[r], sa[r], ss);
+            }
+            for r in 0..4 {
+                ld.global.nc.v4.u32(
+                    (w[16 - 16 * h + 4 * r], w[16 - 16 * h + 4 * r + 1], w[16 - 16 * h + 4 * r + 2], w[16 - 16 * h + 4 * r + 3]),
+                    [qa[r]],
+                );
+            }
+            for r in 0..4 {
+                ld.global.nc.u16(s16[4 - 4 * h + r], [sa[r]]);
+            }
+            let xv: [f32; 32];
+            for q in 0..8 {
+                ld.shared.v4.f32((xv[4 * q], xv[4 * q + 1], xv[4 * q + 2], xv[4 * q + 3]), [xo + (q * 16)]);
+            }
+            for r in 0..4 {
+                // the sums of the chunk's two blocks: words 0, 1 are elements 0..15, words 2, 3 elements 16..31
+                let part: [f32; 2];
+                mov.f32(part[0], 0.0);
+                mov.f32(part[1], 0.0);
+                for j in 0..4 {
+                    for k in 0..4 {
+                        // word j's codes k, k + 4 (elements 8j + k, 8j + k + 4): e1 e0 m to bits 9..11 (and 25..27)
+                        let (sh, a, sg, hv): (u32, u32, u32, u32);
+                        let (h0, h1): (f16, f16);
+                        let (f0, f1): (f32, f32);
+                        if k == 3 {
+                            shr.u32(sh, w[16 * h + 4 * r + j], 3);
+                        } else {
+                            shl.b32(sh, w[16 * h + 4 * r + j], 9 - 4 * k);
+                        }
+                        // the sign then at bit 12: hv = a + 7 sg moves it to 15
+                        and.b32(a, sh, 0x1E00_1E00);
+                        and.b32(sg, sh, 0x1000_1000);
+                        mad.lo.u32(hv, sg, 7, a);
+                        mov.b32((h0, h1), hv);
+                        cvt.f32.f16(f0, h0);
+                        cvt.f32.f16(f1, h1);
+                        fma.rn.f32(part[j / 2], f0, xv[8 * j + k], part[j / 2]);
+                        fma.rn.f32(part[j / 2], f1, xv[8 * j + k + 4], part[j / 2]);
+                    }
+                }
+                let (sc, e0, e1): (u32, u32, u32);
+                let (s0, s1): (f32, f32);
+                cvt.u32.u16(sc, s16[4 * h + r]);
+                shl.b32(e0, sc, 20);
+                and.b32(e0, e0, 0x07F0_0000);
+                shl.b32(e1, sc, 12);
+                and.b32(e1, e1, 0x07F0_0000);
+                mov.b32(s0, e0);
+                mov.b32(s1, e1);
+                mul.rn.f32(s0, s0, f120);
+                mul.rn.f32(s1, s1, f120);
+                fma.rn.f32(acc[r], part[0], s0, acc[r]);
+                fma.rn.f32(acc[r], part[1], s1, acc[r]);
+            }
+            add.u32(xo, xo, 1152);
+            mov.u32(c, cn);
+            if h == 0 {
+                let last: pred;
+                setp.ge.u32(last, c, nc);
+                if last {
+                    bra(end);
+                }
+            }
+            if h == 1 {
+                if more {
+                    bra(top);
+                }
+            }
         }
-        add.u32(c, c, 8);
-        for r in 0..4 {
-            add.u64(qa[r], qa[r], 128);
-            add.u64(sa[r], sa[r], 16);
-        }
-        add.u64(xo, xo, 256);
-        add.u64(xda, xda, 32);
-        bra(top);
         label(end);
         for sh in [4, 2, 1] {
             for r in 0..4 {
@@ -1949,9 +1556,18 @@ pub mod gpu {
                 add.rn.f32(acc[r], acc[r], o);
             }
         }
-        let (first, es): (pred, f32);
+        // the expert's factor, as the checkpoint gives it (amax / outer_scale_denominator), times the values' 2^14
+        let (ia, aa, e): (u64, u64, u32);
+        let (am, den, es): (f32, f32, f32);
+        mad.wide.u32(ia, ke, 4, ids);
+        ld.global.u32(e, [ia]);
+        mad.wide.u32(aa, e, 4, amax);
+        ld.global.nc.f32(am, [aa]);
+        ld.global.nc.f32(den, [denom]);
+        div.rn.f32(es, am, den);
+        mul.rn.f32(es, es, 16384.0);
+        let first: pred;
         setp.eq.u32(first, lr, 0);
-        ld.global.nc.f32(es, [sca]);
         for r in 0..4 {
             let (rr, oi, oa, inr, store): (u32, u32, u64, pred, pred);
             add.u32(rr, row0, r * 16);
@@ -1966,34 +1582,65 @@ pub mod gpu {
         }
     }
 
-    /// y = W x for the 8 experts of `slots` (grid.y) on a Q8_0 bank in the slot layout of experts.rs: rows of k int8,
-    /// then the f16 scales (k/32 a row). x as in moe_nv4_d, threads and rows as there: 8 lanes per row (16-byte
-    /// chunks), 4 rows a thread, 64 rows per block of 128 threads; x read through L1. k a multiple of 32.
+    /// acc += 4 e4m3 of `w` (element 0 in its low byte) times x0..x3. An e4m3 byte b as f16 is
+    /// (b & 0x80) << 8 | (b & 0x7F) << 7: the e4m3 value times 2^-8, exactly (subnormals too); the f32 of that is exact.
+    fn fma_e4m3x4(acc: f32, w: u32, x0: f32, x1: f32, x2: f32, x3: f32, zero: u32) {
+        let (u, m, sg, h): (u32, u32, u32, u32);
+        let (h0, h1): (f16, f16);
+        let (f0, f1): (f32, f32);
+        for pair in 0..2 {
+            // bytes 2 pair, 2 pair + 1 into the high bytes of the two halves
+            if pair == 0 {
+                prmt.b32(u, w, zero, 0x1404);
+            } else {
+                prmt.b32(u, w, zero, 0x3424);
+            }
+            shr.u32(m, u, 1);
+            and.b32(m, m, 0x3F80_3F80);
+            and.b32(sg, u, 0x8000_8000);
+            or.b32(h, m, sg);
+            mov.b32((h0, h1), h);
+            cvt.f32.f16(f0, h0);
+            cvt.f32.f16(f1, h1);
+            if pair == 0 {
+                fma.rn.f32(acc, f0, x0, acc);
+                fma.rn.f32(acc, f1, x1, acc);
+            } else {
+                fma.rn.f32(acc, f0, x2, acc);
+                fma.rn.f32(acc, f1, x3, acc);
+            }
+        }
+    }
+
+    /// y = W x for the pairs of `slots` (grid.x, as in moe_nvfp4_d) on a bank of MXFP8 slots: the expert's e4m3 values as
+    /// the checkpoint has them ([rows][k]), then its UE8M0 scales ([rows][k/32], 2^(s-127) each). x is f32, the same for
+    /// all pairs (xstride 0) or pair ke's at x + (ke >> xshift) xstride. 8 lanes per row (16-byte chunks of 16 values: a warp reads
+    /// 128 contiguous bytes of each of 4 rows), a thread takes 4 rows (r + 16i), 64 rows per block of 128 threads; x
+    /// through L1. k a multiple of 128.
     #[reqntid(128)]
-    pub unsafe extern "ptx-kernel" fn moe_q8_d(
-        bank: *const u8, slot_bytes: u64, slots: *const i32, xq: *const u8, xd: *const f32, xstride: u32, y: *mut f32, rows: u32, kdim: u32,
+    pub unsafe extern "ptx-kernel" fn moe_mxfp8_d(
+        bank: *const u8, slot_bytes: u64, slots: *const i32, x: *const f32, xstride: u32, xshift: u32, y: *mut f32, rows: u32,
+        kdim: u32,
     ) {
         let ke: u32;
-        mov.u32(ke, ctaid.y);
-        let (sa, slot): (u64, s32);
-        mad.wide.u32(sa, ke, 4, slots);
-        ld.global.s32(slot, [sa]);
+        mov.u32(ke, ctaid.x);
+        let (sa0, slot): (u64, s32);
+        mad.wide.u32(sa0, ke, 4, slots);
+        ld.global.s32(slot, [sa0]);
         let none: pred;
         setp.lt.s32(none, slot, 0);
         if none {
             ret();
         }
-        // x straight from global memory: every block of the expert reads it, L1 keeps it
-        let (aoff, boff): (u32, u32);
-        mul.lo.u32(aoff, ke, xstride);
-        shr.u32(boff, aoff, 5);
-        let (xk, dk): (u64, u64);
-        mad.wide.u32(xk, aoff, 1, xq);
-        mad.wide.u32(dk, boff, 4, xd);
+        let aoff: u32;
+        shr.u32(aoff, ke, xshift);
+        mul.lo.u32(aoff, aoff, xstride);
+        let xk: u64;
+        mad.wide.u32(xk, aoff, 4, x);
         let (t, lr, bk, row0, last): (u32, u32, u32, u32, u32);
         mov.u32(t, tid.x);
         and.b32(lr, t, 7);
-        mov.u32(bk, ctaid.x);
+        mov.u32(bk, ctaid.y);
         shr.u32(row0, t, 3);
         mad.lo.u32(row0, bk, 64, row0);
         let past: pred;
@@ -2006,16 +1653,15 @@ pub mod gpu {
         cvt.u64.s32(sl, slot);
         mul.lo.u64(sl, sl, slot_bytes);
         add.u64(base, bank, sl);
-        let (qbytes, sk): (u32, u32);
+        let (qbytes, sk, nc, c, bsh): (u32, u32, u32, u32, u32);
         mul.lo.u32(qbytes, rows, kdim);
-        shr.u32(sk, kdim, 4);
-        // a lane's chunks c = lr + 8i: values 16c.., in block c/2 = lr/2 + 4i
-        let (nc, c, g0): (u32, u32, u32);
+        shr.u32(sk, kdim, 5);
         shr.u32(nc, kdim, 4);
         mov.u32(c, lr);
-        shr.u32(g0, lr, 1);
-        // the thread's rows row0 + 16 r (past the end: the last row, computed, not stored)
-        let (qa, da): ([u64; 4], [u64; 4]);
+        // chunk c = lr + 8i is in block c/2 = lr/2 + 4i: byte lr/2 of the row's scale word i
+        shr.u32(bsh, lr, 1);
+        shl.b32(bsh, bsh, 3);
+        let (qa, sa): ([u64; 4], [u64; 4]);
         for r in 0..4 {
             let (rr, so): (u32, u32);
             add.u32(rr, row0, r * 16);
@@ -2023,13 +1669,13 @@ pub mod gpu {
             mad.wide.u32(qa[r], rr, kdim, base);
             mad.wide.u32(qa[r], lr, 16, qa[r]);
             mad.lo.u32(so, rr, sk, qbytes);
-            mad.lo.u32(so, g0, 2, so);
-            cvt.u64.u32(da[r], so);
-            add.u64(da[r], da[r], base);
+            cvt.u64.u32(sa[r], so);
+            add.u64(sa[r], sa[r], base);
         }
-        let (xo, xda): (u64, u64);
-        mad.wide.u32(xo, lr, 16, xk);
-        mad.wide.u32(xda, g0, 4, dk);
+        let xo: u64;
+        mad.wide.u32(xo, lr, 64, xk);
+        let zero: u32;
+        mov.u32(zero, 0);
         let acc: [f32; 4];
         for r in 0..4 {
             mov.f32(acc[r], 0.0);
@@ -2040,35 +1686,39 @@ pub mod gpu {
         if done {
             bra(end);
         }
-        let (w0, w1, w2, w3, hd): ([u32; 4], [u32; 4], [u32; 4], [u32; 4], [f16; 4]);
+        let (w0, w1, w2, w3, sw): ([u32; 4], [u32; 4], [u32; 4], [u32; 4], [u32; 4]);
         for r in 0..4 {
             ld.global.nc.v4.u32((w0[r], w1[r], w2[r], w3[r]), [qa[r]]);
         }
         for r in 0..4 {
-            ld.global.nc.b16(hd[r], [da[r]]);
+            ld.global.nc.u32(sw[r], [sa[r]]);
         }
-        let (x0, x1, x2, x3, dx): (u32, u32, u32, u32, f32);
-        ld.global.nc.v4.u32((x0, x1, x2, x3), [xo]);
-        ld.global.nc.f32(dx, [xda]);
+        let xv: [f32; 16];
+        for q in 0..4 {
+            ld.global.nc.v4.f32((xv[4 * q], xv[4 * q + 1], xv[4 * q + 2], xv[4 * q + 3]), [xo + (q * 16)]);
+        }
         for r in 0..4 {
-            let (isum, dw, f): (u32, f32, f32);
-            mov.u32(isum, 0);
-            dp4a.s32.s32(isum, w0[r], x0, isum);
-            dp4a.s32.s32(isum, w1[r], x1, isum);
-            dp4a.s32.s32(isum, w2[r], x2, isum);
-            dp4a.s32.s32(isum, w3[r], x3, isum);
-            cvt.f32.f16(dw, hd[r]);
-            mul.rn.f32(dw, dw, dx);
-            cvt.rn.f32.s32(f, isum);
-            fma.rn.f32(acc[r], f, dw, acc[r]);
+            let part: f32;
+            mov.f32(part, 0.0);
+            fma_e4m3x4(part, w0[r], xv[0], xv[1], xv[2], xv[3], zero);
+            fma_e4m3x4(part, w1[r], xv[4], xv[5], xv[6], xv[7], zero);
+            fma_e4m3x4(part, w2[r], xv[8], xv[9], xv[10], xv[11], zero);
+            fma_e4m3x4(part, w3[r], xv[12], xv[13], xv[14], xv[15], zero);
+            // the block's 2^(s-127), times the 2^8 of the f16 values: the f32 of exponent s + 8
+            let (sb, sf): (u32, f32);
+            shr.u32(sb, sw[r], bsh);
+            and.b32(sb, sb, 0xFF);
+            add.u32(sb, sb, 8);
+            shl.b32(sb, sb, 23);
+            mov.b32(sf, sb);
+            fma.rn.f32(acc[r], part, sf, acc[r]);
         }
         add.u32(c, c, 8);
         for r in 0..4 {
             add.u64(qa[r], qa[r], 128);
-            add.u64(da[r], da[r], 8);
+            add.u64(sa[r], sa[r], 4);
         }
-        add.u64(xo, xo, 128);
-        add.u64(xda, xda, 16);
+        add.u64(xo, xo, 512);
         bra(top);
         label(end);
         for sh in [4, 2, 1] {
@@ -2093,432 +1743,426 @@ pub mod gpu {
         }
     }
 
-    /// The (slot, count, offset) of group g and the (token, pair) of the 32 tokens of tile tz into shared `tb`:
-    /// slot, the tile's first token and its token count (nt 0: nothing to do).
-    fn group_tile(slot: u32, nt: u32, groups: u64, tb: u32) {
-        let (g, tz, t, ga, ntok, off, t0): (u32, u32, u32, u64, u32, u32, u32);
-        mov.u32(g, ctaid.y);
-        mov.u32(tz, ctaid.z);
-        mov.u32(t, tid.x);
-        mul.lo.u32(off, g, 3);
-        mad.wide.u32(ga, off, 4, groups);
-        ld.global.u32(slot, [ga]);
-        ld.global.u32(ntok, [ga + 4]);
-        ld.global.u32(off, [ga + 8]);
-        shl.b32(t0, tz, 5);
-        mov.u32(nt, 0);
-        let some: pred;
-        setp.lt.u32(some, t0, ntok);
-        if some {
-            sub.u32(nt, ntok, t0);
-            min.u32(nt, nt, 32);
-        }
-        let lt64: pred;
-        setp.lt.u32(lt64, t, 64);
-        and.pred(lt64, lt64, some);
-        if lt64 {
-            let (e, ta, v, sa2): (u32, u64, u32, u32);
-            add.u32(e, off, t0);
-            shl.b32(e, e, 1);
-            add.u32(e, e, t);
-            add.u32(e, e, 384);
-            mad.wide.u32(ta, e, 4, groups);
-            ld.global.u32(v, [ta]);
-            mad.lo.u32(sa2, t, 4, tb);
-            st.shared.u32([sa2], v);
-        }
-    }
-
-    /// Stages values step*128.. of the tile's activations (128 threads): int8 into xb at a stride of 144 bytes a
-    /// token, their 4 scales into db (4 a token). The activations of a token (BYPAIR 0) or of a pair (1).
-    fn stage128<const BYPAIR: u32>(xb: u32, db: u32, tb: u32, xq: u64, xd: u64, kdim: u32, step: u32, nt: u32) {
-        let t: u32;
-        mov.u32(t, tid.x);
-        for w8 in 0..8 {
-            let (wi, tk, wo, src, dst, xr, tka): (u32, u32, u32, u32, u32, u32, u32);
-            add.u32(wi, t, w8 * 128);
-            shr.u32(tk, wi, 5);
-            and.b32(wo, wi, 31);
-            let v: u32;
-            mov.u32(v, 0);
-            let ok: pred;
-            setp.lt.u32(ok, tk, nt);
-            mad.lo.u32(tka, tk, 8, tb);
-            ld.shared.u32(xr, [tka + (BYPAIR * 4)]);
-            mul.lo.u32(src, xr, kdim);
-            mad.lo.u32(src, step, 128, src);
-            mad.lo.u32(src, wo, 4, src);
-            let sa: u64;
-            mad.wide.u32(sa, src, 1, xq);
-            if ok {
-                ld.global.u32(v, [sa]);
-            }
-            mad.lo.u32(dst, tk, 144, xb);
-            mad.lo.u32(dst, wo, 4, dst);
-            st.shared.u32([dst], v);
-        }
-        let (tk, bo, src, dst, xr, tka, nb): (u32, u32, u32, u32, u32, u32, u32);
-        shr.u32(tk, t, 2);
-        and.b32(bo, t, 3);
-        let v: f32;
-        mov.f32(v, 0.0);
-        let ok: pred;
-        setp.lt.u32(ok, tk, nt);
-        mad.lo.u32(tka, tk, 8, tb);
-        ld.shared.u32(xr, [tka + (BYPAIR * 4)]);
-        shr.u32(nb, kdim, 5);
-        mad.lo.u32(src, xr, nb, bo);
-        mad.lo.u32(src, step, 4, src);
-        let sa: u64;
-        mad.wide.u32(sa, src, 4, xd);
-        if ok {
-            ld.global.f32(v, [sa]);
-        }
-        mad.lo.u32(dst, t, 4, db);
-        st.shared.f32([dst], v);
-    }
-
-    /// Writes the 8 sums of a thread (row, tokens cc + 4i of the tile) to y[pair][rows], times `scale`.
-    fn store8(acc: [f32; 8], cc: u32, nt: u32, tb: u32, y: u64, row: u32, rows: u32, scale: f32) {
-        let rin: pred;
-        setp.lt.u32(rin, row, rows);
-        for i in 0..8 {
-            let (tk, pair, o, tka, v): (u32, u32, u32, u32, f32);
-            add.u32(tk, cc, i * 4);
-            let tin: pred;
-            setp.lt.u32(tin, tk, nt);
-            and.pred(tin, tin, rin);
-            mad.lo.u32(tka, tk, 8, tb);
-            ld.shared.u32(pair, [tka + 4]);
-            mad.lo.u32(o, pair, rows, row);
-            let ya: u64;
-            mad.wide.u32(ya, o, 4, y);
-            mul.rn.f32(v, acc[i], scale);
-            if tin {
-                st.global.f32([ya], v);
-            }
-        }
-    }
-
-    /// Prefill: y[pair] = W x for the groups of (token, pair) of each cached expert (grid.y), on an NVFP4 bank (as
-    /// moe_nv4_d); x of the token (BYPAIR 0, gate_up) or of the pair (1, down). 32 rows (grid.x) by 32 tokens
-    /// (grid.z) a block of 128 threads: a thread takes a row and 8 tokens; k a multiple of 128.
+    /// y[t] = W x[t] for the m tokens of an NVFP4 expert, one expert per tab entry (grid.z). tab[4 z ..] holds w, x, y,
+    /// then m and the expert e as two u32s. w is the expert's slot, read as moe_nvfp4_d reads one: the codes
+    /// [rows][k/2], then the E4M3 scales [rows][k/16]. x is [m][k] f32 and y is [m][rows], and the factor is
+    /// amax[e] / denom[0]. A block takes 128 rows by 32 tokens, so that each weight is decoded once for 32 tokens.
+    /// c goes by 32: W's [128][32], decoded to f32 times their scales (exactly), and x's [32][32] wait in shared memory
+    /// as [32][128] and [32][32]. Thread t, lane l of warp w, sums rows 4 g .. 4 g + 4 and 64 + 4 g .. for tokens
+    /// 4 h .. 4 h + 4 (g = l % 8 + 8 (w % 2), h = l / 8 + 4 (w / 2)), each over c in order. A warp then reads 128
+    /// contiguous bytes of W's tile and 64 of x's. Rows past `rows` and tokens past m read the last one and are not
+    /// stored. Blocks past an expert's tokens return at once: the grid is sized for the largest m. k is a multiple
+    /// of 32, rows a multiple of 4.
     #[reqntid(128)]
-    #[instances(0, 1)]
-    pub unsafe extern "ptx-kernel" fn moe_nv4_g<const BYPAIR: u32>(
-        bank: *const u8, slot_bytes: u64, groups: *const u32, xq: *const u8, xd: *const f32, y: *mut f32, rows: u32, kdim: u32,
-    ) {
-        let xsh: shared<[u8; 4608], 16>;
-        let dsh: shared<[f32; 128], 16>;
-        let tsh: shared<[u32; 64], 16>;
-        let (xb, db, tb, slot, nt): (u32, u32, u32, u32, u32);
-        mov.u32(xb, xsh);
-        mov.u32(db, dsh);
-        mov.u32(tb, tsh);
-        group_tile(slot, nt, groups, tb);
-        let none: pred;
-        setp.eq.u32(none, nt, 0);
-        if none {
+    pub unsafe extern "ptx-kernel" fn moe_nvfp4_g(tab: *const u64, amax: *const f32, denom: *const f32, rows: u32, k: u32) {
+        let ws: shared<[f32; 4096], 16>;
+        let xs: shared<[f32; 1024], 16>;
+        let (z, zi, t0, m, e): (u32, u32, u32, u32, u32);
+        let ta: u64;
+        mov.u32(z, ctaid.z);
+        shl.b32(zi, z, 2);
+        mad.wide.u32(ta, zi, 8, tab);
+        ld.global.u32(m, [ta + 24]);
+        ld.global.u32(e, [ta + 28]);
+        mov.u32(t0, ctaid.y);
+        shl.b32(t0, t0, 5);
+        let idle: pred;
+        setp.ge.u32(idle, t0, m);
+        if idle {
             ret();
         }
-        bar.sync(0);
-        let (t, rr, cc, bx, row, rows1, rowc): (u32, u32, u32, u32, u32, u32, u32);
+        let (wz, xz, yz): (u64, u64, u64);
+        ld.global.u64(wz, [ta]);
+        ld.global.u64(xz, [ta + 8]);
+        ld.global.u64(yz, [ta + 16]);
+        let (t, tl, tw, r0, lim): (u32, u32, u32, u32, u32);
         mov.u32(t, tid.x);
-        mov.u32(bx, ctaid.x);
-        shr.u32(rr, t, 2);
-        and.b32(cc, t, 3);
-        mad.lo.u32(row, bx, 32, rr);
-        sub.u32(rows1, rows, 1);
-        min.u32(rowc, row, rows1);
-        let (sl, base, qrow, srow, sca): (u64, u64, u64, u64, u64);
-        cvt.u64.u32(sl, slot);
-        mul.lo.u64(sl, sl, slot_bytes);
-        add.u64(base, bank, sl);
-        let (half, qbytes, sbytes, o): (u32, u32, u32, u32);
-        shr.u32(half, kdim, 1);
+        and.b32(tl, t, 31);
+        shr.u32(tw, t, 5);
+        mov.u32(r0, ctaid.x);
+        shl.b32(r0, r0, 7);
+        // the tiles' loads: thread t brings the 32 codes (16 bytes) and 2 scales of row t, and 8 floats of token t % 32
+        // (8 (t / 32) ..)
+        let (wr, xt, xc, half, qbytes, sk, o): (u32, u32, u32, u32, u32, u32, u32);
+        add.u32(wr, r0, t);
+        sub.u32(lim, rows, 1);
+        min.u32(wr, wr, lim);
+        add.u32(xt, t0, tl);
+        sub.u32(lim, m, 1);
+        min.u32(xt, xt, lim);
+        shl.b32(xc, tw, 3);
+        shr.u32(half, k, 1);
         mul.lo.u32(qbytes, rows, half);
-        mad.wide.u32(qrow, rowc, half, base);
-        shr.u32(o, kdim, 4);
-        mul.lo.u32(sbytes, rows, o);
-        mad.lo.u32(o, rowc, o, qbytes);
-        cvt.u64.u32(srow, o);
-        add.u64(srow, srow, base);
-        add.u32(o, qbytes, sbytes);
-        cvt.u64.u32(sca, o);
-        add.u64(sca, sca, base);
-        let (pa, pb, na, nbt): (u32, u32, u32, u32);
-        mov.u32(pa, 0x0302_0100);
-        mov.u32(pb, 0x0C08_0604);
-        mov.u32(na, 0xFDFE_FF00);
-        mov.u32(nbt, 0xF4F8_FAFC);
-        let acc: [f32; 8];
-        for i in 0..8 {
+        shr.u32(sk, k, 4);
+        let (qa, sa, xa): (u64, u64, u64);
+        mad.wide.u32(qa, wr, half, wz);
+        mad.lo.u32(o, wr, sk, qbytes);
+        cvt.u64.u32(sa, o);
+        add.u64(sa, sa, wz);
+        mad.lo.u32(o, xt, k, xc);
+        mad.wide.u32(xa, o, 4, xz);
+        // row t's value c goes to [c][t] of W's tile, at wst + 512 c; value j of token t % 32 to [8 (t / 32) + j][t % 32]
+        // of x's, at xst + 128 j: a warp's 32 stores reach 32 banks
+        let (wsb, xsb, wst, xst): (u32, u32, u32, u32);
+        mov.u32(wsb, ws);
+        mov.u32(xsb, xs);
+        mad.lo.u32(wst, t, 4, wsb);
+        mad.lo.u32(xst, tl, 4, xsb);
+        mad.lo.u32(xst, tw, 1024, xst);
+        // the thread reads [c][4 g ..] and [c][64 + 4 g ..] of W's tile, and [c][4 h ..] of x's
+        let (g, h, q, ard, brd): (u32, u32, u32, u32, u32);
+        and.b32(g, tl, 7);
+        and.b32(q, tw, 1);
+        mad.lo.u32(g, q, 8, g);
+        shr.u32(h, tl, 3);
+        shr.u32(q, tw, 1);
+        mad.lo.u32(h, q, 4, h);
+        mad.lo.u32(ard, g, 16, wsb);
+        mad.lo.u32(brd, h, 16, xsb);
+        let (k120, f120): (u32, f32);
+        mov.u32(k120, 0x7B80_0000);
+        mov.b32(f120, k120);
+        let acc: [f32; 32];
+        for i in 0..32 {
             mov.f32(acc[i], 0.0);
         }
-        let (step, nsteps): (u32, u32);
-        mov.u32(step, 0);
-        shr.u32(nsteps, kdim, 7);
-        label(stop_);
-        let sdone: pred;
-        setp.ge.u32(sdone, step, nsteps);
-        if sdone {
-            bra(send_);
-        }
-        stage128::<BYPAIR>(xb, db, tb, xq, xd, kdim, step, nt);
+        let (wv, s16, xv): ([u32; 4], u16, [f32; 8]);
+        ld.global.nc.v4.u32((wv[0], wv[1], wv[2], wv[3]), [qa]);
+        ld.global.nc.u16(s16, [sa]);
+        ld.global.nc.v4.f32((xv[0], xv[1], xv[2], xv[3]), [xa]);
+        ld.global.nc.v4.f32((xv[4], xv[5], xv[6], xv[7]), [xa + 16]);
+        // A step waits until every warp has read the tiles, fills them from the registers, waits again, loads the next
+        // step's codes and x into the registers and sums the tiles meanwhile.
+        let k0: u32;
+        mov.u32(k0, 0);
+        label(top);
         bar.sync(0);
-        // the step's 8 weight scales (two groups of 64)
-        let (qa, sa, s0, s1): (u64, u64, u32, u32);
-        mad.wide.u32(qa, step, 64, qrow);
-        mad.wide.u32(sa, step, 8, srow);
-        ld.global.nc.v2.u32((s0, s1), [sa]);
+        // the scales of values 0..15 and 16..31, as moe_nvfp4_d decodes them
+        let (sc, e0, e1): (u32, u32, u32);
+        let (s0, s1): (f32, f32);
+        cvt.u32.u16(sc, s16);
+        shl.b32(e0, sc, 20);
+        and.b32(e0, e0, 0x07F0_0000);
+        shl.b32(e1, sc, 12);
+        and.b32(e1, e1, 0x07F0_0000);
+        mov.b32(s0, e0);
+        mov.b32(s1, e1);
+        mul.rn.f32(s0, s0, f120);
+        mul.rn.f32(s1, s1, f120);
         for j in 0..4 {
-            // chunk j: group j/2 of the step, half j%2: low nibbles values 16h.. of it, high ones 32 + 16h..
-            let (blo, bhi, slo, shi): (u32, u32, f32, f32);
-            if j < 2 {
-                bfe.u32(blo, s0, (j % 2) * 8, 8);
-                bfe.u32(bhi, s0, 16 + (j % 2) * 8, 8);
-            } else {
-                bfe.u32(blo, s1, (j % 2) * 8, 8);
-                bfe.u32(bhi, s1, 16 + (j % 2) * 8, 8);
+            for kk in 0..4 {
+                // word j's codes kk, kk + 4 (values 8 j + kk, 8 j + kk + 4) times 2^-14, as moe_nvfp4_d decodes them,
+                // times their scale: the products are exact
+                let (sh, a, sg, hv): (u32, u32, u32, u32);
+                let (h0, h1): (f16, f16);
+                let (f0, f1): (f32, f32);
+                if kk == 3 {
+                    shr.u32(sh, wv[j], 3);
+                } else {
+                    shl.b32(sh, wv[j], 9 - 4 * kk);
+                }
+                and.b32(a, sh, 0x1E00_1E00);
+                and.b32(sg, sh, 0x1000_1000);
+                mad.lo.u32(hv, sg, 7, a);
+                mov.b32((h0, h1), hv);
+                cvt.f32.f16(f0, h0);
+                cvt.f32.f16(f1, h1);
+                if j < 2 {
+                    mul.rn.f32(f0, f0, s0);
+                    mul.rn.f32(f1, f1, s0);
+                } else {
+                    mul.rn.f32(f0, f0, s1);
+                    mul.rn.f32(f1, f1, s1);
+                }
+                st.shared.f32([wst + (512 * (8 * j + kk))], f0);
+                st.shared.f32([wst + (512 * (8 * j + kk + 4))], f1);
             }
-            ue4m3(slo, blo);
-            ue4m3(shi, bhi);
-            let (w0, w1, w2, w3): (u32, u32, u32, u32);
-            ld.global.nc.v4.u32((w0, w1, w2, w3), [qa + (j * 16)]);
-            let (l0, l1, l2, l3, h0, h1, h2, h3): (u32, u32, u32, u32, u32, u32, u32, u32);
-            fp4x8(l0, h0, w0, pa, pb, na, nbt);
-            fp4x8(l1, h1, w1, pa, pb, na, nbt);
-            fp4x8(l2, h2, w2, pa, pb, na, nbt);
-            fp4x8(l3, h3, w3, pa, pb, na, nbt);
-            for i in 0..8 {
-                let (tk, xa, da): (u32, u32, u32);
-                add.u32(tk, cc, i * 4);
-                mad.lo.u32(xa, tk, 144, xb);
-                let (x0, x1, x2, x3, x4, x5, x6, x7): (u32, u32, u32, u32, u32, u32, u32, u32);
-                ld.shared.v4.u32((x0, x1, x2, x3), [xa + ((j / 2) * 64 + (j % 2) * 16)]);
-                ld.shared.v4.u32((x4, x5, x6, x7), [xa + ((j / 2) * 64 + 32 + (j % 2) * 16)]);
-                let (dl, dh): (u32, u32);
-                mov.u32(dl, 0);
-                mov.u32(dh, 0);
-                dp4a.s32.s32(dl, l0, x0, dl);
-                dp4a.s32.s32(dl, l1, x1, dl);
-                dp4a.s32.s32(dl, l2, x2, dl);
-                dp4a.s32.s32(dl, l3, x3, dl);
-                dp4a.s32.s32(dh, h0, x4, dh);
-                dp4a.s32.s32(dh, h1, x5, dh);
-                dp4a.s32.s32(dh, h2, x6, dh);
-                dp4a.s32.s32(dh, h3, x7, dh);
-                let (xl, xh, fl, fh): (f32, f32, f32, f32);
-                mad.lo.u32(da, tk, 16, db);
-                ld.shared.f32(xl, [da + ((j / 2) * 8)]);
-                ld.shared.f32(xh, [da + ((j / 2) * 8 + 4)]);
-                mul.rn.f32(xl, xl, slo);
-                mul.rn.f32(xh, xh, shi);
-                cvt.rn.f32.s32(fl, dl);
-                cvt.rn.f32.s32(fh, dh);
-                fma.rn.f32(acc[i], fl, xl, acc[i]);
-                fma.rn.f32(acc[i], fh, xh, acc[i]);
-            }
-        }
-        bar.sync(0);
-        add.u32(step, step, 1);
-        bra(stop_);
-        label(send_);
-        let es: f32;
-        ld.global.nc.f32(es, [sca]);
-        store8(acc, cc, nt, tb, y, row, rows, es);
-    }
-
-    /// Prefill on a Q8_0 bank (as moe_q8_d), as moe_nv4_g.
-    #[reqntid(128)]
-    #[instances(0, 1)]
-    pub unsafe extern "ptx-kernel" fn moe_q8_g<const BYPAIR: u32>(
-        bank: *const u8, slot_bytes: u64, groups: *const u32, xq: *const u8, xd: *const f32, y: *mut f32, rows: u32, kdim: u32,
-    ) {
-        let xsh: shared<[u8; 4608], 16>;
-        let dsh: shared<[f32; 128], 16>;
-        let tsh: shared<[u32; 64], 16>;
-        let (xb, db, tb, slot, nt): (u32, u32, u32, u32, u32);
-        mov.u32(xb, xsh);
-        mov.u32(db, dsh);
-        mov.u32(tb, tsh);
-        group_tile(slot, nt, groups, tb);
-        let none: pred;
-        setp.eq.u32(none, nt, 0);
-        if none {
-            ret();
-        }
-        bar.sync(0);
-        let (t, rr, cc, bx, row, rows1, rowc): (u32, u32, u32, u32, u32, u32, u32);
-        mov.u32(t, tid.x);
-        mov.u32(bx, ctaid.x);
-        shr.u32(rr, t, 2);
-        and.b32(cc, t, 3);
-        mad.lo.u32(row, bx, 32, rr);
-        sub.u32(rows1, rows, 1);
-        min.u32(rowc, row, rows1);
-        let (sl, base, qrow, drow): (u64, u64, u64, u64);
-        cvt.u64.u32(sl, slot);
-        mul.lo.u64(sl, sl, slot_bytes);
-        add.u64(base, bank, sl);
-        mad.wide.u32(qrow, rowc, kdim, base);
-        let (qbytes, o): (u32, u32);
-        mul.lo.u32(qbytes, rows, kdim);
-        shr.u32(o, kdim, 4);
-        mad.lo.u32(o, rowc, o, qbytes);
-        cvt.u64.u32(drow, o);
-        add.u64(drow, drow, base);
-        let acc: [f32; 8];
-        for i in 0..8 {
-            mov.f32(acc[i], 0.0);
-        }
-        let (step, nsteps): (u32, u32);
-        mov.u32(step, 0);
-        shr.u32(nsteps, kdim, 7);
-        label(stop_);
-        let sdone: pred;
-        setp.ge.u32(sdone, step, nsteps);
-        if sdone {
-            bra(send_);
-        }
-        stage128::<BYPAIR>(xb, db, tb, xq, xd, kdim, step, nt);
-        bar.sync(0);
-        // the step's 4 f16 weight scales
-        let (qa, sa): (u64, u64);
-        mad.wide.u32(qa, step, 128, qrow);
-        mad.wide.u32(sa, step, 8, drow);
-        let dws: [f32; 4];
-        for b in 0..4 {
-            let hf: f16;
-            ld.global.nc.b16(hf, [sa + (b * 2)]);
-            cvt.f32.f16(dws[b], hf);
         }
         for j in 0..8 {
-            let (w0, w1, w2, w3): (u32, u32, u32, u32);
-            ld.global.nc.v4.u32((w0, w1, w2, w3), [qa + (j * 16)]);
-            for i in 0..8 {
-                let (tk, xa, da): (u32, u32, u32);
-                add.u32(tk, cc, i * 4);
-                mad.lo.u32(xa, tk, 144, xb);
-                let (x0, x1, x2, x3): (u32, u32, u32, u32);
-                ld.shared.v4.u32((x0, x1, x2, x3), [xa + (j * 16)]);
-                let isum: u32;
-                mov.u32(isum, 0);
-                dp4a.s32.s32(isum, w0, x0, isum);
-                dp4a.s32.s32(isum, w1, x1, isum);
-                dp4a.s32.s32(isum, w2, x2, isum);
-                dp4a.s32.s32(isum, w3, x3, isum);
-                let (dx, f): (f32, f32);
-                mad.lo.u32(da, tk, 16, db);
-                ld.shared.f32(dx, [da + ((j / 2) * 4)]);
-                mul.rn.f32(dx, dx, dws[j / 2]);
-                cvt.rn.f32.s32(f, isum);
-                fma.rn.f32(acc[i], f, dx, acc[i]);
-            }
+            st.shared.f32([xst + (128 * j)], xv[j]);
         }
         bar.sync(0);
-        add.u32(step, step, 1);
-        bra(stop_);
-        label(send_);
-        let one: f32;
-        mov.f32(one, 1.0);
-        store8(acc, cc, nt, tb, y, row, rows, one);
+        let more: pred;
+        add.u32(k0, k0, 32);
+        setp.lt.u32(more, k0, k);
+        if more {
+            add.u64(qa, qa, 16);
+            add.u64(sa, sa, 2);
+            add.u64(xa, xa, 128);
+            ld.global.nc.v4.u32((wv[0], wv[1], wv[2], wv[3]), [qa]);
+            ld.global.nc.u16(s16, [sa]);
+            ld.global.nc.v4.f32((xv[0], xv[1], xv[2], xv[3]), [xa]);
+            ld.global.nc.v4.f32((xv[4], xv[5], xv[6], xv[7]), [xa + 16]);
+        }
+        for c in 0..32 {
+            let a: [f32; 8];
+            let b: [f32; 4];
+            ld.shared.v4.f32((a[0], a[1], a[2], a[3]), [ard + (512 * c)]);
+            ld.shared.v4.f32((a[4], a[5], a[6], a[7]), [ard + (512 * c + 256)]);
+            ld.shared.v4.f32((b[0], b[1], b[2], b[3]), [brd + (128 * c)]);
+            for i in 0..8 {
+                for j in 0..4 {
+                    fma.rn.f32(acc[4 * i + j], a[i], b[j], acc[4 * i + j]);
+                }
+            }
+        }
+        if more {
+            bra(top);
+        }
+        // the expert's factor, as moe_nvfp4_d's: amax / outer_scale_denominator, times the values' 2^14
+        let (aa, am, den, es): (u64, f32, f32, f32);
+        mad.wide.u32(aa, e, 4, amax);
+        ld.global.nc.f32(am, [aa]);
+        ld.global.nc.f32(den, [denom]);
+        div.rn.f32(es, am, den);
+        mul.rn.f32(es, es, 16384.0);
+        // y[t0 + 4 h + j][r0 + 4 g + 64 p + i] for i in 0..4: one store of 4 rows
+        let (rb, tb): (u32, u32);
+        mad.lo.u32(rb, g, 4, r0);
+        mad.lo.u32(tb, h, 4, t0);
+        for p in 0..2 {
+            let r: u32;
+            let rin: pred;
+            add.u32(r, rb, 64 * p);
+            setp.lt.u32(rin, r, rows);
+            for j in 0..4 {
+                let (tk, yo): (u32, u32);
+                let ya: u64;
+                let ok: pred;
+                let v: [f32; 4];
+                add.u32(tk, tb, j);
+                setp.lt.and.u32(ok, tk, m, rin);
+                mad.lo.u32(yo, tk, rows, r);
+                mad.wide.u32(ya, yo, 4, yz);
+                for i in 0..4 {
+                    mul.rn.f32(v[i], acc[4 * (4 * p + i) + j], es);
+                }
+                if ok {
+                    st.global.v4.f32([ya], (v[0], v[1], v[2], v[3]));
+                }
+            }
+        }
     }
 
-    /// Router logits: logits[e] = W[e] . x, W [n_expert][n] f32 (GGUF layout); a warp per expert.
-    #[maxntid(256)]
-    pub unsafe extern "ptx-kernel" fn router_logits(w: *const f32, x: *const f32, logits: *mut f32, n_expert: u32, n: u32) {
-        let (lane, e): (u32, u32);
-        warp_row(lane, e);
-        let past: pred;
-        setp.ge.u32(past, e, n_expert);
-        if past {
+    /// moe_nvfp4_g for MXFP8 experts: y[t] = W x[t] for the m tokens of each tab entry's expert (grid.z), tab[4 z ..]
+    /// holding w, x, y, then m and the expert as two u32s. w is the expert's slot, read as moe_mxfp8_d reads one: the
+    /// e4m3 values [rows][k], then the UE8M0 scales [rows][k/32]. A block takes 128 rows by 32 tokens as moe_nvfp4_g's
+    /// does, c going by 32 (a scale of each row): W's [128][32], decoded to f32 times their scale (exactly), and x's
+    /// [32][32] wait in shared memory, and each thread sums the same rows and tokens over c in order. k is a multiple
+    /// of 32, rows a multiple of 4.
+    #[reqntid(128)]
+    pub unsafe extern "ptx-kernel" fn moe_mxfp8_g(tab: *const u64, rows: u32, k: u32) {
+        let ws: shared<[f32; 4096], 16>;
+        let xs: shared<[f32; 1024], 16>;
+        let (z, zi, t0, m): (u32, u32, u32, u32);
+        let ta: u64;
+        mov.u32(z, ctaid.z);
+        shl.b32(zi, z, 2);
+        mad.wide.u32(ta, zi, 8, tab);
+        ld.global.u32(m, [ta + 24]);
+        mov.u32(t0, ctaid.y);
+        shl.b32(t0, t0, 5);
+        let idle: pred;
+        setp.ge.u32(idle, t0, m);
+        if idle {
             ret();
         }
-        let (ro, c, tk, xo): (u32, u32, u32, u32);
-        mul.lo.u32(ro, e, n);
-        shl.b32(c, lane, 2);
-        mov.u32(tk, ctaid.y);
-        mul.lo.u32(xo, tk, n);
-        let xt: u64;
-        mad.wide.u32(xt, xo, 4, x);
-        let acc: f32;
-        mov.f32(acc, 0.0);
-        label(top);
-        let done: pred;
-        setp.ge.u32(done, c, n);
-        if done {
-            bra(end);
+        let (wz, xz, yz): (u64, u64, u64);
+        ld.global.u64(wz, [ta]);
+        ld.global.u64(xz, [ta + 8]);
+        ld.global.u64(yz, [ta + 16]);
+        let (t, tl, tw, r0, lim): (u32, u32, u32, u32, u32);
+        mov.u32(t, tid.x);
+        and.b32(tl, t, 31);
+        shr.u32(tw, t, 5);
+        mov.u32(r0, ctaid.x);
+        shl.b32(r0, r0, 7);
+        // the tiles' loads: thread t brings the 32 values (32 bytes) and the scale of row t, and 8 floats of token
+        // t % 32 (8 (t / 32) ..)
+        let (wr, xt, xc, qbytes, sk, o): (u32, u32, u32, u32, u32, u32);
+        add.u32(wr, r0, t);
+        sub.u32(lim, rows, 1);
+        min.u32(wr, wr, lim);
+        add.u32(xt, t0, tl);
+        sub.u32(lim, m, 1);
+        min.u32(xt, xt, lim);
+        shl.b32(xc, tw, 3);
+        mul.lo.u32(qbytes, rows, k);
+        shr.u32(sk, k, 5);
+        let (qa, sa, xa): (u64, u64, u64);
+        mad.wide.u32(qa, wr, k, wz);
+        mad.lo.u32(o, wr, sk, qbytes);
+        cvt.u64.u32(sa, o);
+        add.u64(sa, sa, wz);
+        mad.lo.u32(o, xt, k, xc);
+        mad.wide.u32(xa, o, 4, xz);
+        // the tiles in shared memory, as moe_nvfp4_g's
+        let (wsb, xsb, wst, xst): (u32, u32, u32, u32);
+        mov.u32(wsb, ws);
+        mov.u32(xsb, xs);
+        mad.lo.u32(wst, t, 4, wsb);
+        mad.lo.u32(xst, tl, 4, xsb);
+        mad.lo.u32(xst, tw, 1024, xst);
+        let (g, h, q, ard, brd): (u32, u32, u32, u32, u32);
+        and.b32(g, tl, 7);
+        and.b32(q, tw, 1);
+        mad.lo.u32(g, q, 8, g);
+        shr.u32(h, tl, 3);
+        shr.u32(q, tw, 1);
+        mad.lo.u32(h, q, 4, h);
+        mad.lo.u32(ard, g, 16, wsb);
+        mad.lo.u32(brd, h, 16, xsb);
+        let zero: u32;
+        mov.u32(zero, 0);
+        let acc: [f32; 32];
+        for i in 0..32 {
+            mov.f32(acc[i], 0.0);
         }
-        let i: u32;
-        let (wa, xa): (u64, u64);
-        add.u32(i, ro, c);
-        mad.wide.u32(wa, i, 4, w);
-        mad.wide.u32(xa, c, 4, xt);
-        let (w0, w1, w2, w3, x0, x1, x2, x3): (f32, f32, f32, f32, f32, f32, f32, f32);
-        ld.global.nc.v4.f32((w0, w1, w2, w3), [wa]);
-        ld.global.v4.f32((x0, x1, x2, x3), [xa]);
-        fma.rn.f32(acc, w0, x0, acc);
-        fma.rn.f32(acc, w1, x1, acc);
-        fma.rn.f32(acc, w2, x2, acc);
-        fma.rn.f32(acc, w3, x3, acc);
-        add.u32(c, c, 128);
-        bra(top);
-        label(end);
-        warp_sum(acc);
-        let first: pred;
-        setp.eq.u32(first, lane, 0);
-        if first {
-            let (la, lo): (u64, u32);
-            mad.lo.u32(lo, tk, n_expert, e);
-            mad.wide.u32(la, lo, 4, logits);
-            st.global.f32([la], acc);
+        let (wv, s8, xv): ([u32; 8], u16, [f32; 8]);
+        ld.global.nc.v4.u32((wv[0], wv[1], wv[2], wv[3]), [qa]);
+        ld.global.nc.v4.u32((wv[4], wv[5], wv[6], wv[7]), [qa + 16]);
+        ld.global.nc.u8(s8, [sa]);
+        ld.global.nc.v4.f32((xv[0], xv[1], xv[2], xv[3]), [xa]);
+        ld.global.nc.v4.f32((xv[4], xv[5], xv[6], xv[7]), [xa + 16]);
+        // A step waits until every warp has read the tiles, fills them from the registers, waits again, loads the next
+        // step's values and x into the registers and sums the tiles meanwhile.
+        let k0: u32;
+        mov.u32(k0, 0);
+        label(top);
+        bar.sync(0);
+        // the scale 2^(s-127) times the 2^8 of the f16 values, as moe_mxfp8_d's: the f32 of exponent s + 8
+        let (sb, sf): (u32, f32);
+        cvt.u32.u16(sb, s8);
+        add.u32(sb, sb, 8);
+        shl.b32(sb, sb, 23);
+        mov.b32(sf, sb);
+        for j in 0..8 {
+            for p in 0..2 {
+                // word j's bytes 2 p, 2 p + 1 (values 4 j + 2 p, + 1) as f16, as fma_e4m3x4 decodes them, times the
+                // scale: the products are exact
+                let (u, mm, sg, hv): (u32, u32, u32, u32);
+                let (h0, h1): (f16, f16);
+                let (f0, f1): (f32, f32);
+                if p == 0 {
+                    prmt.b32(u, wv[j], zero, 0x1404);
+                } else {
+                    prmt.b32(u, wv[j], zero, 0x3424);
+                }
+                shr.u32(mm, u, 1);
+                and.b32(mm, mm, 0x3F80_3F80);
+                and.b32(sg, u, 0x8000_8000);
+                or.b32(hv, mm, sg);
+                mov.b32((h0, h1), hv);
+                cvt.f32.f16(f0, h0);
+                cvt.f32.f16(f1, h1);
+                mul.rn.f32(f0, f0, sf);
+                mul.rn.f32(f1, f1, sf);
+                st.shared.f32([wst + (512 * (4 * j + 2 * p))], f0);
+                st.shared.f32([wst + (512 * (4 * j + 2 * p + 1))], f1);
+            }
+        }
+        for j in 0..8 {
+            st.shared.f32([xst + (128 * j)], xv[j]);
+        }
+        bar.sync(0);
+        let more: pred;
+        add.u32(k0, k0, 32);
+        setp.lt.u32(more, k0, k);
+        if more {
+            add.u64(qa, qa, 32);
+            add.u64(sa, sa, 1);
+            add.u64(xa, xa, 128);
+            ld.global.nc.v4.u32((wv[0], wv[1], wv[2], wv[3]), [qa]);
+            ld.global.nc.v4.u32((wv[4], wv[5], wv[6], wv[7]), [qa + 16]);
+            ld.global.nc.u8(s8, [sa]);
+            ld.global.nc.v4.f32((xv[0], xv[1], xv[2], xv[3]), [xa]);
+            ld.global.nc.v4.f32((xv[4], xv[5], xv[6], xv[7]), [xa + 16]);
+        }
+        for c in 0..32 {
+            let a: [f32; 8];
+            let b: [f32; 4];
+            ld.shared.v4.f32((a[0], a[1], a[2], a[3]), [ard + (512 * c)]);
+            ld.shared.v4.f32((a[4], a[5], a[6], a[7]), [ard + (512 * c + 256)]);
+            ld.shared.v4.f32((b[0], b[1], b[2], b[3]), [brd + (128 * c)]);
+            for i in 0..8 {
+                for j in 0..4 {
+                    fma.rn.f32(acc[4 * i + j], a[i], b[j], acc[4 * i + j]);
+                }
+            }
+        }
+        if more {
+            bra(top);
+        }
+        // y[t0 + 4 h + j][r0 + 4 g + 64 p + i] for i in 0..4: one store of 4 rows
+        let (rb, tb): (u32, u32);
+        mad.lo.u32(rb, g, 4, r0);
+        mad.lo.u32(tb, h, 4, t0);
+        for p in 0..2 {
+            let r: u32;
+            let rin: pred;
+            add.u32(r, rb, 64 * p);
+            setp.lt.u32(rin, r, rows);
+            for j in 0..4 {
+                let (tk, yo): (u32, u32);
+                let ya: u64;
+                let ok: pred;
+                add.u32(tk, tb, j);
+                setp.lt.and.u32(ok, tk, m, rin);
+                mad.lo.u32(yo, tk, rows, r);
+                mad.wide.u32(ya, yo, 4, yz);
+                if ok {
+                    st.global.v4.f32([ya], (acc[16 * p + j], acc[16 * p + 4 + j], acc[16 * p + 8 + j], acc[16 * p + 12 + j]));
+                }
+            }
         }
     }
 
     // ---------------------------------------------------------------- split-K decode attention
 
-    /// The number of keys of the token at params[0], and its position modulo the ring.
-    fn n_keys(nk: u32, pmod: u32, pos: u32, ring: u32) {
-        add.u32(nk, pos, 1);
-        mov.u32(pmod, pos);
-        let is_ring: pred;
-        setp.ne.u32(is_ring, ring, 0);
-        if is_ring {
-            min.u32(nk, nk, ring);
-            rem.u32(pmod, pos, ring);
-        }
-    }
-
-    /// One chunk of 256 keys of one kv head, for its 3 query heads: scores (scale q.k + relative bias - sink), their max m
-    /// and sum l of exp(s - m), and acc = sum exp(s - m) v. Partials go to pm/pl [kvh][maxs][3] and pacc [kvh][maxs][3][128].
-    /// grid = (8 kv heads, maxs chunks); chunks past the keys of the token do nothing.
+    /// One chunk of 2^cs keys (cs at most 8) of one kv head, for its 3 query heads: scores (scale q.k + relative bias -
+    /// sink), their max m and sum l of exp(s - m), and acc = sum exp(s - m) v. Partials go to pm/pl [kvh][maxs][3] and
+    /// pacc [kvh][maxs][3][128]. grid = (8 kv heads, chunks); chunks past the keys of the token do nothing. Only rows
+    /// below `vram` count: the chunks start at the distance of row vram - 1 if the token is past it (the CPU takes the
+    /// distances before, see attn_reduce).
     #[reqntid(128)]
     pub unsafe extern "ptx-kernel" fn attn_part(
-        q: *const f32, r: *const f32, sink: *const f32, rb: *const f32, kc: *const u16, vc: *const u16, pm: *mut f32, pl: *mut f32,
-        pacc: *mut f32, params: *const u32, ring: u32, extent: u32, scale: f32, maxs: u32, window: u32,
+        q: *const f32, r: *const f32, sink: *const f32, rb: *const u16, kc: *const u16, vc: *const u16, pm: *mut f32, pl: *mut f32,
+        pacc: *mut f32, params: *const u32, ring: u32, extent: u32, scale: f32, maxs: u32, window: u32, cs: u32, vram: u32,
     ) {
         let qsh: shared<[f32; 384], 16>;
         let rsh: shared<[f32; 48], 16>;
         let ksh: shared<[f32; 4], 16>;
         let sc: shared<[f32; 768], 16>;
+        let red: shared<[f32; 1536], 16>;
         let (kvh, sp, t): (u32, u32, u32);
         mov.u32(kvh, ctaid.x);
         mov.u32(sp, ctaid.y);
         mov.u32(t, tid.x);
-        let (pos, nk, pmod, start, cnt): (u32, u32, u32, u32, u32);
+        let (pos, nk, pmod, start, cnt, csz, d0): (u32, u32, u32, u32, u32, u32, u32);
         ld.global.u32(pos, [params]);
         add.u32(nk, pos, 1);
         min.u32(nk, nk, window);
-        mov.u32(pmod, 0);
-        shl.b32(start, sp, 8);
+        // distances below d0 are rows past the first `vram`, in host memory: the CPU's
+        max.u32(d0, nk, vram);
+        sub.u32(d0, d0, vram);
+        shl.b32(start, sp, cs);
+        add.u32(start, start, d0);
         let none: pred;
         setp.ge.u32(none, start, nk);
         if none {
             ret();
         }
         sub.u32(cnt, nk, start);
-        min.u32(cnt, cnt, 256);
+        mov.u32(csz, 1);
+        shl.b32(csz, csz, cs);
+        min.u32(cnt, cnt, csz);
+        // the row of the token's own position
+        mov.u32(pmod, pos);
+        let is_ring: pred;
+        setp.ne.u32(is_ring, ring, 0);
+        if is_ring {
+            rem.u32(pmod, pos, ring);
+        }
         let (qb, rbs, kb, sb): (u32, u32, u32, u32);
         mov.u32(qb, qsh);
         mov.u32(rbs, rsh);
@@ -2593,156 +2237,88 @@ pub mod gpu {
         label(sm_skip);
         bar.sync(0);
 
-        // acc: a dimension per thread
-        let (a0, a1, a2): (f32, f32, f32);
-        mov.f32(a0, 0.0);
-        mov.f32(a1, 0.0);
-        mov.f32(a2, 0.0);
-        let jj2: u32;
-        mov.u32(jj2, 0);
+        // acc: warp w takes keys w, w + 4, .. and lane l dimensions 4 l .. 4 l + 4 (8 bytes of each row), 8 keys at a time
+        // so that 8 loads are in flight; past cnt a key repeats key cnt - 1 with p = 0. The row of distance d is pmod - d,
+        // plus ring where that is below 0 (d < window <= ring).
+        let acc: [f32; 12]; // [head][4 dimensions]
+        for i in 0..12 {
+            mov.f32(acc[i], 0.0);
+        }
+        let (jb, last): (u32, u32);
+        mov.u32(jb, w);
+        sub.u32(last, cnt, 1);
         label(vtop);
         let vdone: pred;
-        setp.ge.u32(vdone, jj2, cnt);
+        setp.ge.u32(vdone, jb, cnt);
         if vdone {
             bra(vend);
         }
-        let (dist, kp, j, vo, pa): (u32, u32, u32, u32, u32);
-        add.u32(dist, start, jj2);
-        sub.u32(kp, pos, dist);
-        mov.u32(j, kp);
-        let is_ring: pred;
-        setp.ne.u32(is_ring, ring, 0);
-        if is_ring {
-            rem.u32(j, kp, ring);
+        let vh: [f16; 32];
+        let pp: [f32; 24];
+        for u in 0..8 {
+            let (jj, jc, dist, row, rw, vo, pa): (u32, u32, u32, u32, u32, u32, u32);
+            let (ok, wrap): (pred, pred);
+            let va: u64;
+            add.u32(jj, jb, u * 4);
+            setp.lt.u32(ok, jj, cnt);
+            selp.b32(jc, jj, last, ok);
+            add.u32(dist, start, jc);
+            sub.u32(row, pmod, dist);
+            setp.gt.u32(wrap, dist, pmod);
+            add.u32(rw, row, ring);
+            selp.b32(row, rw, row, wrap);
+            mad.lo.u32(vo, row, 8, kvh);
+            shl.b32(vo, vo, 7);
+            mad.lo.u32(vo, lane, 4, vo);
+            mad.wide.u32(va, vo, 2, vc);
+            ld.global.nc.v4.b16((vh[4 * u], vh[4 * u + 1], vh[4 * u + 2], vh[4 * u + 3]), [va]);
+            mad.lo.u32(pa, jc, 4, sb);
+            for h in 0..3 {
+                ld.shared.f32(pp[3 * u + h], [pa + (h * 1024)]);
+                selp.f32(pp[3 * u + h], pp[3 * u + h], 0.0, ok);
+            }
         }
-        mad.lo.u32(vo, j, 8, kvh);
-        shl.b32(vo, vo, 7);
-        add.u32(vo, vo, t);
-        let va: u64;
-        mad.wide.u32(va, vo, 2, vc);
-        let vh: f16;
-        let (vf, p0, p1, p2): (f32, f32, f32, f32);
-        ld.global.nc.b16(vh, [va]);
-        cvt.f32.f16(vf, vh);
-        mad.lo.u32(pa, jj2, 4, sb);
-        ld.shared.f32(p0, [pa]);
-        ld.shared.f32(p1, [pa + 1024]);
-        ld.shared.f32(p2, [pa + 2048]);
-        fma.rn.f32(a0, p0, vf, a0);
-        fma.rn.f32(a1, p1, vf, a1);
-        fma.rn.f32(a2, p2, vf, a2);
-        add.u32(jj2, jj2, 1);
+        for u in 0..8 {
+            for i in 0..4 {
+                let vf: f32;
+                cvt.f32.f16(vf, vh[4 * u + i]);
+                for h in 0..3 {
+                    fma.rn.f32(acc[4 * h + i], pp[3 * u + h], vf, acc[4 * h + i]);
+                }
+            }
+        }
+        add.u32(jb, jb, 32);
         bra(vtop);
         label(vend);
+        // the 4 warps' sums to shared memory, [warp][head][128], then thread t adds up dimension t of each head
+        let (rdb, ra, rt): (u32, u32, u32);
+        mov.u32(rdb, red);
+        mad.lo.u32(ra, w, 1536, rdb);
+        mad.lo.u32(ra, lane, 16, ra);
+        for h in 0..3 {
+            st.shared.v4.f32([ra + (h * 512)], (acc[4 * h], acc[4 * h + 1], acc[4 * h + 2], acc[4 * h + 3]));
+        }
+        bar.sync(0);
+        mad.lo.u32(rt, t, 4, rdb);
+        let a: [f32; 3];
+        for h in 0..3 {
+            let (x1, x2, x3): (f32, f32, f32);
+            ld.shared.f32(a[h], [rt + (h * 512)]);
+            ld.shared.f32(x1, [rt + (1536 + h * 512)]);
+            ld.shared.f32(x2, [rt + (3072 + h * 512)]);
+            ld.shared.f32(x3, [rt + (4608 + h * 512)]);
+            add.rn.f32(a[h], a[h], x1);
+            add.rn.f32(a[h], a[h], x2);
+            add.rn.f32(a[h], a[h], x3);
+        }
         let (po, pao): (u32, u64);
         mad.lo.u32(po, kvh, maxs, sp);
         mul.lo.u32(po, po, 384);
         add.u32(po, po, t);
         mad.wide.u32(pao, po, 4, pacc);
-        st.global.f32([pao], a0);
-        st.global.f32([pao + 512], a1);
-        st.global.f32([pao + 1024], a2);
-    }
-
-    /// The scores of key `start + jj` for the 3 heads in shared q, into shared sc[h][jj].
-    fn score_key(start: u32, jj: u32, kvh: u32, pos: u32, pmod: u32, ring: u32, extent: u32, kc: u64, rb: u64, qb: u32, rbs: u32, kb: u32, sb: u32) {
-        let (j, ko): (u32, u32);
-        add.u32(j, start, jj);
-        mad.lo.u32(ko, j, 8, kvh);
-        shl.b32(ko, ko, 7);
-        let ka: u64;
-        mad.wide.u32(ka, ko, 2, kc);
-        let (s0, s1, s2): (f32, f32, f32);
-        mov.f32(s0, 0.0);
-        mov.f32(s1, 0.0);
-        mov.f32(s2, 0.0);
-        for c in 0..32 {
-            let (h0, h1, h2, h3): (f16, f16, f16, f16);
-            ld.global.nc.v4.b16((h0, h1, h2, h3), [ka + (c * 8)]);
-            let (k0, k1, k2, k3): (f32, f32, f32, f32);
-            cvt.f32.f16(k0, h0);
-            cvt.f32.f16(k1, h1);
-            cvt.f32.f16(k2, h2);
-            cvt.f32.f16(k3, h3);
-            for hh in 0..3 {
-                let (q0, q1, q2, q3): (f32, f32, f32, f32);
-                ld.shared.v4.f32((q0, q1, q2, q3), [qb + (hh * 512 + c * 16)]);
-                if hh == 0 {
-                    fma.rn.f32(s0, q0, k0, s0);
-                    fma.rn.f32(s0, q1, k1, s0);
-                    fma.rn.f32(s0, q2, k2, s0);
-                    fma.rn.f32(s0, q3, k3, s0);
-                }
-                if hh == 1 {
-                    fma.rn.f32(s1, q0, k0, s1);
-                    fma.rn.f32(s1, q1, k1, s1);
-                    fma.rn.f32(s1, q2, k2, s1);
-                    fma.rn.f32(s1, q3, k3, s1);
-                }
-                if hh == 2 {
-                    fma.rn.f32(s2, q0, k0, s2);
-                    fma.rn.f32(s2, q1, k1, s2);
-                    fma.rn.f32(s2, q2, k2, s2);
-                    fma.rn.f32(s2, q3, k3, s2);
-                }
-            }
-        }
-        // distance of key j and its relative bias
-        let dist: u32;
-        sub.u32(dist, pos, j);
-        let is_ring: pred;
-        setp.ne.u32(is_ring, ring, 0);
-        if is_ring {
-            add.u32(dist, pmod, ring);
-            sub.u32(dist, dist, j);
-            rem.u32(dist, dist, ring);
-        }
-        let inb: pred;
-        setp.lt.u32(inb, dist, extent);
-        if inb {
-            let bo: u32;
-            let ba: u64;
-            shl.b32(bo, dist, 4);
-            mad.wide.u32(ba, bo, 4, rb);
-            for c in 0..4 {
-                let (b0, b1, b2, b3): (f32, f32, f32, f32);
-                ld.global.nc.v4.f32((b0, b1, b2, b3), [ba + (c * 16)]);
-                for hh in 0..3 {
-                    let (r0, r1, r2, r3): (f32, f32, f32, f32);
-                    ld.shared.v4.f32((r0, r1, r2, r3), [rbs + (hh * 64 + c * 16)]);
-                    if hh == 0 {
-                        fma.rn.f32(s0, b0, r0, s0);
-                        fma.rn.f32(s0, b1, r1, s0);
-                        fma.rn.f32(s0, b2, r2, s0);
-                        fma.rn.f32(s0, b3, r3, s0);
-                    }
-                    if hh == 1 {
-                        fma.rn.f32(s1, b0, r0, s1);
-                        fma.rn.f32(s1, b1, r1, s1);
-                        fma.rn.f32(s1, b2, r2, s1);
-                        fma.rn.f32(s1, b3, r3, s1);
-                    }
-                    if hh == 2 {
-                        fma.rn.f32(s2, b0, r0, s2);
-                        fma.rn.f32(s2, b1, r1, s2);
-                        fma.rn.f32(s2, b2, r2, s2);
-                        fma.rn.f32(s2, b3, r3, s2);
-                    }
-                }
-            }
-        }
-        let (k0s, k1s, k2s): (f32, f32, f32);
-        ld.shared.f32(k0s, [kb]);
-        ld.shared.f32(k1s, [kb + 4]);
-        ld.shared.f32(k2s, [kb + 8]);
-        sub.rn.f32(s0, s0, k0s);
-        sub.rn.f32(s1, s1, k1s);
-        sub.rn.f32(s2, s2, k2s);
-        let sa: u32;
-        mad.lo.u32(sa, jj, 4, sb);
-        st.shared.f32([sa], s0);
-        st.shared.f32([sa + 1024], s1);
-        st.shared.f32([sa + 2048], s2);
+        st.global.f32([pao], a[0]);
+        st.global.f32([pao + 512], a[1]);
+        st.global.f32([pao + 1024], a[2]);
     }
 
     /// Warp `h`: the max m of the cnt scores of head h, p = exp(s - m) in place, and l = sum p; stores m and l.
@@ -2800,23 +2376,54 @@ pub mod gpu {
         }
     }
 
-    /// Combines the chunks of attn_part and the zero sink logit: out[h][d], a block per query head, a thread per dimension.
+    /// Combines the chunks of 2^cs keys of attn_part, the CPU's partial of the rows past the first `vram` if the token
+    /// is past them (cpu [24][130]: m, l, acc[128] of each head), and the zero sink logit: out[h][d], a block per query
+    /// head, a thread per dimension.
     #[reqntid(128)]
-    pub unsafe extern "ptx-kernel" fn attn_reduce(pm: *const f32, pl: *const f32, pacc: *const f32, out: *mut f32, params: *const u32, window: u32, maxs: u32) {
+    pub unsafe extern "ptx-kernel" fn attn_reduce(
+        pm: *const f32, pl: *const f32, pacc: *const f32, out: *mut f32, params: *const u32, window: u32, maxs: u32, cs: u32, cpu: *const f32, vram: u32,
+    ) {
         let (h, t, kvh, hh): (u32, u32, u32, u32);
         mov.u32(h, ctaid.x);
         mov.u32(t, tid.x);
         div.u32(kvh, h, 3);
         rem.u32(hh, h, 3);
-        let (pos, nk, pmod, ns): (u32, u32, u32, u32);
+        let (pos, nk, pmod, ns, d0): (u32, u32, u32, u32, u32);
         ld.global.u32(pos, [params]);
         add.u32(nk, pos, 1);
         min.u32(nk, nk, window);
+        max.u32(d0, nk, vram);
+        sub.u32(d0, d0, vram);
         mov.u32(pmod, 0);
-        add.u32(ns, nk, 255);
-        shr.u32(ns, ns, 8);
+        mov.u32(ns, 1);
+        shl.b32(ns, ns, cs);
+        sub.u32(ns, ns, 1);
+        add.u32(ns, ns, nk);
+        sub.u32(ns, ns, d0);
+        shr.u32(ns, ns, cs);
+        let has_cpu: pred;
+        setp.ne.u32(has_cpu, d0, 0);
+        let (cm, cl, ca): (f32, f32, f32);
+        mov.f32(cm, 0.0);
+        mov.f32(cl, 0.0);
+        mov.f32(ca, 0.0);
+        if has_cpu {
+            let (ci, ct): (u32, u32);
+            let (cma, caa): (u64, u64);
+            mul.lo.u32(ci, h, 130);
+            mad.wide.u32(cma, ci, 4, cpu);
+            ld.volatile.global.f32(cm, [cma]);
+            ld.volatile.global.f32(cl, [cma + 4]);
+            add.u32(ct, ci, 2);
+            add.u32(ct, ct, t);
+            mad.wide.u32(caa, ct, 4, cpu);
+            ld.volatile.global.f32(ca, [caa]);
+        }
         let (mm, sp): (f32, u32);
         mov.f32(mm, 0.0);
+        if has_cpu {
+            max.f32(mm, mm, cm);
+        }
         mov.u32(sp, 0);
         label(mt);
         let md: pred;
@@ -2839,6 +2446,13 @@ pub mod gpu {
         sub.rn.f32(ll, 0.0, mm);
         exp(ll, ll);
         mov.f32(acc, 0.0);
+        if has_cpu {
+            let ce: f32;
+            sub.rn.f32(ce, cm, mm);
+            exp(ce, ce);
+            fma.rn.f32(ll, cl, ce, ll);
+            fma.rn.f32(acc, ca, ce, acc);
+        }
         mov.u32(sp, 0);
         label(at);
         let ad: pred;
@@ -2974,156 +2588,12 @@ pub mod gpu {
 
     // ================================================================ batched (prefill) kernels
 
-    /// Y[t][r] = W x[t] for up to 32 tokens per tile (grid.y walks token tiles): W repacked Q8_0 [rows][k], x q8_1
-    /// [ntok][k]. A tile is 32 rows x 32 tokens; thread (rr, cc) takes row rr and tokens cc, cc + 4, .., cc + 28.
-    #[reqntid(128)]
-    pub unsafe extern "ptx-kernel" fn gemm_q8d_t(qs: *const u8, dw: *const u16, xq: *const u8, xd: *const f32, y: *mut f32, rows: u32, k: u32, ntok: u32, y_stride: u32) {
-        let xsh: shared<[u8; 8704], 16>; // 32 tokens x 272 bytes (256 + pad)
-        let dsh: shared<[f32; 256], 16>; // 32 tokens x 8 blocks
-        let (t, rr, cc, bx, by, row, rowc, t0): (u32, u32, u32, u32, u32, u32, u32, u32);
-        mov.u32(t, tid.x);
-        shr.u32(rr, t, 2);
-        and.b32(cc, t, 3);
-        mov.u32(bx, ctaid.x);
-        mov.u32(by, ctaid.y);
-        mad.lo.u32(row, bx, 32, rr);
-        shl.b32(t0, by, 5);
-        let rows1: u32;
-        sub.u32(rows1, rows, 1);
-        min.u32(rowc, row, rows1);
-        let (xb, db, nb): (u32, u32, u32);
-        mov.u32(xb, xsh);
-        mov.u32(db, dsh);
-        shr.u32(nb, k, 5);
-        let acc: [f32; 8];
-        for i in 0..8 {
-            mov.f32(acc[i], 0.0);
-        }
-        let (rowq, rowd): (u32, u32);
-        mul.lo.u32(rowq, rowc, k);
-        mul.lo.u32(rowd, rowc, nb);
-        let kc: u32;
-        mov.u32(kc, 0);
-        label(ktop);
-        let kdone: pred;
-        setp.ge.u32(kdone, kc, k);
-        if kdone {
-            bra(kend);
-        }
-        // stage 256 bytes of x for 32 tokens: thread t copies words t, t + 128, .. (2048 words)
-        for w8 in 0..16 {
-            let (wi, tok, wo, gt, src, dst): (u32, u32, u32, u32, u32, u32);
-            add.u32(wi, t, w8 * 128);
-            shr.u32(tok, wi, 6);
-            and.b32(wo, wi, 63);
-            add.u32(gt, t0, tok);
-            let v: u32;
-            mov.u32(v, 0);
-            let ok: pred;
-            setp.lt.u32(ok, gt, ntok);
-            mad.lo.u32(src, gt, k, kc);
-            mad.lo.u32(src, wo, 4, src);
-            let sa: u64;
-            mad.wide.u32(sa, src, 1, xq);
-            if ok {
-                ld.global.u32(v, [sa]);
-            }
-            mad.lo.u32(dst, tok, 272, xb);
-            mad.lo.u32(dst, wo, 4, dst);
-            st.shared.u32([dst], v);
-        }
-        for w2 in 0..2 {
-            let (wi, tok, bo, gt, src, dst): (u32, u32, u32, u32, u32, u32);
-            add.u32(wi, t, w2 * 128);
-            shr.u32(tok, wi, 3);
-            and.b32(bo, wi, 7);
-            add.u32(gt, t0, tok);
-            let v: f32;
-            mov.f32(v, 0.0);
-            let ok: pred;
-            setp.lt.u32(ok, gt, ntok);
-            shr.u32(src, kc, 5);
-            add.u32(src, src, bo);
-            mad.lo.u32(src, gt, nb, src);
-            let sa: u64;
-            mad.wide.u32(sa, src, 4, xd);
-            if ok {
-                ld.global.f32(v, [sa]);
-            }
-            mad.lo.u32(dst, wi, 4, db);
-            st.shared.f32([dst], v);
-        }
-        bar.sync(0);
-        for blk in 0..8 {
-            let (wa, da): (u64, u64);
-            let (qi, di): (u32, u32);
-            add.u32(qi, rowq, kc);
-            add.u32(qi, qi, blk * 32);
-            mad.wide.u32(wa, qi, 1, qs);
-            let (w0, w1, w2, w3, w4, w5, w6, w7): (u32, u32, u32, u32, u32, u32, u32, u32);
-            ld.global.nc.v4.u32((w0, w1, w2, w3), [wa]);
-            ld.global.nc.v4.u32((w4, w5, w6, w7), [wa + 16]);
-            shr.u32(di, kc, 5);
-            add.u32(di, di, rowd);
-            add.u32(di, di, blk);
-            mad.wide.u32(da, di, 2, dw);
-            let h: f16;
-            let sw: f32;
-            ld.global.nc.b16(h, [da]);
-            cvt.f32.f16(sw, h);
-            for i in 0..8 {
-                let (tok, xa, xda): (u32, u32, u32);
-                add.u32(tok, cc, i * 4);
-                mad.lo.u32(xa, tok, 272, xb);
-                let (x0, x1, x2, x3, x4, x5, x6, x7): (u32, u32, u32, u32, u32, u32, u32, u32);
-                ld.shared.v4.u32((x0, x1, x2, x3), [xa + (blk * 32)]);
-                ld.shared.v4.u32((x4, x5, x6, x7), [xa + (blk * 32 + 16)]);
-                let isum: s32;
-                mov.s32(isum, 0);
-                dp4a.s32.s32(isum, w0, x0, isum);
-                dp4a.s32.s32(isum, w1, x1, isum);
-                dp4a.s32.s32(isum, w2, x2, isum);
-                dp4a.s32.s32(isum, w3, x3, isum);
-                dp4a.s32.s32(isum, w4, x4, isum);
-                dp4a.s32.s32(isum, w5, x5, isum);
-                dp4a.s32.s32(isum, w6, x6, isum);
-                dp4a.s32.s32(isum, w7, x7, isum);
-                let (sx, f): (f32, f32);
-                mad.lo.u32(xda, tok, 32, db);
-                ld.shared.f32(sx, [xda + (blk * 4)]);
-                mul.rn.f32(sx, sx, sw);
-                cvt.rn.f32.s32(f, isum);
-                fma.rn.f32(acc[i], f, sx, acc[i]);
-            }
-        }
-        bar.sync(0);
-        add.u32(kc, kc, 256);
-        bra(ktop);
-        label(kend);
-        let rin: pred;
-        setp.lt.u32(rin, row, rows);
-        for i in 0..8 {
-            let (tok, gt, o): (u32, u32, u32);
-            add.u32(tok, cc, i * 4);
-            add.u32(gt, t0, tok);
-            let tin: pred;
-            setp.lt.u32(tin, gt, ntok);
-            and.pred(tin, tin, rin);
-            mad.lo.u32(o, gt, y_stride, row);
-            let ya: u64;
-            mad.wide.u32(ya, o, 4, y);
-            if tin {
-                st.global.f32([ya], acc[i]);
-            }
-        }
-    }
-
     /// Short convolution of `ntok` consecutive tokens of one sequence, a thread per channel (see conv4). x, y [ntok][c];
     /// taps [ntok][c / head_dim][4] where DYN.
     #[maxntid(256)]
     #[instances(0, 1)]
     pub unsafe extern "ptx-kernel" fn conv4_seq<const DYN: u32>(
-        x: *const f32, w: *const f32, state: *mut f32, taps: *const f32, y: *mut f32, c_total: u32, head_dim: u32, scale: f32, ntok: u32, taps_stride: u32,
+        x: *const f32, w: *const u16, state: *mut f32, taps: *const f32, y: *mut f32, c_total: u32, head_dim: u32, scale: f32, ntok: u32, taps_stride: u32,
         x_stride: u32,
     ) {
         let (b, nt, t, c): (u32, u32, u32, u32);
@@ -3136,10 +2606,8 @@ pub mod gpu {
         if past {
             ret();
         }
-        let (wa, sa): (u64, u64);
-        let (c4, c3, hd): (u32, u32, u32);
-        shl.b32(c4, c, 2);
-        mad.wide.u32(wa, c4, 4, w);
+        let sa: u64;
+        let (c3, hd): (u32, u32);
         mul.lo.u32(c3, c, 3);
         mad.wide.u32(sa, c3, 4, state);
         let (h0, h1, h2): (f32, f32, f32);
@@ -3147,7 +2615,7 @@ pub mod gpu {
         ld.global.f32(h1, [sa + 4]);
         ld.global.f32(h2, [sa + 8]);
         let (w0, w1, w2, w3): (f32, f32, f32, f32);
-        ld.global.nc.v4.f32((w0, w1, w2, w3), [wa]);
+        conv_w::<DYN>(w0, w1, w2, w3, w, c, c_total);
         div.u32(hd, c, head_dim);
         shl.b32(hd, hd, 2);
         let tk: u32;
@@ -3243,182 +2711,444 @@ pub mod gpu {
         st.global.b16([vca], vh);
     }
 
-    /// Prefill attention: a block per (kv head, query token), all keys of the token in chunks of 256 (by distance
-    /// 0, 1, ..), online softmax; the sink is the initial state (m = 0, l = 1). Token t is at position params[0] + t;
-    /// it sees distances below `window` (SWA) or all; row of a position: pos % ring, or pos where ring is 0.
-    /// q [t][q_stride] (3 heads of 128 per kv head), r [t][r_stride], sink [t][s_stride], out [t][3072].
+    /// Prefill attention by tiles: a block takes the 3 heads of kv head ctaid.x for the 16 query tokens from 16
+    /// ctaid.y (of nt), 48 rows of q kept in shared memory, and walks the keys they see by tiles of 32 positions,
+    /// ascending, so that a tile's K and V are read once for the 48 rows. Online softmax, the sink the initial state
+    /// (m = 0, l = 1). Token t is at position params[0] + t; it sees distances below `window` (SWA) or all; row of a
+    /// position: pos % ring, or pos where ring is 0. q [t][q_stride] (3 heads of 128 per kv head), r [t][r_stride],
+    /// sink [t][s_stride], out [t][3072]. Only the rows lo..hi count (0, u32::MAX: all), so a pass can read rows
+    /// copied elsewhere: kc and vc then point where row 0 would be. mode bit 0: start from the state an earlier pass
+    /// left; bit 1: leave the state for a later pass instead of the output. state [t][8 kv heads][390]: m[3], l[3],
+    /// acc[3][128].
+    ///
+    /// Thread t takes token tk = t / 8 and, of each tile, the 4 keys 4 g .. (g = t % 8) of the scores and the 16 dims
+    /// 4 g + 32 i .. + 4 (i < 4) of the output, of the 3 heads; it holds its partial sum l of the keys it took. Shared
+    /// memory: q times scale as [32][3][16][4] (q[t][h][4 i .. 4 i + 4] at [i][h][t]); the tile's K as [128][32] or its
+    /// V as [32][132], in f32; its probabilities as [8][3][16][4] (keys 4 g .. of head h, token t, at [g][h][t]), where
+    /// the bias profiles of the tile's 48 distances wait as [48][20] while the scores are made.
     #[reqntid(128)]
+    #[minnctapersm(2)]
     pub unsafe extern "ptx-kernel" fn attn_prefill(
-        q: *const f32, r: *const f32, sink: *const f32, rb: *const f32, kc: *const u16, vc: *const u16, out: *mut f32, params: *const u32,
-        ring: u32, window: u32, extent: u32, scale: f32, q_stride: u32, r_stride: u32, s_stride: u32,
+        q: *const f32, r: *const f32, sink: *const f32, rb: *const u16, kc: *const u16, vc: *const u16, out: *mut f32, params: *const u32,
+        ring: u32, window: u32, extent: u32, scale: f32, q_stride: u32, r_stride: u32, s_stride: u32, lo: u32, hi: u32, state: *mut f32,
+        mode: u32, nt: u32,
     ) {
-        let qsh: shared<[f32; 384], 16>;
-        let rsh: shared<[f32; 48], 16>;
-        let ksh: shared<[f32; 4], 16>;
-        let sc: shared<[f32; 768], 16>;
-        let ml: shared<[f32; 12], 16>; // m[3], l[3], alpha[3]
-        let (kvh, tk, t): (u32, u32, u32);
-        mov.u32(kvh, ctaid.x);
-        mov.u32(tk, ctaid.y);
+        let qsh: shared<[f32; 6144], 16>;
+        let kvsh: shared<[f32; 4224], 16>;
+        let psh: shared<[f32; 1536], 16>;
+        let (t, tk, g, kvh, tq0, h0): (u32, u32, u32, u32, u32, u32);
         mov.u32(t, tid.x);
-        let (pos, nk): (u32, u32);
-        ld.global.u32(pos, [params]);
-        add.u32(pos, pos, tk);
-        add.u32(nk, pos, 1);
-        min.u32(nk, nk, window);
-        let (qb, rbs, kb, sb, mb): (u32, u32, u32, u32, u32);
-        mov.u32(qb, qsh);
-        mov.u32(rbs, rsh);
-        mov.u32(kb, ksh);
-        mov.u32(sb, sc);
-        mov.u32(mb, ml);
-        let h0: u32;
+        shr.u32(tk, t, 3);
+        and.b32(g, t, 7);
+        mov.u32(kvh, ctaid.x);
+        mov.u32(tq0, ctaid.y);
+        shl.b32(tq0, tq0, 4);
         mul.lo.u32(h0, kvh, 3);
-        for k in 0..3 {
-            let (qi, qa2): (u32, u32);
-            let qa: u64;
-            let v: f32;
-            mad.lo.u32(qi, tk, q_stride, t);
-            mad.lo.u32(qi, h0, 128, qi);
-            add.u32(qi, qi, k * 128);
-            mad.wide.u32(qa, qi, 4, q);
-            ld.global.f32(v, [qa]);
-            mul.rn.f32(v, v, scale);
-            mad.lo.u32(qa2, t, 4, qb);
-            st.shared.f32([qa2 + (k * 512)], v);
+        // the block's tokens tq0 .. tq0 + ntile at positions p0 ..; this thread's at ptk; tr the token it reads for
+        // (its own, or the last one where it has none)
+        let (p0, ntile, p1, ptk, tr): (u32, u32, u32, u32, u32);
+        ld.global.u32(p0, [params]);
+        add.u32(p0, p0, tq0);
+        sub.u32(ntile, nt, tq0);
+        min.u32(ntile, ntile, 16);
+        add.u32(p1, p0, ntile);
+        add.u32(ptk, p0, tk);
+        sub.u32(tr, ntile, 1);
+        min.u32(tr, tr, tk);
+        add.u32(tr, tr, tq0);
+        let tok_ok: pred;
+        setp.lt.u32(tok_ok, tk, ntile);
+        // the keys kstart .. kend: from the first token's window (and lo) to the last token (and hi)
+        let (kstart, kend, wst): (u32, u32, u32);
+        add.u32(wst, p0, 1);
+        min.u32(kstart, wst, window);
+        sub.u32(kstart, wst, kstart);
+        max.u32(kstart, kstart, lo);
+        min.u32(kend, p1, hi);
+        let (qb, kb, pb): (u32, u32, u32);
+        mov.u32(qb, qsh);
+        mov.u32(kb, kvsh);
+        mov.u32(pb, psh);
+        // q: thread t brings 4 floats (dq = t % 32) of rows 4 k + t / 32, row h * 16 + token
+        let (dq, hq): (u32, u32);
+        and.b32(dq, t, 31);
+        shr.u32(hq, t, 5);
+        for k in 0..12 {
+            let (row, hh, tt, qi, sa): (u32, u32, u32, u32, u32);
+            add.u32(row, hq, 4 * k);
+            shr.u32(hh, row, 4);
+            and.b32(tt, row, 15);
+            let ok: pred;
+            setp.lt.u32(ok, tt, ntile);
+            let x: [f32; 4];
+            for i in 0..4 {
+                mov.f32(x[i], 0.0);
+            }
+            if ok {
+                let qa: u64;
+                add.u32(tt, tt, tq0);
+                add.u32(hh, hh, h0);
+                shl.b32(hh, hh, 7);
+                mad.lo.u32(qi, dq, 4, hh);
+                mad.lo.u32(qi, tt, q_stride, qi);
+                mad.wide.u32(qa, qi, 4, q);
+                ld.global.nc.v4.f32((x[0], x[1], x[2], x[3]), [qa]);
+                for i in 0..4 {
+                    mul.rn.f32(x[i], x[i], scale);
+                }
+            }
+            mad.lo.u32(sa, dq, 48, row);
+            shl.b32(sa, sa, 4);
+            add.u32(sa, sa, qb);
+            st.shared.v4.f32([sa], (x[0], x[1], x[2], x[3]));
         }
-        let lt48: pred;
-        setp.lt.u32(lt48, t, 48);
-        if lt48 {
-            let (ri, ra2): (u32, u32);
-            let ra: u64;
-            let v: f32;
-            mad.lo.u32(ri, tk, r_stride, t);
-            mad.lo.u32(ri, h0, 16, ri);
-            mad.wide.u32(ra, ri, 4, r);
-            ld.global.f32(v, [ra]);
-            mad.lo.u32(ra2, t, 4, rbs);
-            st.shared.f32([ra2], v);
+        // r [3][16] and the sink [3] of this thread's token
+        let rv: [f32; 48];
+        let sk: [f32; 3];
+        {
+            let (ro, so): (u32, u32);
+            let (ra, sa): (u64, u64);
+            mul.lo.u32(ro, h0, 16);
+            mad.lo.u32(ro, tr, r_stride, ro);
+            mad.wide.u32(ra, ro, 4, r);
+            for k in 0..12 {
+                ld.global.nc.v4.f32((rv[4 * k], rv[4 * k + 1], rv[4 * k + 2], rv[4 * k + 3]), [ra + (16 * k)]);
+            }
+            mad.lo.u32(so, tr, s_stride, h0);
+            mad.wide.u32(sa, so, 4, sink);
+            for h in 0..3 {
+                ld.global.nc.f32(sk[h], [sa + (4 * h)]);
+            }
         }
-        let lt3: pred;
-        setp.lt.u32(lt3, t, 3);
-        if lt3 {
-            let (si, sa2, ma): (u32, u32, u32);
-            let sa: u64;
-            let v: f32;
-            mad.lo.u32(si, tk, s_stride, h0);
-            add.u32(si, si, t);
-            mad.wide.u32(sa, si, 4, sink);
-            ld.global.f32(v, [sa]);
-            mad.lo.u32(sa2, t, 4, kb);
-            st.shared.f32([sa2], v);
-            mad.lo.u32(ma, t, 4, mb);
-            st.shared.f32([ma], 0.0);
-            st.shared.f32([ma + 12], 1.0);
+        // the state: m, this thread's part of l (lane 0 of the token's 8 holds the rest) and its 48 outputs
+        let m: [f32; 3];
+        let l: [f32; 3];
+        let o: [f32; 48];
+        let (mbit, sto): (u32, u32);
+        let (resume, keep, first): (pred, pred, pred);
+        and.b32(mbit, mode, 1);
+        setp.ne.u32(resume, mbit, 0);
+        and.b32(mbit, mode, 2);
+        setp.ne.u32(keep, mbit, 0);
+        setp.eq.u32(first, g, 0);
+        let sacc: u64;
+        mad.lo.u32(sto, tr, 8, kvh);
+        mul.lo.u32(sto, sto, 390);
+        mad.wide.u32(sacc, sto, 4, state);
+        for h in 0..3 {
+            mov.f32(m[h], 0.0);
+            selp.f32(l[h], 1.0, 0.0, first);
+        }
+        for i in 0..48 {
+            mov.f32(o[i], 0.0);
+        }
+        if resume {
+            let (oa, ob): (u32, u64);
+            for h in 0..3 {
+                let lv: f32;
+                ld.global.f32(m[h], [sacc + (4 * h)]);
+                ld.global.f32(lv, [sacc + (12 + 4 * h)]);
+                selp.f32(l[h], lv, 0.0, first);
+            }
+            shl.b32(oa, g, 4);
+            mad.wide.u32(ob, oa, 1, sacc);
+            for h in 0..3 {
+                for i in 0..16 {
+                    ld.global.f32(o[16 * h + i], [ob + (24 + 512 * h + 128 * (i / 4) + 4 * (i % 4))]);
+                }
+            }
+        }
+        // a tile's rows: thread t brings key kp0 + t % 32 (the last one where it is past kend), dims 32 (t / 32) ..
+        let (koff, last): (u32, u32);
+        shl.b32(koff, kvh, 7);
+        mad.lo.u32(koff, hq, 32, koff);
+        sub.u32(last, kend, 1);
+        let kr: [u32; 16];
+        let vr: [u32; 16];
+        for i in 0..16 {
+            mov.u32(kr[i], 0);
+        }
+        let kp0: u32;
+        mov.u32(kp0, kstart);
+        let any: pred;
+        setp.lt.u32(any, kstart, kend);
+        if any {
+            let (kp, ka, va): (u32, u64, u64);
+            add.u32(kp, kp0, dq);
+            kv_at(ka, va, kp, last, ring, koff, kc, vc);
+            for i in 0..4 {
+                ld.global.nc.v4.u32((kr[4 * i], kr[4 * i + 1], kr[4 * i + 2], kr[4 * i + 3]), [ka + (16 * i)]);
+            }
+        }
+        // where this thread stores K ([d][32]: kb + 4 (32 d + key)) and V ([key][132]: kb + 4 (132 key + d)), reads q,
+        // K, the bias profiles, the probabilities and V
+        let (kst, vst, qrd, krd, brd, pst, prd, vrd): (u32, u32, u32, u32, u32, u32, u32, u32);
+        mad.lo.u32(kst, dq, 4, kb);
+        mad.lo.u32(kst, hq, 4096, kst);
+        mad.lo.u32(vst, dq, 528, kb);
+        mad.lo.u32(vst, hq, 128, vst);
+        mad.lo.u32(qrd, tk, 16, qb);
+        mad.lo.u32(krd, g, 16, kb);
+        // the profile of distance tk - 4 g - c + 31 at index (tk + 28 - 4 g) + (3 - c) of [48][20]
+        let g4: u32;
+        shl.b32(g4, g, 2);
+        add.u32(brd, tk, 28);
+        sub.u32(brd, brd, g4);
+        mad.lo.u32(brd, brd, 80, pb);
+        mad.lo.u32(pst, g, 768, pb);
+        mad.lo.u32(pst, tk, 16, pst);
+        mad.lo.u32(prd, tk, 16, pb);
+        mad.lo.u32(vrd, g, 16, kb);
+        // the bias profiles' fill: entry (i, j), i = t / 16 + 8 k, j = t % 16, at pb + 4 (20 i + j)
+        let (bj, bi, bst): (u32, u32, u32);
+        and.b32(bj, t, 15);
+        shr.u32(bi, t, 4);
+        mad.lo.u32(bst, bi, 20, bj);
+        mad.lo.u32(bst, bst, 4, pb);
+        label(top);
+        let done: pred;
+        setp.ge.u32(done, kp0, kend);
+        if done {
+            bra(fin);
+        }
+        // this tile's K to shared memory, f32, and the profiles of its distances p0 - kp0 - 31 + i where it needs them
+        for i in 0..16 {
+            let (h1, h2): (f16, f16);
+            let (f1, f2): (f32, f32);
+            mov.b32((h1, h2), kr[i]);
+            cvt.f32.f16(f1, h1);
+            cvt.f32.f16(f2, h2);
+            st.shared.f32([kst + (256 * i)], f1);
+            st.shared.f32([kst + (256 * i + 128)], f2);
+        }
+        let (bias, bend): (pred, u32);
+        add.u32(bend, kp0, 31);
+        add.u32(bend, bend, extent);
+        setp.gt.u32(bias, bend, p0);
+        if !bias {
+            bra(filled);
+        }
+        {
+            let dmin: u32;
+            sub.u32(dmin, p0, kp0);
+            sub.u32(dmin, dmin, 31);
+            add.u32(dmin, dmin, bi);
+            for k in 0..6 {
+                let d: u32;
+                let v: f32;
+                add.u32(d, dmin, 8 * k);
+                mov.f32(v, 0.0);
+                let inb: pred;
+                setp.lt.u32(inb, d, extent);
+                if inb {
+                    let (bo, ba): (u32, u64);
+                    mad.lo.u32(bo, bj, 1024, d);
+                    mad.wide.u32(ba, bo, 2, rb);
+                    ld_bf16(v, ba);
+                }
+                st.shared.f32([bst + (640 * k)], v);
+            }
+        }
+        label(filled);
+        bar.sync(0);
+        // the tile's V, read while the scores are made
+        {
+            let (kp, ka, va): (u32, u64, u64);
+            add.u32(kp, kp0, dq);
+            kv_at(ka, va, kp, last, ring, koff, kc, vc);
+            for i in 0..4 {
+                ld.global.nc.v4.u32((vr[4 * i], vr[4 * i + 1], vr[4 * i + 2], vr[4 * i + 3]), [va + (16 * i)]);
+            }
+        }
+        // scores s[4 h + c] of keys kp0 + 4 g + c, summed over the dims in order
+        let s: [f32; 12];
+        for i in 0..12 {
+            mov.f32(s[i], 0.0);
+        }
+        for d4 in 0..32 {
+            let qv: [f32; 12];
+            let kv: [f32; 16];
+            for h in 0..3 {
+                ld.shared.v4.f32((qv[4 * h], qv[4 * h + 1], qv[4 * h + 2], qv[4 * h + 3]), [qrd + (768 * d4 + 256 * h)]);
+            }
+            for e in 0..4 {
+                ld.shared.v4.f32((kv[4 * e], kv[4 * e + 1], kv[4 * e + 2], kv[4 * e + 3]), [krd + (128 * (4 * d4 + e))]);
+            }
+            for e in 0..4 {
+                for h in 0..3 {
+                    for c in 0..4 {
+                        fma.rn.f32(s[4 * h + c], qv[4 * h + e], kv[4 * e + c], s[4 * h + c]);
+                    }
+                }
+            }
+        }
+        if bias {
+            for c in 0..4 {
+                let bv: [f32; 16];
+                for j in 0..4 {
+                    ld.shared.v4.f32((bv[4 * j], bv[4 * j + 1], bv[4 * j + 2], bv[4 * j + 3]), [brd + (80 * (3 - c) + 16 * j)]);
+                }
+                for h in 0..3 {
+                    for j in 0..16 {
+                        fma.rn.f32(s[4 * h + c], rv[16 * h + j], bv[j], s[4 * h + c]);
+                    }
+                }
+            }
+        }
+        // the sink, and the keys this token does not see: past it, past the window, past kend, or no token
+        for c in 0..4 {
+            let (key, dist): (u32, u32);
+            let see: pred;
+            add.u32(key, kp0, c);
+            mad.lo.u32(key, g, 4, key);
+            sub.u32(dist, ptk, key);
+            setp.le.and.u32(see, key, ptk, tok_ok);
+            setp.lt.and.u32(see, key, kend, see);
+            setp.lt.and.u32(see, dist, window, see);
+            for h in 0..3 {
+                sub.rn.f32(s[4 * h + c], s[4 * h + c], sk[h]);
+                selp.f32(s[4 * h + c], s[4 * h + c], -3.0e38, see);
+            }
+        }
+        // online softmax over the token's 8 threads: m' = max(m, max s), p = e^(s - m'), l = l e^(m - m') + sum p
+        for h in 0..3 {
+            let (mx, ot, al): (f32, f32, f32);
+            max.f32(mx, s[4 * h], s[4 * h + 1]);
+            max.f32(mx, mx, s[4 * h + 2]);
+            max.f32(mx, mx, s[4 * h + 3]);
+            for sh in [4, 2, 1] {
+                shfl.sync.bfly.b32(ot, mx, sh, 31, 0xffff_ffff);
+                max.f32(mx, mx, ot);
+            }
+            max.f32(mx, mx, m[h]);
+            sub.rn.f32(al, m[h], mx);
+            exp(al, al);
+            mov.f32(m[h], mx);
+            mul.rn.f32(l[h], l[h], al);
+            for c in 0..4 {
+                sub.rn.f32(s[4 * h + c], s[4 * h + c], mx);
+                exp(s[4 * h + c], s[4 * h + c]);
+                add.rn.f32(l[h], l[h], s[4 * h + c]);
+            }
+            for i in 0..16 {
+                mul.rn.f32(o[16 * h + i], o[16 * h + i], al);
+            }
         }
         bar.sync(0);
-        let (a0, a1, a2): (f32, f32, f32);
-        mov.f32(a0, 0.0);
-        mov.f32(a1, 0.0);
-        mov.f32(a2, 0.0);
-        let (lane, w): (u32, u32);
-        and.b32(lane, t, 31);
-        shr.u32(w, t, 5);
-        let start: u32;
-        mov.u32(start, 0);
-        label(ctop);
-        let cdone: pred;
-        setp.ge.u32(cdone, start, nk);
-        if cdone {
-            bra(cend);
+        // the probabilities and V to shared memory
+        for h in 0..3 {
+            st.shared.v4.f32([pst + (256 * h)], (s[4 * h], s[4 * h + 1], s[4 * h + 2], s[4 * h + 3]));
         }
-        let cnt: u32;
-        sub.u32(cnt, nk, start);
-        min.u32(cnt, cnt, 256);
-        // scores of distances start + jj
-        let jj: u32;
-        mov.u32(jj, t);
-        label(stop);
-        let sdone: pred;
-        setp.ge.u32(sdone, jj, cnt);
-        if sdone {
-            bra(send);
+        for i in 0..8 {
+            let f: [f32; 4];
+            for j in 0..2 {
+                let (h1, h2): (f16, f16);
+                mov.b32((h1, h2), vr[2 * i + j]);
+                cvt.f32.f16(f[2 * j], h1);
+                cvt.f32.f16(f[2 * j + 1], h2);
+            }
+            st.shared.v4.f32([vst + (16 * i)], (f[0], f[1], f[2], f[3]));
         }
-        score_dist(start, jj, kvh, pos, ring, extent, kc, rb, qb, rbs, kb, sb);
-        add.u32(jj, jj, 128);
-        bra(stop);
-        label(send);
         bar.sync(0);
-        let no_head: pred;
-        setp.ge.u32(no_head, w, 3);
-        if no_head {
-            bra(sm_skip);
+        // the next tile's K, read while this one's values are summed
+        add.u32(kp0, kp0, 32);
+        let more: pred;
+        setp.lt.u32(more, kp0, kend);
+        if more {
+            let (kp, ka, va): (u32, u64, u64);
+            add.u32(kp, kp0, dq);
+            kv_at(ka, va, kp, last, ring, koff, kc, vc);
+            for i in 0..4 {
+                ld.global.nc.v4.u32((kr[4 * i], kr[4 * i + 1], kr[4 * i + 2], kr[4 * i + 3]), [ka + (16 * i)]);
+            }
         }
-        softmax_online(w, lane, cnt, sb, mb);
-        label(sm_skip);
+        // o += p v, over the tile's keys in order
+        for kq in 0..8 {
+            let pv: [f32; 12];
+            for h in 0..3 {
+                ld.shared.v4.f32((pv[4 * h], pv[4 * h + 1], pv[4 * h + 2], pv[4 * h + 3]), [prd + (768 * kq + 256 * h)]);
+            }
+            for e in 0..4 {
+                let vv: [f32; 16];
+                for i in 0..4 {
+                    ld.shared.v4.f32((vv[4 * i], vv[4 * i + 1], vv[4 * i + 2], vv[4 * i + 3]), [vrd + (528 * (4 * kq + e) + 128 * i)]);
+                }
+                for h in 0..3 {
+                    for i in 0..16 {
+                        fma.rn.f32(o[16 * h + i], pv[4 * h + e], vv[i], o[16 * h + i]);
+                    }
+                }
+            }
+        }
         bar.sync(0);
-        // acc = acc * alpha + sum p v
-        let (al0, al1, al2): (f32, f32, f32);
-        ld.shared.f32(al0, [mb + 24]);
-        ld.shared.f32(al1, [mb + 28]);
-        ld.shared.f32(al2, [mb + 32]);
-        mul.rn.f32(a0, a0, al0);
-        mul.rn.f32(a1, a1, al1);
-        mul.rn.f32(a2, a2, al2);
-        let j2: u32;
-        mov.u32(j2, 0);
-        label(vtop);
-        let vdone: pred;
-        setp.ge.u32(vdone, j2, cnt);
-        if vdone {
-            bra(vend);
+        bra(top);
+        label(fin);
+        // l over the token's 8 threads
+        for h in 0..3 {
+            for sh in [4, 2, 1] {
+                let ot: f32;
+                shfl.sync.bfly.b32(ot, l[h], sh, 31, 0xffff_ffff);
+                add.rn.f32(l[h], l[h], ot);
+            }
         }
-        let (dist, kp, row, vo, pa): (u32, u32, u32, u32, u32);
-        add.u32(dist, start, j2);
-        sub.u32(kp, pos, dist);
-        mov.u32(row, kp);
+        if !tok_ok {
+            bra(end);
+        }
+        if !keep {
+            bra(output);
+        }
+        {
+            let (oa, ob): (u32, u64);
+            if first {
+                for h in 0..3 {
+                    st.global.f32([sacc + (4 * h)], m[h]);
+                    st.global.f32([sacc + (12 + 4 * h)], l[h]);
+                }
+            }
+            shl.b32(oa, g, 4);
+            mad.wide.u32(ob, oa, 1, sacc);
+            for h in 0..3 {
+                for i in 0..16 {
+                    st.global.f32([ob + (24 + 512 * h + 128 * (i / 4) + 4 * (i % 4))], o[16 * h + i]);
+                }
+            }
+            bra(end);
+        }
+        label(output);
+        {
+            let (oi, ow): (u32, u32);
+            let oa: u64;
+            add.u32(oi, tq0, tk);
+            mul.lo.u32(oi, oi, 3072);
+            mad.lo.u32(ow, h0, 128, oi);
+            mad.lo.u32(ow, g, 4, ow);
+            mad.wide.u32(oa, ow, 4, out);
+            for h in 0..3 {
+                for i in 0..4 {
+                    let y: [f32; 4];
+                    for x in 0..4 {
+                        div.rn.f32(y[x], o[16 * h + 4 * i + x], l[h]);
+                    }
+                    st.global.v4.f32([oa + (512 * h + 128 * i)], (y[0], y[1], y[2], y[3]));
+                }
+            }
+        }
+        label(end);
+    }
+
+    /// The addresses in K and V of position kp (the last key where it is past it) at offset off of its row.
+    fn kv_at(ka: u64, va: u64, kp: u32, last: u32, ring: u32, off: u32, kc: u64, vc: u64) {
+        let row: u32;
+        min.u32(row, kp, last);
+        // a row past the ring's is its position; no position is u32::MAX
+        let (rd, o): (u32, u32);
         let is_ring: pred;
         setp.ne.u32(is_ring, ring, 0);
-        if is_ring {
-            rem.u32(row, kp, ring);
-        }
-        mad.lo.u32(vo, row, 8, kvh);
-        shl.b32(vo, vo, 7);
-        add.u32(vo, vo, t);
-        let va: u64;
-        mad.wide.u32(va, vo, 2, vc);
-        let vh: f16;
-        let (vf, p0, p1, p2): (f32, f32, f32, f32);
-        ld.global.nc.b16(vh, [va]);
-        cvt.f32.f16(vf, vh);
-        mad.lo.u32(pa, j2, 4, sb);
-        ld.shared.f32(p0, [pa]);
-        ld.shared.f32(p1, [pa + 1024]);
-        ld.shared.f32(p2, [pa + 2048]);
-        fma.rn.f32(a0, p0, vf, a0);
-        fma.rn.f32(a1, p1, vf, a1);
-        fma.rn.f32(a2, p2, vf, a2);
-        add.u32(j2, j2, 1);
-        bra(vtop);
-        label(vend);
-        bar.sync(0);
-        add.u32(start, start, 256);
-        bra(ctop);
-        label(cend);
-        let (l0, l1, l2): (f32, f32, f32);
-        ld.shared.f32(l0, [mb + 12]);
-        ld.shared.f32(l1, [mb + 16]);
-        ld.shared.f32(l2, [mb + 20]);
-        div.rn.f32(a0, a0, l0);
-        div.rn.f32(a1, a1, l1);
-        div.rn.f32(a2, a2, l2);
-        let (oo, oa): (u32, u64);
-        mad.lo.u32(oo, tk, 3072, t);
-        mad.lo.u32(oo, h0, 128, oo);
-        mad.wide.u32(oa, oo, 4, out);
-        st.global.f32([oa], a0);
-        st.global.f32([oa + 512], a1);
-        st.global.f32([oa + 1024], a2);
+        selp.u32(rd, ring, 0xFFFF_FFFF, is_ring);
+        rem.u32(row, row, rd);
+        mad.lo.u32(o, row, 1024, off);
+        mad.wide.u32(ka, o, 2, kc);
+        mad.wide.u32(va, o, 2, vc);
     }
 
     /// The scores of distance start + jj (key position pos - dist) for the 3 heads in shared q, into sc[h][jj].
@@ -3474,13 +3204,19 @@ pub mod gpu {
         let inb: pred;
         setp.lt.u32(inb, dist, extent);
         if inb {
-            let bo: u32;
+            // the bias profiles at this distance: proj[r][dist], r = 4 c + i (rows of 1024 bf16)
             let ba: u64;
-            shl.b32(bo, dist, 4);
-            mad.wide.u32(ba, bo, 4, rb);
+            mad.wide.u32(ba, dist, 2, rb);
             for c in 0..4 {
+                let hb: [u16; 4];
+                for i in 0..4 {
+                    ld.global.nc.u16(hb[i], [ba + ((c * 4 + i) * 2048)]);
+                }
                 let (b0, b1, b2, b3): (f32, f32, f32, f32);
-                ld.global.nc.v4.f32((b0, b1, b2, b3), [ba + (c * 16)]);
+                bf16f(b0, hb[0]);
+                bf16f(b1, hb[1]);
+                bf16f(b2, hb[2]);
+                bf16f(b3, hb[3]);
                 for hh in 0..3 {
                     let (r0, r1, r2, r3): (f32, f32, f32, f32);
                     ld.shared.v4.f32((r0, r1, r2, r3), [rbs + (hh * 64 + c * 16)]);
@@ -3519,117 +3255,13 @@ pub mod gpu {
         st.shared.f32([sa + 2048], s2);
     }
 
-    /// Warp h, online: m' = max(m, max s), p = exp(s - m') in place, l = l alpha + sum p with alpha = exp(m - m');
-    /// ml holds m[3] @0, l[3] @12, alpha[3] @24.
-    fn softmax_online(h: u32, lane: u32, cnt: u32, sb: u32, mb: u32) {
-        let (hb, i, ma): (u32, u32, u32);
-        mad.lo.u32(hb, h, 1024, sb);
-        mad.lo.u32(ma, h, 4, mb);
-        let (m, mo): (f32, f32);
-        ld.shared.f32(mo, [ma]);
-        mov.f32(m, mo);
-        mov.u32(i, lane);
-        label(mt);
-        let md: pred;
-        setp.ge.u32(md, i, cnt);
-        if md {
-            bra(me);
-        }
-        let (a, v): (u32, f32);
-        mad.lo.u32(a, i, 4, hb);
-        ld.shared.f32(v, [a]);
-        max.f32(m, m, v);
-        add.u32(i, i, 32);
-        bra(mt);
-        label(me);
-        warp_max(m);
-        let l: f32;
-        mov.f32(l, 0.0);
-        mov.u32(i, lane);
-        label(et);
-        let ed: pred;
-        setp.ge.u32(ed, i, cnt);
-        if ed {
-            bra(ee);
-        }
-        let (a2, v2): (u32, f32);
-        mad.lo.u32(a2, i, 4, hb);
-        ld.shared.f32(v2, [a2]);
-        sub.rn.f32(v2, v2, m);
-        exp(v2, v2);
-        st.shared.f32([a2], v2);
-        add.rn.f32(l, l, v2);
-        add.u32(i, i, 32);
-        bra(et);
-        label(ee);
-        warp_sum(l);
-        let first: pred;
-        setp.eq.u32(first, lane, 0);
-        if first {
-            let (alpha, lo): (f32, f32);
-            sub.rn.f32(alpha, mo, m);
-            exp(alpha, alpha);
-            ld.shared.f32(lo, [ma + 12]);
-            fma.rn.f32(lo, lo, alpha, l);
-            st.shared.f32([ma], m);
-            st.shared.f32([ma + 12], lo);
-            st.shared.f32([ma + 24], alpha);
-        }
-    }
-
     // ---------------------------------------------------------------- grouped experts (prefill)
 
-    /// The SITU activation of `gu` [pair][2 nff] for every pair (grid.y), quantized as q8_1: aq [pair][nff], ad, as [pair][nff/32].
+    /// out[t][c] = (add ? out[t][c] : 0) + sum_k wts[t][k] src[8t + k][c] over the pairs on the GPU (slots[t][k] >= 0)
+    /// if gpu is set, else over the others, in k order: the GPU's pairs when they are done, then the CPU's added to them.
+    /// grid.y = token.
     #[maxntid(256)]
-    pub unsafe extern "ptx-kernel" fn situ_q8_n(gu: *const f32, aq: *mut u8, ad: *mut f32, asum: *mut f32, nff: u32, beta: f32, lb: f32) {
-        let ke: u32;
-        mov.u32(ke, ctaid.y);
-        let (lane, b): (u32, u32);
-        warp_row(lane, b);
-        let nb: u32;
-        shr.u32(nb, nff, 5);
-        let past: pred;
-        setp.ge.u32(past, b, nb);
-        if past {
-            ret();
-        }
-        let (i, gi, ui, base): (u32, u32, u32, u32);
-        shl.b32(i, b, 5);
-        add.u32(i, i, lane);
-        shl.b32(base, nff, 1);
-        mul.lo.u32(base, base, ke);
-        add.u32(gi, base, i);
-        add.u32(ui, gi, nff);
-        let (ga, ua): (u64, u64);
-        let (gv, uv, a, sg, tu, ib, il): (f32, f32, f32, f32, f32, f32, f32);
-        mad.wide.u32(ga, gi, 4, gu);
-        mad.wide.u32(ua, ui, 4, gu);
-        ld.global.f32(gv, [ga]);
-        ld.global.f32(uv, [ua]);
-        rcp.rn.f32(ib, beta);
-        rcp.rn.f32(il, lb);
-        mul.rn.f32(a, gv, ib);
-        tanh(a, a);
-        mul.rn.f32(a, a, beta);
-        sigmoid(sg, gv);
-        mul.rn.f32(a, a, sg);
-        mul.rn.f32(tu, uv, il);
-        tanh(tu, tu);
-        mul.rn.f32(tu, tu, lb);
-        mul.rn.f32(a, a, tu);
-        let (gb, qb): (u32, u32);
-        mad.lo.u32(gb, ke, nb, b);
-        shl.b32(qb, gb, 5);
-        let (qa, da, s2): (u64, u64, u64);
-        mad.wide.u32(qa, qb, 1, aq);
-        mad.wide.u32(da, gb, 4, ad);
-        mad.wide.u32(s2, gb, 4, asum);
-        q8_warp(a, lane, qa, da, s2);
-    }
-
-    /// out[t][c] = sum_k wts[t][k] * (slots[t][k] >= 0 ? gpu[8t + k][c] : cpu[8t + k][c]); grid.y = token.
-    #[maxntid(256)]
-    pub unsafe extern "ptx-kernel" fn moe_combine_t(gpu: *const f32, cpu: *const f32, slots: *const i32, wts: *const f32, out: *mut f32, n: u32) {
+    pub unsafe extern "ptx-kernel" fn moe_combine_t(src: *const f32, slots: *const i32, wts: *const f32, out: *mut f32, n: u32, gpu: u32, add: u32) {
         let (b, nt, t, c, tk): (u32, u32, u32, u32, u32);
         mov.u32(b, ctaid.x);
         mov.u32(nt, ntid.x);
@@ -3641,8 +3273,17 @@ pub mod gpu {
         if past {
             ret();
         }
+        let (oi, oa): (u32, u64);
+        mad.lo.u32(oi, tk, n, c);
+        mad.wide.u32(oa, oi, 4, out);
         let acc: f32;
         mov.f32(acc, 0.0);
+        let (adding, want): (pred, pred);
+        setp.ne.u32(adding, add, 0);
+        if adding {
+            ld.global.f32(acc, [oa]);
+        }
+        setp.ne.u32(want, gpu, 0);
         for k in 0..8 {
             let s: s32;
             let wv: f32;
@@ -3653,30 +3294,76 @@ pub mod gpu {
             mad.wide.u32(wa, pi, 4, wts);
             ld.global.s32(s, [sa]);
             ld.global.f32(wv, [wa]);
-            let on_gpu: pred;
+            let (on_gpu, other): (pred, pred);
             setp.ge.s32(on_gpu, s, 0);
-            let (o, ga, ca): (u32, u64, u64);
+            xor.pred(other, on_gpu, want);
+            let (o, ga): (u32, u64);
             let v: f32;
             mad.lo.u32(o, pi, n, c);
-            mad.wide.u32(ga, o, 4, gpu);
-            mad.wide.u32(ca, o, 4, cpu);
-            if on_gpu {
+            mad.wide.u32(ga, o, 4, src);
+            if !other {
                 ld.global.f32(v, [ga]);
-            } else {
-                ld.global.f32(v, [ca]);
+                fma.rn.f32(acc, wv, v, acc);
             }
-            fma.rn.f32(acc, wv, v, acc);
+        }
+        st.global.f32([oa], acc);
+    }
+
+    /// out[t][c] = (add ? out[t][c] : 0) + sum_k wts[8t + k] src[rows[8t + k]][c] over the pairs with rows[8t + k] >= 0,
+    /// in k order: the pairs whose outputs a grouped kernel left in its own order. grid.y = token.
+    #[maxntid(256)]
+    pub unsafe extern "ptx-kernel" fn moe_combine_r(src: *const f32, rows: *const i32, wts: *const f32, out: *mut f32, n: u32, add: u32) {
+        let (b, nt, t, c, tk): (u32, u32, u32, u32, u32);
+        mov.u32(b, ctaid.x);
+        mov.u32(nt, ntid.x);
+        mov.u32(t, tid.x);
+        mov.u32(tk, ctaid.y);
+        mad.lo.u32(c, b, nt, t);
+        let past: pred;
+        setp.ge.u32(past, c, n);
+        if past {
+            ret();
         }
         let (oi, oa): (u32, u64);
         mad.lo.u32(oi, tk, n, c);
         mad.wide.u32(oa, oi, 4, out);
+        let acc: f32;
+        mov.f32(acc, 0.0);
+        let adding: pred;
+        setp.ne.u32(adding, add, 0);
+        if adding {
+            ld.global.f32(acc, [oa]);
+        }
+        for k in 0..8 {
+            let r: s32;
+            let wv: f32;
+            let (pi, ra, wa): (u32, u64, u64);
+            mad.lo.u32(pi, tk, 8, k);
+            mad.wide.u32(ra, pi, 4, rows);
+            ld.global.s32(r, [ra]);
+            let none: pred;
+            setp.lt.s32(none, r, 0);
+            if !none {
+                mad.wide.u32(wa, pi, 4, wts);
+                ld.global.f32(wv, [wa]);
+                let (ru, o, ga): (u32, u32, u64);
+                let v: f32;
+                cvt.u32.s32(ru, r);
+                mad.lo.u32(o, ru, n, c);
+                mad.wide.u32(ga, o, 4, src);
+                ld.global.f32(v, [ga]);
+                fma.rn.f32(acc, wv, v, acc);
+            }
+        }
         st.global.f32([oa], acc);
     }
 
     // ================================================================ fused decode kernels
 
-    /// Depth mix in one pass over the states: per state j < ns <= 8 its sum of squares and dot with the query,
-    /// one block reduction of the 16 numbers, then the weighted sum (see mix). grid (nq, ntok), 256 threads.
+    /// Attention over depth: the states are `ptrs[0..ns]` (n floats each, ns <= 8), each RMS-normalized; query `q` of
+    /// `qs[blockIdx.x]` scores them by `dot/sqrt(n)`, and `out[blockIdx.x]` is the softmax-weighted sum of the normalized
+    /// states. One pass over the states: per state its sum of squares and dot with the query, one block reduction of the
+    /// 16 numbers, then the weighted sum. grid (nq, ntok), 256 threads.
     #[reqntid(256)]
     pub unsafe extern "ptx-kernel" fn mix8(ptrs: *const u64, ns: u32, qs: *const f32, out: *mut f32, n: u32) {
         let red: shared<[f32; 128], 16>;
@@ -3834,87 +3521,12 @@ pub mod gpu {
         label(oend);
     }
 
-    /// y = x / rms(x) * w, and y as q8_1 (q, d, s), for nvec vectors (grid.x) of n floats; x at stride xs.
-    #[reqntid(256)]
-    pub unsafe extern "ptx-kernel" fn norm_q8(x: *const f32, w: *const f32, y: *mut f32, q: *mut u8, d: *mut f32, s: *mut f32, n: u32, eps: f32, xs: u32) {
-        let red: shared<[f32; 32], 16>;
-        let (v, xo, yo, t, lane, wp, nb): (u32, u32, u32, u32, u32, u32, u32);
-        mov.u32(v, ctaid.x);
-        mov.u32(t, tid.x);
-        and.b32(lane, t, 31);
-        shr.u32(wp, t, 5);
-        mul.lo.u32(xo, v, xs);
-        mul.lo.u32(yo, v, n);
-        shr.u32(nb, n, 5);
-        let (xv, yv): (u64, u64);
-        mad.wide.u32(xv, xo, 4, x);
-        mad.wide.u32(yv, yo, 4, y);
-        let ss: f32;
-        mov.f32(ss, 0.0);
-        let i: u32;
-        mov.u32(i, t);
-        label(top);
-        let done: pred;
-        setp.ge.u32(done, i, n);
-        if done {
-            bra(end);
-        }
-        let a: u64;
-        let f: f32;
-        mad.wide.u32(a, i, 4, xv);
-        ld.global.f32(f, [a]);
-        fma.rn.f32(ss, f, f, ss);
-        add.u32(i, i, 256);
-        bra(top);
-        label(end);
-        let r: u32;
-        mov.u32(r, red);
-        block_sum(ss, r);
-        let (nf, scale): (f32, f32);
-        cvt.rn.f32.u32(nf, n);
-        div.rn.f32(scale, ss, nf);
-        add.rn.f32(scale, scale, eps);
-        sqrt.rn.f32(scale, scale);
-        rcp.rn.f32(scale, scale);
-        let b: u32;
-        mov.u32(b, wp);
-        label(btop);
-        let bdone: pred;
-        setp.ge.u32(bdone, b, nb);
-        if bdone {
-            bra(bend);
-        }
-        let (j, gb, qb): (u32, u32, u32);
-        shl.b32(j, b, 5);
-        add.u32(j, j, lane);
-        let (xa, wa, ya): (u64, u64, u64);
-        let (xv2, wv): (f32, f32);
-        mad.wide.u32(xa, j, 4, xv);
-        mad.wide.u32(wa, j, 4, w);
-        mad.wide.u32(ya, j, 4, yv);
-        ld.global.f32(xv2, [xa]);
-        ld.global.nc.f32(wv, [wa]);
-        mul.rn.f32(xv2, xv2, scale);
-        mul.rn.f32(xv2, xv2, wv);
-        st.global.f32([ya], xv2);
-        mad.lo.u32(gb, v, nb, b);
-        shl.b32(qb, gb, 5);
-        let (qa, da, sa): (u64, u64, u64);
-        mad.wide.u32(qa, qb, 1, q);
-        mad.wide.u32(da, gb, 4, d);
-        mad.wide.u32(sa, gb, 4, s);
-        q8_warp(xv2, lane, qa, da, sa);
-        add.u32(b, b, 8);
-        bra(btop);
-        label(bend);
-    }
-
     /// K and V of one token, a block per kv head (128 threads, a channel each): the short convolutions (with the taps of
     /// full attention where DYN), the K clip and the V norm, stored as f32 (k, v) and as f16 at the cache row of pos.
     #[reqntid(128)]
     #[instances(0, 1)]
     pub unsafe extern "ptx-kernel" fn kv_prep<const DYN: u32>(
-        gk: *const f32, gv: *const f32, kw: *const f32, vw: *const f32, state: *mut f32, k: *mut f32, v: *mut f32, kc: *mut u16, vc: *mut u16,
+        gk: *const f32, gv: *const f32, kw: *const u16, vw: *const u16, state: *mut f32, k: *mut f32, v: *mut f32, kc: *mut u16, vc: *mut u16,
         params: *const u32, ring: u32, cscale: f32, thr: f32, eps: f32,
     ) {
         let red: shared<[f32; 32], 16>;
@@ -3966,13 +3578,13 @@ pub mod gpu {
         st.global.b16([vca], vh);
     }
 
-    /// The short convolution of channel c of x (taps of head h at x[1024 + 4 h] where DYN); state rows at `soff`.
+    /// The short convolution of channel c of x (taps of head h at x[1024 + 4 h] where DYN); state rows at `soff`. w is
+    /// the checkpoint's BF16 weight (conv_w), of 1024 channels where DYN.
     fn conv_ch<const DYN: u32, const SOFF: u32>(o: f32, x: u64, w: u64, state: u64, c: u32, h: u32, scale: f32) {
-        let (xa, wa, sa): (u64, u64, u64);
-        let (c4, c3): (u32, u32);
+        let (xa, sa): (u64, u64);
+        let (c3, ct): (u32, u32);
         mad.wide.u32(xa, c, 4, x);
-        shl.b32(c4, c, 2);
-        mad.wide.u32(wa, c4, 4, w);
+        mov.u32(ct, 1024);
         add.u32(c3, c, SOFF);
         mul.lo.u32(c3, c3, 3);
         mad.wide.u32(sa, c3, 4, state);
@@ -3982,7 +3594,7 @@ pub mod gpu {
         ld.global.f32(h1, [sa + 4]);
         ld.global.f32(h2, [sa + 8]);
         let (w0, w1, w2, w3): (f32, f32, f32, f32);
-        ld.global.nc.v4.f32((w0, w1, w2, w3), [wa]);
+        conv_w::<DYN>(w0, w1, w2, w3, w, c, ct);
         mul.rn.f32(o, w0, h0);
         fma.rn.f32(o, w1, h1, o);
         fma.rn.f32(o, w2, h2, o);
@@ -4012,7 +3624,7 @@ pub mod gpu {
     /// The Q clip (rows 0..n_head of 128) and the R clip (rows n_head..2 n_head of 16) of one token, times post[0].
     #[maxntid(256)]
     pub unsafe extern "ptx-kernel" fn clip_qr(
-        qin: *const f32, qs: *const f32, qout: *mut f32, rin: *const f32, rs: *const f32, rout: *mut f32, n_head: u32, thr_q: f32, thr_r: f32, post: *const f32,
+        qin: *const f32, qs: *const u16, qout: *mut f32, rin: *const f32, rs: *const u16, rout: *mut f32, n_head: u32, thr_q: f32, thr_r: f32, post: *const f32,
     ) {
         let (lane, row): (u32, u32);
         warp_row(lane, row);
@@ -4083,42 +3695,10 @@ pub mod gpu {
         }
     }
 
-    /// a * sigmoid(g) over n floats (n a multiple of 32), as q8_1: a warp per block of 32.
-    #[maxntid(256)]
-    pub unsafe extern "ptx-kernel" fn gate_q8(a: *const f32, g: *const f32, q: *mut u8, d: *mut f32, s: *mut f32, n: u32) {
-        let (lane, b): (u32, u32);
-        warp_row(lane, b);
-        let nb: u32;
-        shr.u32(nb, n, 5);
-        let past: pred;
-        setp.ge.u32(past, b, nb);
-        if past {
-            ret();
-        }
-        let i: u32;
-        shl.b32(i, b, 5);
-        add.u32(i, i, lane);
-        let (aa, ga): (u64, u64);
-        let (av, gv, sg): (f32, f32, f32);
-        mad.wide.u32(aa, i, 4, a);
-        mad.wide.u32(ga, i, 4, g);
-        ld.global.f32(av, [aa]);
-        ld.global.f32(gv, [ga]);
-        sigmoid(sg, gv);
-        mul.rn.f32(av, av, sg);
-        let qb: u32;
-        shl.b32(qb, b, 5);
-        let (qa, da, sa): (u64, u64, u64);
-        mad.wide.u32(qa, qb, 1, q);
-        mad.wide.u32(da, b, 4, d);
-        mad.wide.u32(sa, b, 4, s);
-        q8_warp(av, lane, qa, da, sa);
-    }
-
     /// y = conv(x) (+ res where RES): the short convolution of 4 taps of one token, a thread per channel.
     #[maxntid(256)]
     #[instances(0, 1)]
-    pub unsafe extern "ptx-kernel" fn conv_res<const RES: u32>(x: *const f32, w: *const f32, state: *mut f32, res: *const f32, y: *mut f32, n: u32, scale: f32) {
+    pub unsafe extern "ptx-kernel" fn conv_res<const RES: u32>(x: *const f32, w: *const u16, state: *mut f32, res: *const f32, y: *mut f32, n: u32, scale: f32) {
         let (b, nt, t, c): (u32, u32, u32, u32);
         mov.u32(b, ctaid.x);
         mov.u32(nt, ntid.x);
@@ -4147,7 +3727,7 @@ pub mod gpu {
     /// The end of a MoE layer for one token: m = sum_k w_k (slots[k] >= 0 ? gpu[k] : cpu[k]) per channel, then
     /// x += conv(m) (ffn post convolution).
     #[maxntid(256)]
-    pub unsafe extern "ptx-kernel" fn moe_tail(gpu: *const f32, cpu: *const f32, slots: *const i32, wts: *const f32, w: *const f32, state: *mut f32, x: *mut f32, n: u32, scale: f32) {
+    pub unsafe extern "ptx-kernel" fn moe_tail(gpu: *const f32, cpu: *const f32, slots: *const i32, wts: *const f32, w: *const u16, state: *mut f32, x: *mut f32, n: u32, scale: f32) {
         let (b, nt, t, c): (u32, u32, u32, u32);
         mov.u32(b, ctaid.x);
         mov.u32(nt, ntid.x);
@@ -4179,17 +3759,16 @@ pub mod gpu {
             }
             fma.rn.f32(m, wv, v, m);
         }
-        let (wa, sa, xa): (u64, u64, u64);
-        let (c4, c3): (u32, u32);
-        shl.b32(c4, c, 2);
-        mad.wide.u32(wa, c4, 4, w);
+        let (sa, xa): (u64, u64);
+        let c3: u32;
         mul.lo.u32(c3, c, 3);
         mad.wide.u32(sa, c3, 4, state);
         let (h0, h1, h2, w0, w1, w2, w3, o2, xv): (f32, f32, f32, f32, f32, f32, f32, f32, f32);
         ld.global.f32(h0, [sa]);
         ld.global.f32(h1, [sa + 4]);
         ld.global.f32(h2, [sa + 8]);
-        ld.global.nc.v4.f32((w0, w1, w2, w3), [wa]);
+        // the conv1d weights [n][4] BF16 (tap 3 the current token)
+        conv_w::<0>(w0, w1, w2, w3, w, c, n);
         mul.rn.f32(o2, w0, h0);
         fma.rn.f32(o2, w1, h1, o2);
         fma.rn.f32(o2, w2, h2, o2);
@@ -4337,112 +3916,11 @@ pub mod gpu {
             let (tok, seq): (u32, u32);
             st.volatile.global.u32([job + 4], layer);
             ld.global.u32(tok, [params + 12]);
-            mad.lo.u32(seq, tok, 64, step);
+            mad.lo.u32(seq, tok, 256, step);
             add.u32(seq, seq, 1);
             membar.sys();
             st.volatile.global.u32([job], seq);
         }
-    }
-
-    /// The controller input (rms(cur), rms(msg)) of one token, as q8_1 of 2n values (see ctrl_in).
-    /// The body of ctrl_in_q.
-    fn ctrl_in_body(cur: u64, msg: u64, q: u64, d: u64, s: u64, n: u32) {
-        let red: shared<[f32; 32], 16>;
-        let (t, lane, wp, nb): (u32, u32, u32, u32);
-        mov.u32(t, tid.x);
-        and.b32(lane, t, 31);
-        shr.u32(wp, t, 5);
-        shr.u32(nb, n, 5);
-        let r: u32;
-        mov.u32(r, red);
-        let nf: f32;
-        cvt.rn.f32.u32(nf, n);
-        for half in 0..2 {
-            let src: u64;
-            if half == 0 {
-                mov.u64(src, cur);
-            } else {
-                mov.u64(src, msg);
-            }
-            let ss: f32;
-            mov.f32(ss, 0.0);
-            let i: u32;
-            mov.u32(i, t);
-            label(atop);
-            let adone: pred;
-            setp.ge.u32(adone, i, n);
-            if adone {
-                bra(aend);
-            }
-            let a: u64;
-            let f: f32;
-            mad.wide.u32(a, i, 4, src);
-            ld.global.f32(f, [a]);
-            fma.rn.f32(ss, f, f, ss);
-            add.u32(i, i, 256);
-            bra(atop);
-            label(aend);
-            block_sum(ss, r);
-            div.rn.f32(ss, ss, nf);
-            add.rn.f32(ss, ss, 0.000_001);
-            sqrt.rn.f32(ss, ss);
-            rcp.rn.f32(ss, ss);
-            let b: u32;
-            mov.u32(b, wp);
-            label(btop);
-            let bdone: pred;
-            setp.ge.u32(bdone, b, nb);
-            if bdone {
-                bra(bend);
-            }
-            let (j, gb, qb): (u32, u32, u32);
-            shl.b32(j, b, 5);
-            add.u32(j, j, lane);
-            let xa: u64;
-            let xv: f32;
-            mad.wide.u32(xa, j, 4, src);
-            ld.global.f32(xv, [xa]);
-            mul.rn.f32(xv, xv, ss);
-            add.u32(gb, b, half * 0);
-            if half == 1 {
-                add.u32(gb, b, nb);
-            }
-            shl.b32(qb, gb, 5);
-            let (qa, da, sa): (u64, u64, u64);
-            mad.wide.u32(qa, qb, 1, q);
-            mad.wide.u32(da, gb, 4, d);
-            mad.wide.u32(sa, gb, 4, s);
-            q8_warp(xv, lane, qa, da, sa);
-            add.u32(b, b, 8);
-            bra(btop);
-            label(bend);
-        }
-    }
-
-    #[reqntid(256)]
-    pub unsafe extern "ptx-kernel" fn ctrl_in_q(cur: *const f32, msg: *const f32, q: *mut u8, d: *mut f32, s: *mut f32, n: u32) {
-        ctrl_in_body(cur, msg, q, d, s, n);
-    }
-
-    /// ctrl_in_q of controller ctaid.z: cur and msg at tab[2 z], tab[2 z + 1]; q, d, s of controller z at z 2n, z 2n/32.
-    #[reqntid(256)]
-    pub unsafe extern "ptx-kernel" fn ctrl_in_qz(tab: *const u64, q: *mut u8, d: *mut f32, s: *mut f32, n: u32) {
-        let (z, n2, nb): (u32, u32, u32);
-        mov.u32(z, ctaid.z);
-        shl.b32(n2, n, 1);
-        shr.u32(nb, n2, 5);
-        let (ta, cz, mz, qz, dz, sz): (u64, u64, u64, u64, u64, u64);
-        let (zq, zd): (u32, u32);
-        mul.lo.u32(zq, z, 2);
-        mad.wide.u32(ta, zq, 8, tab);
-        ld.global.u64(cz, [ta]);
-        ld.global.u64(mz, [ta + 8]);
-        mul.lo.u32(zq, z, n2);
-        mad.wide.u32(qz, zq, 1, q);
-        mul.lo.u32(zd, z, nb);
-        mad.wide.u32(dz, zd, 4, d);
-        mad.wide.u32(sz, zd, 4, s);
-        ctrl_in_body(cz, mz, qz, dz, sz, n);
     }
 
     /// Profiling: writes the GPU's global timer (ns) to buf[i], from one thread.
@@ -4462,152 +3940,6 @@ pub mod gpu {
     }
 
     // ---------------------------------------------------------------- 768 threads: 3 values of 2304 each, in registers
-
-    /// RMS norm (times w) of the vector at x, and its q8_1: 768 threads, element t + 768 i in v[i]; warp w quantizes blocks
-    /// w + 24 i. Writes y [n] (if `y` is not 0), q, d, s.
-    fn norm768(v0: f32, v1: f32, v2: f32, w: u64, y: u64, q: u64, d: u64, s: u64, t: u32, eps: f32, red: u32, wy: u32) {
-        let (lane, wp): (u32, u32);
-        and.b32(lane, t, 31);
-        shr.u32(wp, t, 5);
-        let ss: f32;
-        mul.rn.f32(ss, v0, v0);
-        fma.rn.f32(ss, v1, v1, ss);
-        fma.rn.f32(ss, v2, v2, ss);
-        block_sum(ss, red);
-        let scale: f32;
-        mul.rn.f32(scale, ss, 0.000_434_027_78);
-        add.rn.f32(scale, scale, eps);
-        sqrt.rn.f32(scale, scale);
-        rcp.rn.f32(scale, scale);
-        for i in 0..3 {
-            let (j, b, qb): (u32, u32, u32);
-            add.u32(j, t, i * 768);
-            let (wa, ya, qa, da, sa): (u64, u64, u64, u64, u64);
-            let (x, wv): (f32, f32);
-            if i == 0 {
-                mov.f32(x, v0);
-            }
-            if i == 1 {
-                mov.f32(x, v1);
-            }
-            if i == 2 {
-                mov.f32(x, v2);
-            }
-            mad.wide.u32(wa, j, 4, w);
-            ld.global.nc.f32(wv, [wa]);
-            mul.rn.f32(x, x, scale);
-            mul.rn.f32(x, x, wv);
-            let has_y: pred;
-            setp.ne.u32(has_y, wy, 0);
-            if has_y {
-                mad.wide.u32(ya, j, 4, y);
-                st.global.f32([ya], x);
-            }
-            add.u32(b, wp, i * 24);
-            shl.b32(qb, b, 5);
-            mad.wide.u32(qa, qb, 1, q);
-            mad.wide.u32(da, b, 4, d);
-            mad.wide.u32(sa, b, 4, s);
-            q8_warp(x, lane, qa, da, sa);
-        }
-    }
-
-    /// norm_q8 of vector ctaid.x (n = 2304) at x + ctaid.x xs: 768 threads, the values in registers.
-    #[reqntid(768)]
-    pub unsafe extern "ptx-kernel" fn norm_q8_768(x: *const f32, w: *const f32, y: *mut f32, q: *mut u8, d: *mut f32, s: *mut f32, eps: f32, xs: u32) {
-        let red: shared<[f32; 32], 16>;
-        let (vi, t, xo, r, wy): (u32, u32, u32, u32, u32);
-        mov.u32(vi, ctaid.x);
-        mov.u32(t, tid.x);
-        mov.u32(r, red);
-        mad.lo.u32(xo, vi, xs, t);
-        let (xa, yv, qv, dv, sv): (u64, u64, u64, u64, u64);
-        mad.wide.u32(xa, xo, 4, x);
-        let (v0, v1, v2): (f32, f32, f32);
-        ld.global.f32(v0, [xa]);
-        ld.global.f32(v1, [xa + 3072]);
-        ld.global.f32(v2, [xa + 6144]);
-        let (yo, qo, bo): (u32, u32, u32);
-        mul.lo.u32(yo, vi, 2304);
-        mad.wide.u32(yv, yo, 4, y);
-        mad.wide.u32(qv, yo, 1, q);
-        mul.lo.u32(bo, vi, 72);
-        mad.wide.u32(dv, bo, 4, d);
-        mad.wide.u32(sv, bo, 4, s);
-        mov.u32(wy, 1);
-        norm768(v0, v1, v2, w, yv, qv, dv, sv, t, eps, r, wy);
-    }
-
-    /// The input of a controller, q8_1: [cur / rms(cur), msg / rms(msg)] (2 x 2304), at q, d, s; 768 threads.
-    fn ctrl_in768(cur: u64, msg: u64, q: u64, d: u64, s: u64, t: u32, red: u32) {
-        let (lane, wp): (u32, u32);
-        and.b32(lane, t, 31);
-        shr.u32(wp, t, 5);
-        for half in 0..2 {
-            let src: u64;
-            if half == 0 {
-                mov.u64(src, cur);
-            }
-            if half == 1 {
-                mov.u64(src, msg);
-            }
-            let a: u64;
-            let (v0, v1, v2, ss): (f32, f32, f32, f32);
-            mad.wide.u32(a, t, 4, src);
-            ld.global.f32(v0, [a]);
-            ld.global.f32(v1, [a + 3072]);
-            ld.global.f32(v2, [a + 6144]);
-            mul.rn.f32(ss, v0, v0);
-            fma.rn.f32(ss, v1, v1, ss);
-            fma.rn.f32(ss, v2, v2, ss);
-            block_sum(ss, red);
-            mul.rn.f32(ss, ss, 0.000_434_027_78);
-            add.rn.f32(ss, ss, 0.000_001);
-            sqrt.rn.f32(ss, ss);
-            rcp.rn.f32(ss, ss);
-            for i in 0..3 {
-                let x: f32;
-                if i == 0 {
-                    mul.rn.f32(x, v0, ss);
-                }
-                if i == 1 {
-                    mul.rn.f32(x, v1, ss);
-                }
-                if i == 2 {
-                    mul.rn.f32(x, v2, ss);
-                }
-                let (b, qb): (u32, u32);
-                add.u32(b, wp, half * 72 + i * 24);
-                shl.b32(qb, b, 5);
-                let (qa, da, sa): (u64, u64, u64);
-                mad.wide.u32(qa, qb, 1, q);
-                mad.wide.u32(da, b, 4, d);
-                mad.wide.u32(sa, b, 4, s);
-                q8_warp(x, lane, qa, da, sa);
-            }
-        }
-    }
-
-    /// ctrl_in_qz with 768 threads (n = 2304): controller ctaid.z, cur and msg at tab[2 z], tab[2 z + 1].
-    #[reqntid(768)]
-    pub unsafe extern "ptx-kernel" fn ctrl_in_z768(tab: *const u64, q: *mut u8, d: *mut f32, s: *mut f32) {
-        let red: shared<[f32; 32], 16>;
-        let (z, t, r, zi): (u32, u32, u32, u32);
-        mov.u32(z, ctaid.z);
-        mov.u32(t, tid.x);
-        mov.u32(r, red);
-        let (ta, cz, mz, qz, dz, sz): (u64, u64, u64, u64, u64, u64);
-        mul.lo.u32(zi, z, 2);
-        mad.wide.u32(ta, zi, 8, tab);
-        ld.global.u64(cz, [ta]);
-        ld.global.u64(mz, [ta + 8]);
-        mul.lo.u32(zi, z, 4608);
-        mad.wide.u32(qz, zi, 1, q);
-        mul.lo.u32(zi, z, 144);
-        mad.wide.u32(dz, zi, 4, d);
-        mad.wide.u32(sz, zi, 4, s);
-        ctrl_in768(cz, mz, qz, dz, sz, t, r);
-    }
 
     /// mix8 with 768 threads (n = 2304): the states in registers, one read of each. grid (nq, ntok).
     #[reqntid(768)]
@@ -4880,1397 +4212,10 @@ pub mod gpu {
             let (tok, seq): (u32, u32);
             st.volatile.global.u32([job + 4], layer);
             ld.global.u32(tok, [params + 12]);
-            mad.lo.u32(seq, tok, 64, step);
+            mad.lo.u32(seq, tok, 256, step);
             add.u32(seq, seq, 1);
             // release at system scope: the job (all warps, ordered before by the barrier) is visible before seq
             st.release.sys.global.u32([job], seq);
         }
-    }
-}
-
-/// The KV caches (int8 and int4) and the attention on them, a module of its own: kernite builds a module's PTX in const
-/// evaluation, and one module with every kernel takes rustc past the steps it evaluates without a warning (and toward
-/// kernite's limit of 1-2 MiB, see ~/kernite-repro). The helpers these kernels share with `gpu` are copies.
-#[kernite_macros::kernels]
-pub mod attn {
-    // ---------------------------------------------------------------- helpers (copies of gpu's)
-
-    /// Sum of `v` over the warp, in every lane.
-    fn warp_sum(v: f32) {
-        for sh in [16, 8, 4, 2, 1] {
-            let o: f32;
-            shfl.sync.bfly.b32(o, v, sh, 31, 0xffff_ffff);
-            add.rn.f32(v, v, o);
-        }
-    }
-
-    /// Max of `v` over the warp, in every lane.
-    fn warp_max(v: f32) {
-        for sh in [16, 8, 4, 2, 1] {
-            let o: f32;
-            shfl.sync.bfly.b32(o, v, sh, 31, 0xffff_ffff);
-            max.f32(v, v, o);
-        }
-    }
-
-    /// Sum of `v` over the block, in every thread. `red` is the shared address of 32 floats.
-    fn block_sum(v: f32, red: u32) {
-        let (t, lane, w, nw, at): (u32, u32, u32, u32, u32);
-        warp_sum(v);
-        mov.u32(t, tid.x);
-        and.b32(lane, t, 31);
-        shr.u32(w, t, 5);
-        mov.u32(nw, ntid.x);
-        add.u32(nw, nw, 31);
-        shr.u32(nw, nw, 5);
-        let first: pred;
-        setp.eq.u32(first, lane, 0);
-        mad.lo.u32(at, w, 4, red);
-        bar.sync(0);
-        if first {
-            st.shared.f32([at], v);
-        }
-        bar.sync(0);
-        let inside: pred;
-        setp.lt.u32(inside, lane, nw);
-        mov.f32(v, 0.0);
-        mad.lo.u32(at, lane, 4, red);
-        if inside {
-            ld.shared.f32(v, [at]);
-        }
-        warp_sum(v);
-    }
-
-    /// e^x
-    fn exp(y: f32, x: f32) {
-        mul.rn.f32(y, x, 1.442_695_04);
-        ex2.approx.ftz.f32(y, y);
-    }
-
-    /// Sum of the s32 `v` over the warp.
-    fn warp_isum(v: s32) {
-        for sh in [16, 8, 4, 2, 1] {
-            let o: s32;
-            shfl.sync.bfly.b32(o, v, sh, 31, 0xffff_ffff);
-            add.s32(v, v, o);
-        }
-    }
-
-    /// acc += the 4 signed bytes of `w` times x0..x3
-    fn fma_s8x4(acc: f32, w: u32, x0: f32, x1: f32, x2: f32, x3: f32) {
-        let b: s32;
-        let f: f32;
-        bfe.s32(b, w, 0, 8);
-        cvt.rn.f32.s32(f, b);
-        fma.rn.f32(acc, f, x0, acc);
-        bfe.s32(b, w, 8, 8);
-        cvt.rn.f32.s32(f, b);
-        fma.rn.f32(acc, f, x1, acc);
-        bfe.s32(b, w, 16, 8);
-        cvt.rn.f32.s32(f, b);
-        fma.rn.f32(acc, f, x2, acc);
-        bfe.s32(b, w, 24, 8);
-        cvt.rn.f32.s32(f, b);
-        fma.rn.f32(acc, f, x3, acc);
-    }
-
-    /// The short convolution of channel c of x (taps of head h at x[1024 + 4 h] where DYN); state rows at `soff`.
-    fn conv_ch<const DYN: u32, const SOFF: u32>(o: f32, x: u64, w: u64, state: u64, c: u32, h: u32, scale: f32) {
-        let (xa, wa, sa): (u64, u64, u64);
-        let (c4, c3): (u32, u32);
-        mad.wide.u32(xa, c, 4, x);
-        shl.b32(c4, c, 2);
-        mad.wide.u32(wa, c4, 4, w);
-        add.u32(c3, c, SOFF);
-        mul.lo.u32(c3, c3, 3);
-        mad.wide.u32(sa, c3, 4, state);
-        let (xv, h0, h1, h2): (f32, f32, f32, f32);
-        ld.global.f32(xv, [xa]);
-        ld.global.f32(h0, [sa]);
-        ld.global.f32(h1, [sa + 4]);
-        ld.global.f32(h2, [sa + 8]);
-        let (w0, w1, w2, w3): (f32, f32, f32, f32);
-        ld.global.nc.v4.f32((w0, w1, w2, w3), [wa]);
-        mul.rn.f32(o, w0, h0);
-        fma.rn.f32(o, w1, h1, o);
-        fma.rn.f32(o, w2, h2, o);
-        fma.rn.f32(o, w3, xv, o);
-        if DYN == 1 {
-            let ti: u32;
-            let ta: u64;
-            mad.lo.u32(ti, h, 4, 1024);
-            mad.wide.u32(ta, ti, 4, x);
-            let (t0, t1, t2, t3): (f32, f32, f32, f32);
-            ld.global.f32(t0, [ta]);
-            ld.global.f32(t1, [ta + 4]);
-            ld.global.f32(t2, [ta + 8]);
-            ld.global.f32(t3, [ta + 12]);
-            fma.rn.f32(o, xv, t0, o);
-            fma.rn.f32(o, h2, t1, o);
-            fma.rn.f32(o, h1, t2, o);
-            fma.rn.f32(o, h0, t3, o);
-        }
-        add.rn.f32(o, o, xv);
-        mul.rn.f32(o, o, scale);
-        st.global.f32([sa], h1);
-        st.global.f32([sa + 4], h2);
-        st.global.f32([sa + 8], xv);
-    }
-
-    /// Warp `h`: the max m of the cnt scores of head h, p = exp(s - m) in place, and l = sum p; stores m and l.
-    fn softmax_part(h: u32, lane: u32, cnt: u32, sb: u32, kvh: u32, sp: u32, maxs: u32, pm: u64, pl: u64) {
-        let (hb, i): (u32, u32);
-        mad.lo.u32(hb, h, 1024, sb);
-        let m: f32;
-        mov.f32(m, -3.0e38);
-        mov.u32(i, lane);
-        label(mt);
-        let md: pred;
-        setp.ge.u32(md, i, cnt);
-        if md {
-            bra(me);
-        }
-        let (a, v): (u32, f32);
-        mad.lo.u32(a, i, 4, hb);
-        ld.shared.f32(v, [a]);
-        max.f32(m, m, v);
-        add.u32(i, i, 32);
-        bra(mt);
-        label(me);
-        warp_max(m);
-        let l: f32;
-        mov.f32(l, 0.0);
-        mov.u32(i, lane);
-        label(et);
-        let ed: pred;
-        setp.ge.u32(ed, i, cnt);
-        if ed {
-            bra(ee);
-        }
-        let (a2, v2): (u32, f32);
-        mad.lo.u32(a2, i, 4, hb);
-        ld.shared.f32(v2, [a2]);
-        sub.rn.f32(v2, v2, m);
-        exp(v2, v2);
-        st.shared.f32([a2], v2);
-        add.rn.f32(l, l, v2);
-        add.u32(i, i, 32);
-        bra(et);
-        label(ee);
-        warp_sum(l);
-        let first: pred;
-        setp.eq.u32(first, lane, 0);
-        if first {
-            let o: u32;
-            let (ma, la): (u64, u64);
-            mad.lo.u32(o, kvh, maxs, sp);
-            mad.lo.u32(o, o, 3, h);
-            mad.wide.u32(ma, o, 4, pm);
-            mad.wide.u32(la, o, 4, pl);
-            st.global.f32([ma], m);
-            st.global.f32([la], l);
-        }
-    }
-
-    /// Warp h, online: m' = max(m, max s), p = exp(s - m') in place, l = l alpha + sum p with alpha = exp(m - m');
-    /// ml holds m[3] @0, l[3] @12, alpha[3] @24.
-    fn softmax_online(h: u32, lane: u32, cnt: u32, sb: u32, mb: u32) {
-        let (hb, i, ma): (u32, u32, u32);
-        mad.lo.u32(hb, h, 1024, sb);
-        mad.lo.u32(ma, h, 4, mb);
-        let (m, mo): (f32, f32);
-        ld.shared.f32(mo, [ma]);
-        mov.f32(m, mo);
-        mov.u32(i, lane);
-        label(mt);
-        let md: pred;
-        setp.ge.u32(md, i, cnt);
-        if md {
-            bra(me);
-        }
-        let (a, v): (u32, f32);
-        mad.lo.u32(a, i, 4, hb);
-        ld.shared.f32(v, [a]);
-        max.f32(m, m, v);
-        add.u32(i, i, 32);
-        bra(mt);
-        label(me);
-        warp_max(m);
-        let l: f32;
-        mov.f32(l, 0.0);
-        mov.u32(i, lane);
-        label(et);
-        let ed: pred;
-        setp.ge.u32(ed, i, cnt);
-        if ed {
-            bra(ee);
-        }
-        let (a2, v2): (u32, f32);
-        mad.lo.u32(a2, i, 4, hb);
-        ld.shared.f32(v2, [a2]);
-        sub.rn.f32(v2, v2, m);
-        exp(v2, v2);
-        st.shared.f32([a2], v2);
-        add.rn.f32(l, l, v2);
-        add.u32(i, i, 32);
-        bra(et);
-        label(ee);
-        warp_sum(l);
-        let first: pred;
-        setp.eq.u32(first, lane, 0);
-        if first {
-            let (alpha, lo): (f32, f32);
-            sub.rn.f32(alpha, mo, m);
-            exp(alpha, alpha);
-            ld.shared.f32(lo, [ma + 12]);
-            fma.rn.f32(lo, lo, alpha, l);
-            st.shared.f32([ma], m);
-            st.shared.f32([ma + 12], lo);
-            st.shared.f32([ma + 24], alpha);
-        }
-    }
-
-    // ---------------------------------------------------------------- int8 KV cache
-    //
-    // A cache of R rows (positions) is [R][8 kv heads][128] int8 at kc, and the scales [R][8][4] f16 (a scale per 32
-    // values, as q8_0) at ks: 1088 bytes a row, 53% of f16. Quantized as llama.cpp's q8_0: d = max|x| / 127.
-
-    /// Quantizes the f32 `v` of each lane to int8 of the warp's 32 values: d = max|v| / 127 rounded to f16, q = round(v / d)
-    /// within +-127; lanes 0, 4, .. store 4 bytes each at `qa` (the block's byte address), lane 0 stores d at `sa`.
-    fn kv8_warp(v: f32, lane: u32, qa: u64, sa: u64) {
-        let (a, amax, d, id): (f32, f32, f32, f32);
-        abs.f32(a, v);
-        mov.f32(amax, a);
-        warp_max(amax);
-        div.rn.f32(d, amax, 127.0);
-        let dh: f16;
-        cvt.rn.f16.f32(dh, d);
-        cvt.f32.f16(d, dh);
-        let nz: pred;
-        setp.gt.f32(nz, d, 0.0);
-        mov.f32(id, 0.0);
-        if nz {
-            rcp.rn.f32(id, d);
-        }
-        let qf: f32;
-        mul.rn.f32(qf, v, id);
-        let qi: s32;
-        cvt.rni.s32.f32(qi, qf);
-        min.s32(qi, qi, 127);
-        max.s32(qi, qi, -127);
-        let (b0, b1, b2, b3, w): (u32, u32, u32, u32, u32);
-        and.b32(b0, qi, 255);
-        shfl.sync.down.b32(b1, b0, 1, 31, 0xffff_ffff);
-        shfl.sync.down.b32(b2, b0, 2, 31, 0xffff_ffff);
-        shfl.sync.down.b32(b3, b0, 3, 31, 0xffff_ffff);
-        shl.b32(b1, b1, 8);
-        shl.b32(b2, b2, 16);
-        shl.b32(b3, b3, 24);
-        or.b32(w, b0, b1);
-        or.b32(w, w, b2);
-        or.b32(w, w, b3);
-        let (l4, four): (u32, pred);
-        and.b32(l4, lane, 3);
-        setp.eq.u32(four, l4, 0);
-        let wa: u64;
-        cvt.u64.u32(wa, lane);
-        add.u64(wa, wa, qa);
-        if four {
-            st.global.u32([wa], w);
-        }
-        let first: pred;
-        setp.eq.u32(first, lane, 0);
-        if first {
-            st.global.b16([sa], dh);
-        }
-    }
-
-    /// The byte address of channel block (c - lane) of `row` in kc, and the address of its scale in ks.
-    fn kv8_addr(qa: u64, sa: u64, row: u32, c: u32, lane: u32, kc: u64, ks: u64) {
-        let (qo, so): (u32, u32);
-        mad.lo.u32(qo, row, 1024, c);
-        sub.u32(qo, qo, lane);
-        cvt.u64.u32(qa, qo);
-        add.u64(qa, qa, kc);
-        shr.u32(so, c, 5);
-        mad.lo.u32(so, row, 32, so);
-        mad.wide.u32(sa, so, 2, ks);
-    }
-
-    /// kv_prep on the int8 cache: the convolutions, K clip, V norm, and the cache row of the token at params[0].
-    #[reqntid(128)]
-    #[instances(0, 1)]
-    pub unsafe extern "ptx-kernel" fn kv_prep8<const DYN: u32>(
-        gk: *const f32, gv: *const f32, kw: *const f32, vw: *const f32, state: *mut f32, k: *mut f32, v: *mut f32, kc: *mut u8, ks: *mut u16, vc: *mut u8,
-        vs: *mut u16, params: *const u32, ring: u32, cscale: f32, thr: f32, eps: f32,
-    ) {
-        let red: shared<[f32; 32], 16>;
-        let (h, t, c, lane): (u32, u32, u32, u32);
-        mov.u32(h, ctaid.x);
-        mov.u32(t, tid.x);
-        mad.lo.u32(c, h, 128, t);
-        and.b32(lane, t, 31);
-        let (ko, vo): (f32, f32);
-        conv_ch::<DYN, 0>(ko, gk, kw, state, c, h, cscale);
-        conv_ch::<DYN, 1024>(vo, gv, vw, state, c, h, cscale);
-        let r: u32;
-        mov.u32(r, red);
-        let (ss, f, norm, vsq): (f32, f32, f32, f32);
-        mul.rn.f32(ss, ko, ko);
-        block_sum(ss, r);
-        sqrt.rn.f32(norm, ss);
-        add.rn.f32(norm, norm, 0.000_001);
-        div.rn.f32(f, thr, norm);
-        max.f32(f, f, 0.0);
-        min.f32(f, f, 1.0);
-        mul.rn.f32(ko, ko, f);
-        mul.rn.f32(vsq, vo, vo);
-        block_sum(vsq, r);
-        div.rn.f32(vsq, vsq, 128.0);
-        add.rn.f32(vsq, vsq, eps);
-        sqrt.rn.f32(vsq, vsq);
-        div.rn.f32(vo, vo, vsq);
-        let (ka, va): (u64, u64);
-        mad.wide.u32(ka, c, 4, k);
-        mad.wide.u32(va, c, 4, v);
-        st.global.f32([ka], ko);
-        st.global.f32([va], vo);
-        let (pos, row): (u32, u32);
-        ld.global.u32(pos, [params]);
-        mov.u32(row, pos);
-        let is_ring: pred;
-        setp.ne.u32(is_ring, ring, 0);
-        if is_ring {
-            rem.u32(row, pos, ring);
-        }
-        let (kqa, ksa, vqa, vsa): (u64, u64, u64, u64);
-        kv8_addr(kqa, ksa, row, c, lane, kc, ks);
-        kv8_addr(vqa, vsa, row, c, lane, vc, vs);
-        kv8_warp(ko, lane, kqa, ksa);
-        kv8_warp(vo, lane, vqa, vsa);
-    }
-
-    /// The K and V rows of ubatch token ctaid.y (at position params[0] + ctaid.y) into the int8 cache; grid (8 kv heads, tokens).
-    #[reqntid(128)]
-    pub unsafe extern "ptx-kernel" fn kv_store8_t(
-        k: *const f32, v: *const f32, kc: *mut u8, ks: *mut u16, vc: *mut u8, vs: *mut u16, params: *const u32, ring: u32, kstride: u32, vstride: u32,
-    ) {
-        let (h, tk, t, c, lane): (u32, u32, u32, u32, u32);
-        mov.u32(h, ctaid.x);
-        mov.u32(tk, ctaid.y);
-        mov.u32(t, tid.x);
-        mad.lo.u32(c, h, 128, t);
-        and.b32(lane, t, 31);
-        let (pos, row): (u32, u32);
-        ld.global.u32(pos, [params]);
-        add.u32(pos, pos, tk);
-        mov.u32(row, pos);
-        let is_ring: pred;
-        setp.ne.u32(is_ring, ring, 0);
-        if is_ring {
-            rem.u32(row, pos, ring);
-        }
-        let (ki, vi): (u32, u32);
-        let (ka, va): (u64, u64);
-        mad.lo.u32(ki, tk, kstride, c);
-        mad.lo.u32(vi, tk, vstride, c);
-        mad.wide.u32(ka, ki, 4, k);
-        mad.wide.u32(va, vi, 4, v);
-        let (kv, vv): (f32, f32);
-        ld.global.f32(kv, [ka]);
-        ld.global.f32(vv, [va]);
-        let (kqa, ksa, vqa, vsa): (u64, u64, u64, u64);
-        kv8_addr(kqa, ksa, row, c, lane, kc, ks);
-        kv8_addr(vqa, vsa, row, c, lane, vc, vs);
-        kv8_warp(kv, lane, kqa, ksa);
-        kv8_warp(vv, lane, vqa, vsa);
-    }
-
-    // ---------------------------------------------------------------- int4 KV cache (full attention)
-    //
-    // As the int8 cache with 4-bit values: [R][8 kv heads][64] bytes, value 2i in the low nibble of byte i and 2i + 1 in
-    // the high one, symmetric (-7..7, d = max|x| / 7) and stored plus 8 (1..15), and the same f16 scale per 32 values:
-    // 576 bytes a row, against 1088 int8 and 2048 f16. The full-attention caches are int4 (K and V) or int8; the
-    // sliding-window rings stay int8.
-
-    /// Quantizes the f32 `v` of each lane to 4 bits of the warp's 32 values (d = max|v| / 7 rounded to f16, q within
-    /// +-7, stored as q + 8); lanes 0, 8, 16, 24 store 4 bytes (8 values) each at qa + lane / 2, lane 0 stores d at `sa`.
-    fn kv4_warp(v: f32, lane: u32, qa: u64, sa: u64) {
-        let (a, amax, d, id): (f32, f32, f32, f32);
-        abs.f32(a, v);
-        mov.f32(amax, a);
-        warp_max(amax);
-        div.rn.f32(d, amax, 7.0);
-        let dh: f16;
-        cvt.rn.f16.f32(dh, d);
-        cvt.f32.f16(d, dh);
-        let nz: pred;
-        setp.gt.f32(nz, d, 0.0);
-        mov.f32(id, 0.0);
-        if nz {
-            rcp.rn.f32(id, d);
-        }
-        let qf: f32;
-        mul.rn.f32(qf, v, id);
-        let qi: s32;
-        cvt.rni.s32.f32(qi, qf);
-        min.s32(qi, qi, 7);
-        max.s32(qi, qi, -7);
-        let (nib, w): (u32, u32);
-        add.s32(qi, qi, 8);
-        and.b32(nib, qi, 15);
-        mov.u32(w, nib);
-        for k in 1..8 {
-            let o: u32;
-            shfl.sync.down.b32(o, nib, k, 31, 0xffff_ffff);
-            shl.b32(o, o, k * 4);
-            or.b32(w, w, o);
-        }
-        let (l8, eight): (u32, pred);
-        and.b32(l8, lane, 7);
-        setp.eq.u32(eight, l8, 0);
-        let (wa, half): (u64, u32);
-        shr.u32(half, lane, 1);
-        cvt.u64.u32(wa, half);
-        add.u64(wa, wa, qa);
-        if eight {
-            st.global.u32([wa], w);
-        }
-        let first: pred;
-        setp.eq.u32(first, lane, 0);
-        if first {
-            st.global.b16([sa], dh);
-        }
-    }
-
-    /// The byte address of channel block (c - lane) of `row` in an int4 cache kc, and the address of its scale in ks.
-    fn kv4_addr(qa: u64, sa: u64, row: u32, c: u32, lane: u32, kc: u64, ks: u64) {
-        let (qo, so, cb): (u32, u32, u32);
-        sub.u32(cb, c, lane);
-        shr.u32(cb, cb, 1);
-        mad.lo.u32(qo, row, 512, cb);
-        cvt.u64.u32(qa, qo);
-        add.u64(qa, qa, kc);
-        shr.u32(so, c, 5);
-        mad.lo.u32(so, row, 32, so);
-        mad.wide.u32(sa, so, 2, ks);
-    }
-
-    /// kv_prep8 (with the input-dependent taps of full attention) for int4 caches.
-    #[reqntid(128)]
-    pub unsafe extern "ptx-kernel" fn kv_prep4(
-        gk: *const f32, gv: *const f32, kw: *const f32, vw: *const f32, state: *mut f32, k: *mut f32, v: *mut f32, kc: *mut u8, ks: *mut u16, vc: *mut u8,
-        vs: *mut u16, params: *const u32, cscale: f32, thr: f32, eps: f32,
-    ) {
-        let red: shared<[f32; 32], 16>;
-        let (h, t, c, lane): (u32, u32, u32, u32);
-        mov.u32(h, ctaid.x);
-        mov.u32(t, tid.x);
-        mad.lo.u32(c, h, 128, t);
-        and.b32(lane, t, 31);
-        let (ko, vo): (f32, f32);
-        conv_ch::<1, 0>(ko, gk, kw, state, c, h, cscale);
-        conv_ch::<1, 1024>(vo, gv, vw, state, c, h, cscale);
-        let r: u32;
-        mov.u32(r, red);
-        let (ss, f, norm, vsq): (f32, f32, f32, f32);
-        mul.rn.f32(ss, ko, ko);
-        block_sum(ss, r);
-        sqrt.rn.f32(norm, ss);
-        add.rn.f32(norm, norm, 0.000_001);
-        div.rn.f32(f, thr, norm);
-        max.f32(f, f, 0.0);
-        min.f32(f, f, 1.0);
-        mul.rn.f32(ko, ko, f);
-        mul.rn.f32(vsq, vo, vo);
-        block_sum(vsq, r);
-        div.rn.f32(vsq, vsq, 128.0);
-        add.rn.f32(vsq, vsq, eps);
-        sqrt.rn.f32(vsq, vsq);
-        div.rn.f32(vo, vo, vsq);
-        let (ka, va): (u64, u64);
-        mad.wide.u32(ka, c, 4, k);
-        mad.wide.u32(va, c, 4, v);
-        st.global.f32([ka], ko);
-        st.global.f32([va], vo);
-        let row: u32;
-        ld.global.u32(row, [params]);
-        kv_quant4(ko, vo, row, c, lane, kc, ks, vc, vs);
-    }
-
-    /// The K and V values of channel c of `row` into int4 caches.
-    fn kv_quant4(ko: f32, vo: f32, row: u32, c: u32, lane: u32, kc: u64, ks: u64, vc: u64, vs: u64) {
-        let (kqa, ksa, vqa, vsa): (u64, u64, u64, u64);
-        kv4_addr(kqa, ksa, row, c, lane, kc, ks);
-        kv4_warp(ko, lane, kqa, ksa);
-        kv4_addr(vqa, vsa, row, c, lane, vc, vs);
-        kv4_warp(vo, lane, vqa, vsa);
-    }
-
-    /// kv_store8_t for int4 caches (full attention: no ring).
-    #[reqntid(128)]
-    pub unsafe extern "ptx-kernel" fn kv_store4_t(
-        k: *const f32, v: *const f32, kc: *mut u8, ks: *mut u16, vc: *mut u8, vs: *mut u16, params: *const u32, kstride: u32, vstride: u32,
-    ) {
-        let (h, tk, t, c, lane): (u32, u32, u32, u32, u32);
-        mov.u32(h, ctaid.x);
-        mov.u32(tk, ctaid.y);
-        mov.u32(t, tid.x);
-        mad.lo.u32(c, h, 128, t);
-        and.b32(lane, t, 31);
-        let row: u32;
-        ld.global.u32(row, [params]);
-        add.u32(row, row, tk);
-        let (ki, vi): (u32, u32);
-        let (ka, va): (u64, u64);
-        mad.lo.u32(ki, tk, kstride, c);
-        mad.lo.u32(vi, tk, vstride, c);
-        mad.wide.u32(ka, ki, 4, k);
-        mad.wide.u32(va, vi, 4, v);
-        let (kv, vv): (f32, f32);
-        ld.global.f32(kv, [ka]);
-        ld.global.f32(vv, [va]);
-        kv_quant4(kv, vv, row, c, lane, kc, ks, vc, vs);
-    }
-
-    /// acc += the 8 signed nibbles of `w` (value j in bits 4j..) times x0..x7.
-    fn fma_s4x8(acc: f32, w: u32, x0: f32, x1: f32, x2: f32, x3: f32, x4: f32, x5: f32, x6: f32, x7: f32) {
-        let b: s32;
-        let f: f32;
-        bfe.s32(b, w, 0, 4);
-        cvt.rn.f32.s32(f, b);
-        fma.rn.f32(acc, f, x0, acc);
-        bfe.s32(b, w, 4, 4);
-        cvt.rn.f32.s32(f, b);
-        fma.rn.f32(acc, f, x1, acc);
-        bfe.s32(b, w, 8, 4);
-        cvt.rn.f32.s32(f, b);
-        fma.rn.f32(acc, f, x2, acc);
-        bfe.s32(b, w, 12, 4);
-        cvt.rn.f32.s32(f, b);
-        fma.rn.f32(acc, f, x3, acc);
-        bfe.s32(b, w, 16, 4);
-        cvt.rn.f32.s32(f, b);
-        fma.rn.f32(acc, f, x4, acc);
-        bfe.s32(b, w, 20, 4);
-        cvt.rn.f32.s32(f, b);
-        fma.rn.f32(acc, f, x5, acc);
-        bfe.s32(b, w, 24, 4);
-        cvt.rn.f32.s32(f, b);
-        fma.rn.f32(acc, f, x6, acc);
-        bfe.s32(b, w, 28, 4);
-        cvt.rn.f32.s32(f, b);
-        fma.rn.f32(acc, f, x7, acc);
-    }
-
-    /// p0..p2 += the 8 nibbles of `w` times q of the 3 heads at shared `qa` (heads 512 bytes apart).
-    fn dot3_s4x8(p0: f32, p1: f32, p2: f32, w: u32, qa: u32) {
-        let (q0, q1, q2, q3, q4, q5, q6, q7): (f32, f32, f32, f32, f32, f32, f32, f32);
-        ld.shared.v4.f32((q0, q1, q2, q3), [qa]);
-        ld.shared.v4.f32((q4, q5, q6, q7), [qa + 16]);
-        fma_s4x8(p0, w, q0, q1, q2, q3, q4, q5, q6, q7);
-        ld.shared.v4.f32((q0, q1, q2, q3), [qa + 512]);
-        ld.shared.v4.f32((q4, q5, q6, q7), [qa + 528]);
-        fma_s4x8(p1, w, q0, q1, q2, q3, q4, q5, q6, q7);
-        ld.shared.v4.f32((q0, q1, q2, q3), [qa + 1024]);
-        ld.shared.v4.f32((q4, q5, q6, q7), [qa + 1040]);
-        fma_s4x8(p2, w, q0, q1, q2, q3, q4, q5, q6, q7);
-    }
-
-    /// p0..p2 += the 4 signed bytes of `w` times q of the 3 heads at shared `qa` (heads 512 bytes apart).
-    fn dot3_s8x4(p0: f32, p1: f32, p2: f32, w: u32, qa: u32) {
-        let (q0, q1, q2, q3): (f32, f32, f32, f32);
-        ld.shared.v4.f32((q0, q1, q2, q3), [qa]);
-        fma_s8x4(p0, w, q0, q1, q2, q3);
-        ld.shared.v4.f32((q0, q1, q2, q3), [qa + 512]);
-        fma_s8x4(p1, w, q0, q1, q2, q3);
-        ld.shared.v4.f32((q0, q1, q2, q3), [qa + 1024]);
-        fma_s8x4(p2, w, q0, q1, q2, q3);
-    }
-
-    /// The query of the block's 3 heads (shared f32 qsh [3][128], scaled) as int8 for the dp4a scores: q8 [3][128] bytes
-    /// in the order the K format reads them (K4: in each 8, the even dimensions, then the odd ones), d [3][4] per 32,
-    /// and (K4) 8 times the sum of each 32 int8 at qs [3][4], what the +8 of the int4 keys adds. 128 threads, then a
-    /// barrier.
-    fn q_quant<const K4: u32>(t: u32, qb: u32, q8b: u32, qdb: u32, qsb: u32) {
-        let (lane, w): (u32, u32);
-        and.b32(lane, t, 31);
-        shr.u32(w, t, 5);
-        let (l8, eight, first): (u32, pred, pred);
-        and.b32(l8, lane, 7);
-        setp.eq.u32(eight, l8, 0);
-        setp.eq.u32(first, lane, 0);
-        for k in 0..3 {
-            let (qa, v, a, amax, d, id): (u32, f32, f32, f32, f32, f32);
-            mad.lo.u32(qa, t, 4, qb);
-            ld.shared.f32(v, [qa + (k * 512)]);
-            abs.f32(a, v);
-            mov.f32(amax, a);
-            warp_max(amax);
-            div.rn.f32(d, amax, 127.0);
-            let nz: pred;
-            setp.gt.f32(nz, d, 0.0);
-            mov.f32(id, 0.0);
-            if nz {
-                rcp.rn.f32(id, d);
-            }
-            let (qf, qi, sum): (f32, s32, s32);
-            mul.rn.f32(qf, v, id);
-            cvt.rni.s32.f32(qi, qf);
-            min.s32(qi, qi, 127);
-            max.s32(qi, qi, -127);
-            mov.s32(sum, qi);
-            warp_isum(sum);
-            let b: u32;
-            and.b32(b, qi, 255);
-            let o: [u32; 8];
-            mov.u32(o[0], b);
-            for j in 1..8 {
-                shfl.sync.down.b32(o[j], b, j, 31, 0xffff_ffff);
-            }
-            let (w0, w1, x): (u32, u32, u32);
-            if K4 == 1 {
-                mov.u32(w0, o[0]);
-                mov.u32(w1, o[1]);
-                for j in 1..4 {
-                    shl.b32(x, o[2 * j], j * 8);
-                    or.b32(w0, w0, x);
-                    shl.b32(x, o[2 * j + 1], j * 8);
-                    or.b32(w1, w1, x);
-                }
-            } else {
-                mov.u32(w0, o[0]);
-                mov.u32(w1, o[4]);
-                for j in 1..4 {
-                    shl.b32(x, o[j], j * 8);
-                    or.b32(w0, w0, x);
-                    shl.b32(x, o[j + 4], j * 8);
-                    or.b32(w1, w1, x);
-                }
-            }
-            if eight {
-                let sa: u32;
-                add.u32(sa, q8b, t);
-                st.shared.v2.u32([sa + (k * 128)], (w0, w1));
-            }
-            if first {
-                let (da, ssa): (u32, u32);
-                mad.lo.u32(da, w, 4, qdb);
-                st.shared.f32([da + (k * 16)], d);
-                mul.lo.s32(sum, sum, 8);
-                mad.lo.u32(ssa, w, 4, qsb);
-                st.shared.s32([ssa + (k * 16)], sum);
-            }
-        }
-        bar.sync(0);
-    }
-
-    /// score_dist on the int8 cache (K4 = 1: the int4 one), the dots by dp4a on the int8 query of q_quant; the key's row
-    /// goes to shared ri[jj] for the V pass.
-    fn score_dist8<const K4: u32>(
-        start: u32, jj: u32, kvh: u32, pos: u32, ring: u32, extent: u32, kc: u64, ks: u64, rb: u64, q8b: u32, qdb: u32, qsb: u32, rbs: u32, kb: u32,
-        sb: u32, rib: u32,
-    ) {
-        let (dist, kp, row, ko, ria): (u32, u32, u32, u32, u32);
-        add.u32(dist, start, jj);
-        sub.u32(kp, pos, dist);
-        mov.u32(row, kp);
-        let is_ring: pred;
-        setp.ne.u32(is_ring, ring, 0);
-        if is_ring {
-            rem.u32(row, kp, ring);
-        }
-        mad.lo.u32(ria, jj, 4, rib);
-        st.shared.u32([ria], row);
-        mad.lo.u32(ko, row, 8, kvh);
-        let (ka, sa): (u64, u64);
-        let kq: u32;
-        if K4 == 1 {
-            shl.b32(kq, ko, 6);
-        } else {
-            shl.b32(kq, ko, 7);
-        }
-        cvt.u64.u32(ka, kq);
-        add.u64(ka, ka, kc);
-        mad.wide.u32(sa, ko, 8, ks);
-        let (h0, h1, h2, h3): (f16, f16, f16, f16);
-        ld.global.nc.v4.b16((h0, h1, h2, h3), [sa]);
-        let (s0, s1, s2): (f32, f32, f32);
-        mov.f32(s0, 0.0);
-        mov.f32(s1, 0.0);
-        mov.f32(s2, 0.0);
-        for blk in 0..4 {
-            let d: f32;
-            let acc: [s32; 3];
-            for h in 0..3 {
-                mov.s32(acc[h], 0);
-            }
-            if K4 == 1 {
-                let wk: [u32; 4];
-                ld.global.nc.v4.u32((wk[0], wk[1], wk[2], wk[3]), [ka + (blk * 16)]);
-                for i in 0..4 {
-                    let (lo, hi): (u32, u32);
-                    and.b32(lo, wk[i], 0x0f0f_0f0f);
-                    shr.u32(hi, wk[i], 4);
-                    and.b32(hi, hi, 0x0f0f_0f0f);
-                    for h in 0..3 {
-                        let (qe, qo): (u32, u32);
-                        ld.shared.v2.u32((qe, qo), [q8b + (h * 128 + blk * 32 + i * 8)]);
-                        dp4a.s32.s32(acc[h], lo, qe, acc[h]);
-                        dp4a.s32.s32(acc[h], hi, qo, acc[h]);
-                    }
-                }
-                for h in 0..3 {
-                    let c8: s32;
-                    ld.shared.s32(c8, [qsb + (h * 16 + blk * 4)]);
-                    sub.s32(acc[h], acc[h], c8);
-                }
-            } else {
-                for c in 0..2 {
-                    let wk: [u32; 4];
-                    ld.global.nc.v4.u32((wk[0], wk[1], wk[2], wk[3]), [ka + (blk * 32 + c * 16)]);
-                    for h in 0..3 {
-                        let xq: [u32; 4];
-                        ld.shared.v4.u32((xq[0], xq[1], xq[2], xq[3]), [q8b + (h * 128 + blk * 32 + c * 16)]);
-                        for i in 0..4 {
-                            dp4a.s32.s32(acc[h], wk[i], xq[i], acc[h]);
-                        }
-                    }
-                }
-            }
-            if blk == 0 {
-                cvt.f32.f16(d, h0);
-            }
-            if blk == 1 {
-                cvt.f32.f16(d, h1);
-            }
-            if blk == 2 {
-                cvt.f32.f16(d, h2);
-            }
-            if blk == 3 {
-                cvt.f32.f16(d, h3);
-            }
-            for h in 0..3 {
-                let (f, dq): (f32, f32);
-                cvt.rn.f32.s32(f, acc[h]);
-                ld.shared.f32(dq, [qdb + (h * 16 + blk * 4)]);
-                mul.rn.f32(dq, dq, d);
-                if h == 0 {
-                    fma.rn.f32(s0, f, dq, s0);
-                }
-                if h == 1 {
-                    fma.rn.f32(s1, f, dq, s1);
-                }
-                if h == 2 {
-                    fma.rn.f32(s2, f, dq, s2);
-                }
-            }
-        }
-        let inb: pred;
-        setp.lt.u32(inb, dist, extent);
-        if inb {
-            let bo: u32;
-            let ba: u64;
-            shl.b32(bo, dist, 4);
-            mad.wide.u32(ba, bo, 4, rb);
-            for c in 0..4 {
-                let (b0, b1, b2, b3): (f32, f32, f32, f32);
-                ld.global.nc.v4.f32((b0, b1, b2, b3), [ba + (c * 16)]);
-                for hh in 0..3 {
-                    let (r0, r1, r2, r3): (f32, f32, f32, f32);
-                    ld.shared.v4.f32((r0, r1, r2, r3), [rbs + (hh * 64 + c * 16)]);
-                    if hh == 0 {
-                        fma.rn.f32(s0, b0, r0, s0);
-                        fma.rn.f32(s0, b1, r1, s0);
-                        fma.rn.f32(s0, b2, r2, s0);
-                        fma.rn.f32(s0, b3, r3, s0);
-                    }
-                    if hh == 1 {
-                        fma.rn.f32(s1, b0, r0, s1);
-                        fma.rn.f32(s1, b1, r1, s1);
-                        fma.rn.f32(s1, b2, r2, s1);
-                        fma.rn.f32(s1, b3, r3, s1);
-                    }
-                    if hh == 2 {
-                        fma.rn.f32(s2, b0, r0, s2);
-                        fma.rn.f32(s2, b1, r1, s2);
-                        fma.rn.f32(s2, b2, r2, s2);
-                        fma.rn.f32(s2, b3, r3, s2);
-                    }
-                }
-            }
-        }
-        let (k0s, k1s, k2s): (f32, f32, f32);
-        ld.shared.f32(k0s, [kb]);
-        ld.shared.f32(k1s, [kb + 4]);
-        ld.shared.f32(k2s, [kb + 8]);
-        sub.rn.f32(s0, s0, k0s);
-        sub.rn.f32(s1, s1, k1s);
-        sub.rn.f32(s2, s2, k2s);
-        let sa2: u32;
-        mad.lo.u32(sa2, jj, 4, sb);
-        st.shared.f32([sa2], s0);
-        st.shared.f32([sa2 + 1024], s1);
-        st.shared.f32([sa2 + 2048], s2);
-    }
-
-    /// The V pass of a chunk of `cnt` keys (V4: int4 values): lane group g = lane / 8 of warp w takes keys 4 w + g, + 16,
-    /// .. (2 at a time), lane l8 = lane % 8 its 16 dimensions (one 16-byte load, 8 for int4), converted without cvt
-    /// (the byte, plus 128 for int8 or the stored +8 for int4, into the low byte of 2^23); the 4 groups are summed by
-    /// shuffles and each warp's sums go to shared red[w][h][128], then the block waits.
-    fn v_chunk8<const V4: u32>(t: u32, cnt: u32, kvh: u32, vc: u64, vs: u64, sb: u32, rib: u32, redb: u32) {
-        let (lane, w, g, l8, base): (u32, u32, u32, u32, u32);
-        and.b32(lane, t, 31);
-        shr.u32(w, t, 5);
-        shr.u32(g, lane, 3);
-        and.b32(l8, lane, 7);
-        let acc: [f32; 48];
-        for i in 0..48 {
-            mov.f32(acc[i], 0.0);
-        }
-        let off: f32;
-        if V4 == 1 {
-            mov.f32(off, 8388616.0);
-        } else {
-            mov.f32(off, 8388736.0);
-        }
-        shl.b32(base, w, 2);
-        label(vtop);
-        let vdone: pred;
-        setp.ge.u32(vdone, base, cnt);
-        if vdone {
-            bra(vend);
-        }
-        for u in 0..2 {
-            let (jj, ok): (u32, pred);
-            add.u32(jj, base, g);
-            add.u32(jj, jj, u * 16);
-            setp.lt.u32(ok, jj, cnt);
-            let wv: [u32; 4];
-            let (p0, p1, p2, d): (f32, f32, f32, f32);
-            for k in 0..4 {
-                mov.u32(wv[k], 0);
-            }
-            mov.f32(p0, 0.0);
-            mov.f32(p1, 0.0);
-            mov.f32(p2, 0.0);
-            mov.f32(d, 0.0);
-            if ok {
-                let (pa, row, vo, so, b2, bo): (u32, u32, u32, u32, u32, u32);
-                let (va, sa): (u64, u64);
-                let dh: f16;
-                mad.lo.u32(pa, jj, 4, rib);
-                ld.shared.u32(row, [pa]);
-                mad.lo.u32(vo, row, 8, kvh);
-                shr.u32(b2, l8, 1);
-                mad.lo.u32(so, vo, 4, b2);
-                mad.wide.u32(sa, so, 2, vs);
-                ld.global.nc.b16(dh, [sa]);
-                cvt.f32.f16(d, dh);
-                if V4 == 1 {
-                    mad.lo.u32(bo, vo, 8, l8);
-                    mad.wide.u32(va, bo, 8, vc);
-                    ld.global.nc.v2.u32((wv[0], wv[1]), [va]);
-                } else {
-                    mad.lo.u32(bo, vo, 8, l8);
-                    mad.wide.u32(va, bo, 16, vc);
-                    ld.global.nc.v4.u32((wv[0], wv[1], wv[2], wv[3]), [va]);
-                }
-                mad.lo.u32(pa, jj, 4, sb);
-                ld.shared.f32(p0, [pa]);
-                ld.shared.f32(p1, [pa + 1024]);
-                ld.shared.f32(p2, [pa + 2048]);
-            }
-            mul.rn.f32(p0, p0, d);
-            mul.rn.f32(p1, p1, d);
-            mul.rn.f32(p2, p2, d);
-            let f: [f32; 16];
-            if V4 == 1 {
-                for k in 0..2 {
-                    let (lo, hi, x): (u32, u32, u32);
-                    and.b32(lo, wv[k], 0x0f0f_0f0f);
-                    shr.u32(hi, wv[k], 4);
-                    and.b32(hi, hi, 0x0f0f_0f0f);
-                    for b in 0..4 {
-                        prmt.b32(x, lo, 0x4B00_0000, 0x7540 + b);
-                        mov.b32(f[8 * k + 2 * b], x);
-                        prmt.b32(x, hi, 0x4B00_0000, 0x7540 + b);
-                        mov.b32(f[8 * k + 2 * b + 1], x);
-                    }
-                }
-            } else {
-                for k in 0..4 {
-                    let (tw, x): (u32, u32);
-                    xor.b32(tw, wv[k], 0x8080_8080);
-                    for b in 0..4 {
-                        prmt.b32(x, tw, 0x4B00_0000, 0x7540 + b);
-                        mov.b32(f[4 * k + b], x);
-                    }
-                }
-            }
-            for i in 0..16 {
-                sub.rn.f32(f[i], f[i], off);
-                fma.rn.f32(acc[i], p0, f[i], acc[i]);
-                fma.rn.f32(acc[16 + i], p1, f[i], acc[16 + i]);
-                fma.rn.f32(acc[32 + i], p2, f[i], acc[32 + i]);
-            }
-        }
-        add.u32(base, base, 32);
-        bra(vtop);
-        label(vend);
-        // the 4 lane groups hold the same dimensions: sum them
-        for i in 0..48 {
-            let o: f32;
-            shfl.sync.bfly.b32(o, acc[i], 8, 31, 0xffff_ffff);
-            add.rn.f32(acc[i], acc[i], o);
-            shfl.sync.bfly.b32(o, acc[i], 16, 31, 0xffff_ffff);
-            add.rn.f32(acc[i], acc[i], o);
-        }
-        let g0: pred;
-        setp.eq.u32(g0, g, 0);
-        if g0 {
-            let ra: u32;
-            mad.lo.u32(ra, w, 1536, redb);
-            mad.lo.u32(ra, l8, 64, ra);
-            for h in 0..3 {
-                for m in 0..4 {
-                    st.shared.v4.f32([ra + (h * 512 + m * 16)], (acc[h * 16 + 4 * m], acc[h * 16 + 4 * m + 1], acc[h * 16 + 4 * m + 2], acc[h * 16 + 4 * m + 3]));
-                }
-            }
-        }
-        bar.sync(0);
-    }
-
-    /// Sum over the 4 warps of red[w][h][t], for head h (byte offset of the head `ho`).
-    fn red4(acc: f32, redb: u32, t: u32, ho: u32) {
-        let (a, x): (u32, f32);
-        mad.lo.u32(a, t, 4, redb);
-        add.u32(a, a, ho);
-        ld.shared.f32(acc, [a]);
-        for w in 1..4 {
-            ld.shared.f32(x, [a + (w * 1536)]);
-            add.rn.f32(acc, acc, x);
-        }
-    }
-
-    /// attn_part on the int8 cache (K4: the int4 one), chunks of 2^cs keys (at most 256): grid = (8 kv heads, chunks); a chunk past the
-    /// keys of the token does nothing. Partials as attn_part: pm/pl [kvh][maxs][3], pacc [kvh][maxs][3][128].
-    #[reqntid(128)]
-    #[instances(0, 1)]
-    pub unsafe extern "ptx-kernel" fn attn_part8<const K4: u32>(
-        q: *const f32, r: *const f32, sink: *const f32, rb: *const f32, kc: *const u8, ks: *const u16, vc: *const u8, vs: *const u16, pm: *mut f32,
-        pl: *mut f32, pacc: *mut f32, params: *const u32, ring: u32, extent: u32, scale: f32, maxs: u32, window: u32, cs: u32,
-    ) {
-        let qsh: shared<[f32; 384], 16>;
-        let q8sh: shared<[u32; 96], 16>;
-        let qdsh: shared<[f32; 12], 16>;
-        let qssh: shared<[u32; 12], 16>;
-        let rsh: shared<[f32; 48], 16>;
-        let ksh: shared<[f32; 4], 16>;
-        let sc: shared<[f32; 768], 16>;
-        let ri: shared<[u32; 256], 16>;
-        let red: shared<[f32; 1536], 16>;
-        let (kvh, sp, t): (u32, u32, u32);
-        mov.u32(kvh, ctaid.x);
-        mov.u32(sp, ctaid.y);
-        mov.u32(t, tid.x);
-        let (pos, nk, start, cnt, csz): (u32, u32, u32, u32, u32);
-        ld.global.u32(pos, [params]);
-        add.u32(nk, pos, 1);
-        min.u32(nk, nk, window);
-        shl.b32(start, sp, cs);
-        let none: pred;
-        setp.ge.u32(none, start, nk);
-        if none {
-            ret();
-        }
-        shl.b32(csz, 1, cs);
-        sub.u32(cnt, nk, start);
-        min.u32(cnt, cnt, csz);
-        let (qb, rbs, kb, sb, rib, redb): (u32, u32, u32, u32, u32, u32);
-        mov.u32(qb, qsh);
-        mov.u32(rbs, rsh);
-        mov.u32(kb, ksh);
-        mov.u32(sb, sc);
-        mov.u32(rib, ri);
-        mov.u32(redb, red);
-        let h0: u32;
-        mul.lo.u32(h0, kvh, 3);
-        for k in 0..3 {
-            let (qi, qa2): (u32, u32);
-            let qa: u64;
-            let v: f32;
-            mad.lo.u32(qi, h0, 128, t);
-            add.u32(qi, qi, k * 128);
-            mad.wide.u32(qa, qi, 4, q);
-            ld.global.f32(v, [qa]);
-            mul.rn.f32(v, v, scale);
-            mad.lo.u32(qa2, t, 4, qb);
-            st.shared.f32([qa2 + (k * 512)], v);
-        }
-        let lt48: pred;
-        setp.lt.u32(lt48, t, 48);
-        if lt48 {
-            let (ri2, ra2): (u32, u32);
-            let ra: u64;
-            let v: f32;
-            mad.lo.u32(ri2, h0, 16, t);
-            mad.wide.u32(ra, ri2, 4, r);
-            ld.global.f32(v, [ra]);
-            mad.lo.u32(ra2, t, 4, rbs);
-            st.shared.f32([ra2], v);
-        }
-        let lt3: pred;
-        setp.lt.u32(lt3, t, 3);
-        if lt3 {
-            let (si, sa2): (u32, u32);
-            let sa: u64;
-            let v: f32;
-            add.u32(si, h0, t);
-            mad.wide.u32(sa, si, 4, sink);
-            ld.global.f32(v, [sa]);
-            mad.lo.u32(sa2, t, 4, kb);
-            st.shared.f32([sa2], v);
-        }
-        bar.sync(0);
-        let (q8b, qdb, qsb): (u32, u32, u32);
-        mov.u32(q8b, q8sh);
-        mov.u32(qdb, qdsh);
-        mov.u32(qsb, qssh);
-        q_quant::<K4>(t, qb, q8b, qdb, qsb);
-
-        let jj: u32;
-        mov.u32(jj, t);
-        label(stop);
-        let sdone: pred;
-        setp.ge.u32(sdone, jj, cnt);
-        if sdone {
-            bra(send);
-        }
-        score_dist8::<K4>(start, jj, kvh, pos, ring, extent, kc, ks, rb, q8b, qdb, qsb, rbs, kb, sb, rib);
-        add.u32(jj, jj, 128);
-        bra(stop);
-        label(send);
-        bar.sync(0);
-
-        let (lane, w): (u32, u32);
-        and.b32(lane, t, 31);
-        shr.u32(w, t, 5);
-        let no_head: pred;
-        setp.ge.u32(no_head, w, 3);
-        if no_head {
-            bra(sm_skip);
-        }
-        softmax_part(w, lane, cnt, sb, kvh, sp, maxs, pm, pl);
-        label(sm_skip);
-        bar.sync(0);
-
-        v_chunk8::<K4>(t, cnt, kvh, vc, vs, sb, rib, redb);
-        let (po, pao): (u32, u64);
-        mad.lo.u32(po, kvh, maxs, sp);
-        mul.lo.u32(po, po, 384);
-        add.u32(po, po, t);
-        mad.wide.u32(pao, po, 4, pacc);
-        let acc: f32;
-        let ho: u32;
-        for hh in 0..3 {
-            mov.u32(ho, hh * 512);
-            red4(acc, redb, t, ho);
-            st.global.f32([pao + (hh * 512)], acc);
-        }
-    }
-
-    /// Combines the chunks of attn_part8 (chunks of 2^cs keys) and the zero sink logit: out[h][d]; a block of 8 warps
-    /// per query head; warp w takes chunks w, w + 8, .., lane its 4 dimensions.
-    #[reqntid(256)]
-    pub unsafe extern "ptx-kernel" fn attn_reduce8(pm: *const f32, pl: *const f32, pacc: *const f32, out: *mut f32, params: *const u32, window: u32, maxs: u32, cs: u32) {
-        let red: shared<[f32; 1024], 16>;
-        let lred: shared<[f32; 8], 16>;
-        let mx: shared<[f32; 8], 16>;
-        let (h, t, kvh, hh, lane, w): (u32, u32, u32, u32, u32, u32);
-        mov.u32(h, ctaid.x);
-        mov.u32(t, tid.x);
-        div.u32(kvh, h, 3);
-        rem.u32(hh, h, 3);
-        and.b32(lane, t, 31);
-        shr.u32(w, t, 5);
-        let (pos, nk, ns, csz): (u32, u32, u32, u32);
-        ld.global.u32(pos, [params]);
-        add.u32(nk, pos, 1);
-        min.u32(nk, nk, window);
-        shl.b32(csz, 1, cs);
-        add.u32(ns, nk, csz);
-        sub.u32(ns, ns, 1);
-        shr.u32(ns, ns, cs);
-        let base: u32;
-        mul.lo.u32(base, kvh, maxs);
-        // the max over the chunks and the sink's 0
-        let (mm, sp): (f32, u32);
-        mov.f32(mm, 0.0);
-        mov.u32(sp, t);
-        label(mt);
-        let md: pred;
-        setp.ge.u32(md, sp, ns);
-        if md {
-            bra(me);
-        }
-        let o: u32;
-        let ma: u64;
-        let mv: f32;
-        add.u32(o, base, sp);
-        mad.lo.u32(o, o, 3, hh);
-        mad.wide.u32(ma, o, 4, pm);
-        ld.global.f32(mv, [ma]);
-        max.f32(mm, mm, mv);
-        add.u32(sp, sp, 256);
-        bra(mt);
-        label(me);
-        warp_max(mm);
-        let (mxb, first): (u32, pred);
-        mov.u32(mxb, mx);
-        setp.eq.u32(first, lane, 0);
-        if first {
-            let wa: u32;
-            mad.lo.u32(wa, w, 4, mxb);
-            st.shared.f32([wa], mm);
-        }
-        bar.sync(0);
-        let x: f32;
-        ld.shared.f32(mm, [mxb]);
-        for k in 1..8 {
-            ld.shared.f32(x, [mxb + (k * 4)]);
-            max.f32(mm, mm, x);
-        }
-        // the weighted sums
-        let (a0, a1, a2, a3, ll): (f32, f32, f32, f32, f32);
-        mov.f32(a0, 0.0);
-        mov.f32(a1, 0.0);
-        mov.f32(a2, 0.0);
-        mov.f32(a3, 0.0);
-        mov.f32(ll, 0.0);
-        mov.u32(sp, w);
-        label(at);
-        let ad: pred;
-        setp.ge.u32(ad, sp, ns);
-        if ad {
-            bra(ae);
-        }
-        let (o2, o3): (u32, u32);
-        let (ma2, la2, aa2): (u64, u64, u64);
-        let (mv2, lv2, e2, x0, x1, x2, x3): (f32, f32, f32, f32, f32, f32, f32);
-        add.u32(o2, base, sp);
-        mad.lo.u32(o2, o2, 3, hh);
-        mad.lo.u32(o3, o2, 32, lane);
-        mad.wide.u32(ma2, o2, 4, pm);
-        mad.wide.u32(la2, o2, 4, pl);
-        mad.wide.u32(aa2, o3, 16, pacc);
-        ld.global.f32(mv2, [ma2]);
-        ld.global.f32(lv2, [la2]);
-        ld.global.v4.f32((x0, x1, x2, x3), [aa2]);
-        sub.rn.f32(e2, mv2, mm);
-        exp(e2, e2);
-        fma.rn.f32(ll, lv2, e2, ll);
-        fma.rn.f32(a0, x0, e2, a0);
-        fma.rn.f32(a1, x1, e2, a1);
-        fma.rn.f32(a2, x2, e2, a2);
-        fma.rn.f32(a3, x3, e2, a3);
-        add.u32(sp, sp, 8);
-        bra(at);
-        label(ae);
-        let (redb, lb, ra): (u32, u32, u32);
-        mov.u32(redb, red);
-        mov.u32(lb, lred);
-        mad.lo.u32(ra, w, 512, redb);
-        mad.lo.u32(ra, lane, 16, ra);
-        st.shared.v4.f32([ra], (a0, a1, a2, a3));
-        if first {
-            let la: u32;
-            mad.lo.u32(la, w, 4, lb);
-            st.shared.f32([la], ll);
-        }
-        bar.sync(0);
-        let lt128: pred;
-        setp.lt.u32(lt128, t, 128);
-        if lt128 {
-            let (acc, l, y): (f32, f32, f32);
-            let (a, oo): (u32, u32);
-            let oa: u64;
-            mad.lo.u32(a, t, 4, redb);
-            ld.shared.f32(acc, [a]);
-            ld.shared.f32(l, [lb]);
-            for k in 1..8 {
-                ld.shared.f32(y, [a + (k * 512)]);
-                add.rn.f32(acc, acc, y);
-                ld.shared.f32(y, [lb + (k * 4)]);
-                add.rn.f32(l, l, y);
-            }
-            sub.rn.f32(y, 0.0, mm);
-            exp(y, y);
-            add.rn.f32(l, l, y);
-            div.rn.f32(acc, acc, l);
-            mad.lo.u32(oo, h, 128, t);
-            mad.wide.u32(oa, oo, 4, out);
-            st.global.f32([oa], acc);
-        }
-    }
-
-    /// attn_prefill on the int8 cache (K4: the int4 one): a block per (kv head, query token), the keys in chunks of 256 by distance, online
-    /// softmax with the sink as the initial state (m = 0, l = 1); the V pass of a chunk split over the 4 warps.
-    #[reqntid(128)]
-    #[instances(0, 1)]
-    pub unsafe extern "ptx-kernel" fn attn_prefill8<const K4: u32>(
-        q: *const f32, r: *const f32, sink: *const f32, rb: *const f32, kc: *const u8, ks: *const u16, vc: *const u8, vs: *const u16, out: *mut f32,
-        params: *const u32, ring: u32, window: u32, extent: u32, scale: f32, q_stride: u32, r_stride: u32, s_stride: u32,
-    ) {
-        let qsh: shared<[f32; 384], 16>;
-        let q8sh: shared<[u32; 96], 16>;
-        let qdsh: shared<[f32; 12], 16>;
-        let qssh: shared<[u32; 12], 16>;
-        let rsh: shared<[f32; 48], 16>;
-        let ksh: shared<[f32; 4], 16>;
-        let sc: shared<[f32; 768], 16>;
-        let ml: shared<[f32; 12], 16>; // m[3], l[3], alpha[3]
-        let ri: shared<[u32; 256], 16>;
-        let red: shared<[f32; 1536], 16>;
-        let (kvh, tk, t): (u32, u32, u32);
-        mov.u32(kvh, ctaid.x);
-        mov.u32(tk, ctaid.y);
-        mov.u32(t, tid.x);
-        let (pos, nk): (u32, u32);
-        ld.global.u32(pos, [params]);
-        add.u32(pos, pos, tk);
-        add.u32(nk, pos, 1);
-        min.u32(nk, nk, window);
-        let (qb, rbs, kb, sb, mb, rib, redb): (u32, u32, u32, u32, u32, u32, u32);
-        mov.u32(qb, qsh);
-        mov.u32(rbs, rsh);
-        mov.u32(kb, ksh);
-        mov.u32(sb, sc);
-        mov.u32(mb, ml);
-        mov.u32(rib, ri);
-        mov.u32(redb, red);
-        let h0: u32;
-        mul.lo.u32(h0, kvh, 3);
-        for k in 0..3 {
-            let (qi, qa2): (u32, u32);
-            let qa: u64;
-            let v: f32;
-            mad.lo.u32(qi, tk, q_stride, t);
-            mad.lo.u32(qi, h0, 128, qi);
-            add.u32(qi, qi, k * 128);
-            mad.wide.u32(qa, qi, 4, q);
-            ld.global.f32(v, [qa]);
-            mul.rn.f32(v, v, scale);
-            mad.lo.u32(qa2, t, 4, qb);
-            st.shared.f32([qa2 + (k * 512)], v);
-        }
-        let lt48: pred;
-        setp.lt.u32(lt48, t, 48);
-        if lt48 {
-            let (ri2, ra2): (u32, u32);
-            let ra: u64;
-            let v: f32;
-            mad.lo.u32(ri2, tk, r_stride, t);
-            mad.lo.u32(ri2, h0, 16, ri2);
-            mad.wide.u32(ra, ri2, 4, r);
-            ld.global.f32(v, [ra]);
-            mad.lo.u32(ra2, t, 4, rbs);
-            st.shared.f32([ra2], v);
-        }
-        let lt3: pred;
-        setp.lt.u32(lt3, t, 3);
-        if lt3 {
-            let (si, sa2, ma): (u32, u32, u32);
-            let sa: u64;
-            let v: f32;
-            mad.lo.u32(si, tk, s_stride, h0);
-            add.u32(si, si, t);
-            mad.wide.u32(sa, si, 4, sink);
-            ld.global.f32(v, [sa]);
-            mad.lo.u32(sa2, t, 4, kb);
-            st.shared.f32([sa2], v);
-            mad.lo.u32(ma, t, 4, mb);
-            st.shared.f32([ma], 0.0);
-            st.shared.f32([ma + 12], 1.0);
-        }
-        bar.sync(0);
-        let (q8b, qdb, qsb): (u32, u32, u32);
-        mov.u32(q8b, q8sh);
-        mov.u32(qdb, qdsh);
-        mov.u32(qsb, qssh);
-        q_quant::<K4>(t, qb, q8b, qdb, qsb);
-        let (a0, a1, a2): (f32, f32, f32);
-        mov.f32(a0, 0.0);
-        mov.f32(a1, 0.0);
-        mov.f32(a2, 0.0);
-        let (lane, w): (u32, u32);
-        and.b32(lane, t, 31);
-        shr.u32(w, t, 5);
-        let start: u32;
-        mov.u32(start, 0);
-        label(ctop);
-        let cdone: pred;
-        setp.ge.u32(cdone, start, nk);
-        if cdone {
-            bra(cend);
-        }
-        let cnt: u32;
-        sub.u32(cnt, nk, start);
-        min.u32(cnt, cnt, 256);
-        let jj: u32;
-        mov.u32(jj, t);
-        label(stop);
-        let sdone: pred;
-        setp.ge.u32(sdone, jj, cnt);
-        if sdone {
-            bra(send);
-        }
-        score_dist8::<K4>(start, jj, kvh, pos, ring, extent, kc, ks, rb, q8b, qdb, qsb, rbs, kb, sb, rib);
-        add.u32(jj, jj, 128);
-        bra(stop);
-        label(send);
-        bar.sync(0);
-        let no_head: pred;
-        setp.ge.u32(no_head, w, 3);
-        if no_head {
-            bra(sm_skip);
-        }
-        softmax_online(w, lane, cnt, sb, mb);
-        label(sm_skip);
-        bar.sync(0);
-        v_chunk8::<K4>(t, cnt, kvh, vc, vs, sb, rib, redb);
-        // acc = acc alpha + the chunk's sum
-        let (al0, al1, al2, c0, c1, c2): (f32, f32, f32, f32, f32, f32);
-        let ho: u32;
-        ld.shared.f32(al0, [mb + 24]);
-        ld.shared.f32(al1, [mb + 28]);
-        ld.shared.f32(al2, [mb + 32]);
-        mov.u32(ho, 0);
-        red4(c0, redb, t, ho);
-        mov.u32(ho, 512);
-        red4(c1, redb, t, ho);
-        mov.u32(ho, 1024);
-        red4(c2, redb, t, ho);
-        fma.rn.f32(a0, a0, al0, c0);
-        fma.rn.f32(a1, a1, al1, c1);
-        fma.rn.f32(a2, a2, al2, c2);
-        bar.sync(0);
-        add.u32(start, start, 256);
-        bra(ctop);
-        label(cend);
-        let (l0, l1, l2): (f32, f32, f32);
-        ld.shared.f32(l0, [mb + 12]);
-        ld.shared.f32(l1, [mb + 16]);
-        ld.shared.f32(l2, [mb + 20]);
-        div.rn.f32(a0, a0, l0);
-        div.rn.f32(a1, a1, l1);
-        div.rn.f32(a2, a2, l2);
-        let (oo, oa): (u32, u64);
-        mad.lo.u32(oo, tk, 3072, t);
-        mad.lo.u32(oo, h0, 128, oo);
-        mad.wide.u32(oa, oo, 4, out);
-        st.global.f32([oa], a0);
-        st.global.f32([oa + 512], a1);
-        st.global.f32([oa + 1024], a2);
     }
 }

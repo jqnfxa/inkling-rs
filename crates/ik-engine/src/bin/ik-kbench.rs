@@ -1,4 +1,4 @@
-//! Kernel timings on real weights: `ik-kbench <model.gguf>`; IK_CTX (default 8192) bounds the attention lengths timed
+//! Kernel timings on real weights: `ik-kbench <checkpoint dir>`; IK_CTX (default 8192) bounds the attention lengths timed
 use ik_engine::engine::{Engine, Options};
 fn main() -> Result<(), String> {
     let a: Vec<String> = std::env::args().collect();

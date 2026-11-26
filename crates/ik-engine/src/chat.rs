@@ -1,4 +1,4 @@
-//! The Inkling-2 chat format: the GGUF template rendered natively (it uses Hugging Face extensions of Jinja),
+//! The Inkling-2 chat format: the model's chat template rendered natively (it uses Hugging Face extensions of Jinja),
 //! and an incremental parser of the generated messages (thinking, text, tool calls).
 
 use serde_json::{Map, Value};

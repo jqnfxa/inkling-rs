@@ -1,4 +1,4 @@
-//! Prefill vs decode for one token, layer by layer, expert cache off: `ik-pfsmall <model.gguf>`
+//! Prefill vs decode for one token, layer by layer, expert cache off: `ik-pfsmall <checkpoint dir>`
 use std::cell::RefCell;
 use std::rc::Rc;
 

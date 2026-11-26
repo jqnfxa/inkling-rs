@@ -1,26 +1,57 @@
-//! The routed experts: host copies in the layout of the GPU cache slots, CPU compute of the misses, and the GPU cache of
+//! The routed experts: a host copy of the checkpoint's expert tensors, CPU compute of the misses, and the GPU cache of
 //! hot experts. The cache is keyed by physical layer, so the passes of the loop share it.
 //!
-//! The official GGUFs (unsloth, UD-Q4_K_XL) hold NVFP4 experts with an F32 scale each (layers 0-19) and Q8_0 experts
-//! (20-23). Both are repacked at load into the layout that the GPU kernels read and the CPU kernels read too, so that
-//! a cache upload is one copy. A matrix of `rows` rows of k values:
-//! - NVFP4: the rows' E2M1 nibbles, k/2 bytes a row, each 64 values as 32 bytes with value j in the low nibble of
-//!   byte j and value 32 + j in the high one; then the UE4M3 scales of all rows, one byte per 16 values; then the
-//!   expert's scale (f32).
-//! - Q8_0: the rows' int8 values, k bytes a row; then the f16 scales of all rows, one per 32 values.
+//! The checkpoint holds each layer's experts as two matrices, w13 (gate and up, their rows interleaved: gate i is row
+//! 2i, up i row 2i + 1) [E][2 n_ff][n_embd] and w2 (down) [E][n_embd][n_ff], in one of two formats:
+//! - ModelOpt NVFP4 (layers 0-19): `weight` U8 [E][rows][k/2], the E2M1 code of element 2j of a row in the low nibble
+//!   of byte j and of element 2j + 1 in the high one; `weight_scale` F8_E4M3 [E][rows][k/16]; and the expert's factor,
+//!   `weight_amax` F32 [E] over `weight_outer_scale_denominator` F32 [1].
+//! - MXFP8 (layers 20-23): `weight` F8_E4M3 [E][rows][k]; `weight_scale` U8 [E][rows][k/32], 2^(s - 127) each.
+//!
+//! The host copy holds each tensor's bytes as the file has them, on huge pages (the CPU kernels stream them). The
+//! file's pages go from the page cache as they are copied, so the experts are in memory once. Cache uploads copy from
+//! it between tokens. The copy is never page-locked: locking its 15 GB stalled the kernel in reclaim for minutes, until
+//! systemd-oomd killed the session. Prefill's expert stream copies what it uploads to small page-locked slots instead.
+//! IK_MAP_EXPERTS=1 reads the experts where the file is mapped instead, with no copy: the least memory (the page cache
+//! holds them, and may drop them under a memory limit), but slower CPU experts. A GPU cache slot holds one expert's matrix: its part of the codes tensor, then its
+//! part of the scales tensor, copied as they are.
+
+use std::ops::Range;
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use crate::cuda::{Result, Stream, VmBuf};
-use crate::gguf::{GgmlType, Gguf};
+use crate::checkpoint::{Checkpoint, Dtype};
+use crate::cuda::{DevBuf, Result, Stream, VmBuf};
 use crate::hp::Hp;
-use crate::quant::{FP4, dot, ue4m3};
+
+/// The E2M1 values doubled, as integers: a code's value is this times half its block's scale.
+pub const FP4X2: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// The magnitude of an E4M3 byte (float8 e4m3fn: sign, 4 exponent bits of bias 7, 3 mantissa bits), as the kernels
+/// decode the NVFP4 scales: the sign bit is ignored, and 0x7F (NaN in e4m3fn) reads as 480. The checkpoint's scales
+/// are all positive and finite.
+pub fn e4m3_abs(b: u8) -> f32 {
+    let (e, m) = ((b >> 3) & 15, b & 7);
+    if e == 0 { m as f32 * 2f32.powi(-9) } else { (1.0 + m as f32 / 8.0) * 2f32.powi(e as i32 - 7) }
+}
+
+/// The value of an E4M3 byte, as the kernels decode the MXFP8 values (0x7F and 0xFF, NaN in e4m3fn, as +-480; the
+/// checkpoint has none).
+pub fn e4m3(b: u8) -> f32 {
+    if b & 0x80 != 0 { -e4m3_abs(b) } else { e4m3_abs(b) }
+}
+
+/// A UE8M0 scale: 2^(s - 127).
+pub fn ue8m0(s: u8) -> f32 {
+    2f32.powi(s as i32 - 127)
+}
 
 /// The format of a layer's experts.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Fmt {
-    Nv4,
-    Q8,
+    NvFp4,
+    MxFp8,
 }
 
 impl Fmt {
@@ -28,128 +59,117 @@ impl Fmt {
         self as usize
     }
 
-    /// Bytes of a matrix of `rows` rows of k values in the slot layout, rounded up to 256.
+    /// Bytes of the codes and of the scales of one expert's matrix of `rows` rows of k values.
+    pub fn parts(self, rows: usize, k: usize) -> (usize, usize) {
+        match self {
+            Fmt::NvFp4 => (rows * k / 2, rows * k / 16),
+            Fmt::MxFp8 => (rows * k, rows * k / 32),
+        }
+    }
+
+    /// Bytes of a cache slot of such a matrix: its codes, then its scales, rounded up to 256.
     pub fn bytes(self, rows: usize, k: usize) -> usize {
-        let b = match self {
-            Fmt::Nv4 => rows * k / 2 + rows * k / 16 + 4,
-            Fmt::Q8 => rows * k + rows * k / 32 * 2,
-        };
-        b.div_ceil(256) * 256
+        let (q, s) = self.parts(rows, k);
+        (q + s).next_multiple_of(256)
     }
 }
 
-/// A matrix of one expert in the slot layout.
+/// One expert's matrix: its parts of the codes and scales tensors.
 #[derive(Clone, Copy)]
 pub struct Mat<'a> {
     pub fmt: Fmt,
-    pub b: &'a [u8],
+    /// rows of k/2 (NVFP4) or k (MXFP8) bytes
+    pub q: &'a [u8],
+    /// rows of k/16 E4M3 (NVFP4) or k/32 UE8M0 (MXFP8) scales
+    pub s: &'a [u8],
+    /// the expert's factor: amax / denominator (NVFP4), 1 (MXFP8)
+    pub factor: f32,
     pub rows: usize,
     pub k: usize,
 }
 
 impl<'a> Mat<'a> {
-    /// The quants of row r: k/2 bytes (NVFP4) or k int8 (Q8_0).
+    /// The codes of row r.
     pub fn qs(&self, r: usize) -> &'a [u8] {
-        let w = match self.fmt {
-            Fmt::Nv4 => self.k / 2,
-            Fmt::Q8 => self.k,
-        };
-        &self.b[r * w..(r + 1) * w]
+        let w = self.q.len() / self.rows;
+        &self.q[r * w..(r + 1) * w]
     }
 
-    /// The scales of row r: k/16 UE4M3 bytes (NVFP4) or k/32 f16 (Q8_0, as bytes).
+    /// The scales of row r.
     pub fn sc(&self, r: usize) -> &'a [u8] {
-        let (base, w) = match self.fmt {
-            Fmt::Nv4 => (self.rows * self.k / 2, self.k / 16),
-            Fmt::Q8 => (self.rows * self.k, self.k / 16),
-        };
-        &self.b[base + r * w..base + (r + 1) * w]
+        let w = self.s.len() / self.rows;
+        &self.s[r * w..(r + 1) * w]
     }
 
-    /// The expert's scale of this matrix (NVFP4), 1 for Q8_0.
+    /// The expert's factor, which the CPU kernels leave out of a row's dot.
     pub fn scale(&self) -> f32 {
-        match self.fmt {
-            Fmt::Nv4 => {
-                let o = self.rows * self.k / 2 + self.rows * self.k / 16;
-                f32::from_le_bytes(self.b[o..o + 4].try_into().unwrap())
-            }
-            Fmt::Q8 => 1.0,
-        }
+        self.factor
     }
 
-    /// Row r as f32, the expert's scale left out (the reference of the kernels).
+    /// Row r as f32, the expert's factor left out (the reference of the kernels).
     pub fn dequant_row(&self, r: usize, out: &mut [f32]) {
         let (q, s) = (self.qs(r), self.sc(r));
         match self.fmt {
-            Fmt::Nv4 => {
-                for g in 0..self.k / 64 {
-                    for j in 0..32 {
-                        let b = q[g * 32 + j];
-                        out[g * 64 + j] = FP4[(b & 0xF) as usize] as f32 * ue4m3(s[(g * 64 + j) / 16]);
-                        out[g * 64 + 32 + j] = FP4[(b >> 4) as usize] as f32 * ue4m3(s[(g * 64 + 32 + j) / 16]);
-                    }
-                }
-            }
-            Fmt::Q8 => {
+            Fmt::NvFp4 => {
                 for (i, o) in out[..self.k].iter_mut().enumerate() {
-                    let d = half::f16::from_le_bytes([s[i / 32 * 2], s[i / 32 * 2 + 1]]).to_f32();
-                    *o = q[i] as i8 as f32 * d;
+                    let c = (q[i / 2] >> (4 * (i % 2))) & 15;
+                    *o = FP4X2[c as usize] as f32 * 0.5 * e4m3_abs(s[i / 16]);
+                }
+            }
+            Fmt::MxFp8 => {
+                for (i, o) in out[..self.k].iter_mut().enumerate() {
+                    *o = e4m3(q[i]) * ue8m0(s[i / 32]);
                 }
             }
         }
     }
 }
 
-/// Repacks one GGUF matrix (rows of NVFP4 or Q8_0 blocks) into the slot layout `dst`, with the expert's scale.
-fn repack(fmt: Fmt, src: &[u8], rows: usize, k: usize, scale: f32, dst: &mut [u8]) {
-    match fmt {
-        Fmt::Nv4 => {
-            let (qs_end, nb) = (rows * k / 2, k / 64);
-            for r in 0..rows {
-                for b in 0..nb {
-                    let blk = &src[(r * nb + b) * 36..(r * nb + b + 1) * 36];
-                    // ggml: value 16s + j (j < 8) in the low nibble of byte 8s + j, 16s + 8 + j in its high one
-                    let mut v = [0u8; 64];
-                    for s in 0..4 {
-                        for j in 0..8 {
-                            let q = blk[4 + s * 8 + j];
-                            v[s * 16 + j] = q & 0xF;
-                            v[s * 16 + 8 + j] = q >> 4;
-                        }
-                    }
-                    let o = r * k / 2 + b * 32;
-                    for j in 0..32 {
-                        dst[o + j] = v[j] | (v[32 + j] << 4);
-                    }
-                    // the scales; 0x7F (NaN, decoded as 0) as 0x00, also 0, which the GPU decode needs no test for
-                    let so = qs_end + r * k / 16 + b * 4;
-                    for (d, &s) in dst[so..so + 4].iter_mut().zip(&blk[..4]) {
-                        *d = if s & 0x7F == 0x7F { 0 } else { s };
-                    }
-                }
-            }
-            let o = qs_end + rows * k / 16;
-            dst[o..o + 4].copy_from_slice(&scale.to_le_bytes());
-        }
-        Fmt::Q8 => {
-            let nb = k / 32;
-            for (i, blk) in src.chunks_exact(34).enumerate() {
-                let (r, b) = (i / nb, i % nb);
-                dst[r * k + b * 32..r * k + b * 32 + 32].copy_from_slice(&blk[2..34]);
-                dst[rows * k + i * 2..rows * k + i * 2 + 2].copy_from_slice(&blk[..2]);
-            }
-        }
-    }
-}
-
-/// Byte offsets of the experts of one physical layer in the host copy: expert e's gate_up at gate_up + e * its size.
-#[derive(Clone, Copy)]
+/// The experts of one physical layer: where their tensors are, [E][rows][..], and their factors.
 pub struct HostExperts {
-    pub gate_up: usize,
-    pub down: usize,
+    pub fmt: Fmt,
+    /// w13's codes and scales: (file, byte offset) of each tensor in the mapped checkpoint, or (unused, byte offset) in
+    /// the copy
+    pub gu: [(usize, usize); 2],
+    /// w2's codes and scales
+    pub dn: [(usize, usize); 2],
+    /// the experts' factors of w13 and w2: amax / denominator (NVFP4), 1 (MXFP8)
+    pub gu_f: Vec<f32>,
+    pub dn_f: Vec<f32>,
+    /// NVFP4: weight_amax and weight_outer_scale_denominator of w13 and w2, as stored, for the GPU kernels
+    pub amax: [Vec<f32>; 2],
+    pub denom: [f32; 2],
 }
 
-/// Anonymous memory backed by transparent huge pages (unless IK_NO_HUGE), holding the experts.
+/// The page-aligned ranges of the checkpoint's mapped files that hold `spans` (file, byte range), merged where they
+/// touch. Each is (address, length).
+fn page_ranges(ck: &Checkpoint, mut spans: Vec<(usize, Range<usize>)>) -> Vec<(usize, usize)> {
+    const PAGE: usize = 4096;
+    spans.sort_by_key(|(f, r)| (*f, r.start));
+    let mut merged: Vec<(usize, Range<usize>)> = vec![];
+    for (f, r) in spans {
+        // the mapping covers the file's last page whole, so rounding the end up stays inside it
+        let r = r.start / PAGE * PAGE..r.end.next_multiple_of(PAGE);
+        match merged.last_mut() {
+            Some((mf, mr)) if *mf == f && r.start <= mr.end => mr.end = mr.end.max(r.end),
+            _ => merged.push((f, r)),
+        }
+    }
+    merged.into_iter().map(|(f, r)| (ck.file(f).as_ptr() as usize + r.start, r.len())).collect()
+}
+
+/// Drops the pages of the mapped file that lie wholly in `b` from the page cache (MADV_PAGEOUT, Linux 5.4; it takes
+/// those no other process maps): the copy holds their bytes now.
+fn page_out(b: &[u8]) {
+    const MADV_PAGEOUT: libc::c_int = 21;
+    let (s, e) = ((b.as_ptr() as usize).next_multiple_of(4096), (b.as_ptr() as usize + b.len()) / 4096 * 4096);
+    if e > s {
+        // SAFETY: whole pages of a read-only file mapping that the checkpoint holds; a later read faults them back in
+        unsafe { libc::madvise(s as *mut libc::c_void, e - s, MADV_PAGEOUT) };
+    }
+}
+
+/// Anonymous memory backed by transparent huge pages (unless IK_NO_HUGE), holding the copy of the experts.
 pub struct HugeMem {
     pub ptr: *mut u8,
     pub len: usize,
@@ -180,15 +200,30 @@ impl Drop for HugeMem {
     }
 }
 
+/// Reads the mapped range (address, length) in from the file where it is not cached: MADV_POPULATE_READ (Linux 5.14),
+/// else a read of each page.
+fn populate(p: usize, len: usize) {
+    const MADV_POPULATE_READ: libc::c_int = 22;
+    // SAFETY: a page-aligned part of a read-only mapping that the checkpoint holds
+    if unsafe { libc::madvise(p as *mut libc::c_void, len, MADV_POPULATE_READ) } != 0 {
+        let mut acc = 0u8;
+        for off in (0..len).step_by(4096) {
+            // SAFETY: as above
+            acc ^= unsafe { std::ptr::read_volatile((p + off) as *const u8) };
+        }
+        std::hint::black_box(acc);
+    }
+}
+
 pub struct Experts {
-    /// the experts in the slot layout; offsets of `layers` index it
-    pub mem: HugeMem,
-    /// the copy is page-locked, so that cache uploads are DMA and run asynchronously
-    pub pinned: bool,
+    /// the checkpoint, whose mapped expert tensors the matrices view with IK_MAP_EXPERTS
+    ck: Arc<Checkpoint>,
+    /// the copy of the expert tensors, which the offsets of `layers` index; None with IK_MAP_EXPERTS
+    copy: Option<HugeMem>,
     pub layers: Vec<HostExperts>,
     /// the format of each physical layer's experts
     pub fmt: Vec<Fmt>,
-    /// bytes of one expert's gate_up and down, by format
+    /// bytes of a cache slot of one expert's gate_up and down, by format
     pub gu_bytes: [usize; 2],
     pub down_bytes: [usize; 2],
     pub n_embd: usize,
@@ -198,106 +233,108 @@ pub struct Experts {
 }
 
 impl Experts {
-    pub fn new(g: &Gguf, hp: &Hp) -> Result<Experts> {
+    /// The experts of the checkpoint: their tensors copied to huge pages. With IK_MAP_EXPERTS, the tensors where the
+    /// file is mapped, read in.
+    pub fn new(ck: Arc<Checkpoint>, hp: &Hp) -> Result<Experts> {
         let (n, nff, ne) = (hp.n_embd, hp.n_ff_exp, hp.n_expert);
-        let mut fmt = vec![];
-        for i in 0..hp.n_phys {
-            let gu = g.tensor(&format!("blk.{i}.ffn_gate_up_exps.weight"))?;
-            let dn = g.tensor(&format!("blk.{i}.ffn_down_exps.weight"))?;
-            let f = match (gu.ty, dn.ty) {
-                (GgmlType::NVFP4, GgmlType::NVFP4) => Fmt::Nv4,
-                (GgmlType::Q8_0, GgmlType::Q8_0) => Fmt::Q8,
-                (a, b) => return Err(format!("layer {i}: experts are {a:?}/{b:?}; the engine takes the official GGUFs' NVFP4 or Q8_0 (unsloth Inkling-2-Mini-UD-Q4_K_XL)")),
-            };
-            if gu.ne != [n, 2 * nff, ne] || dn.ne != [nff, n, ne] {
-                return Err(format!("layer {i}: unexpected expert shapes {:?} {:?}", gu.ne, dn.ne));
-            }
-            fmt.push(f);
-        }
-        let gu_bytes = [Fmt::Nv4.bytes(2 * nff, n), Fmt::Q8.bytes(2 * nff, n)];
-        let down_bytes = [Fmt::Nv4.bytes(n, nff), Fmt::Q8.bytes(n, nff)];
+        // each layer's tensors, checked: (format, [(codes, scales)] of w13 and w2, factors)
+        let mut spans = vec![];
         let mut layers = vec![];
-        let mut at = 0;
-        for &f in &fmt {
-            layers.push(HostExperts { gate_up: at, down: at + ne * gu_bytes[f.index()] });
-            at += ne * (gu_bytes[f.index()] + down_bytes[f.index()]);
-        }
-        // the expert scales of the NVFP4 layers (absent: 1)
-        let scales = |name: String| -> Result<Vec<f32>> { if g.tensor(&name).is_ok() { g.f32s(&name) } else { Ok(vec![1.0; ne]) } };
-        let t = std::time::Instant::now();
-        let mem = HugeMem::new(at)?;
-        let dst = mem.ptr as usize;
-        let mut jobs = vec![];
-        for (i, &f) in fmt.iter().enumerate() {
-            let gu = g.tensor(&format!("blk.{i}.ffn_gate_up_exps.weight"))?;
-            let dn = g.tensor(&format!("blk.{i}.ffn_down_exps.weight"))?;
-            let (sg, sd) = (scales(format!("blk.{i}.ffn_gate_up_exps.scale"))?, scales(format!("blk.{i}.ffn_down_exps.scale"))?);
-            let (gsrc, dsrc) = (gu.ty.row_bytes(n) * 2 * nff, dn.ty.row_bytes(nff) * n);
-            for e in 0..ne {
-                jobs.push((f, gu.offset + e * gsrc, gsrc, 2 * nff, n, sg[e], layers[i].gate_up + e * gu_bytes[f.index()], gu_bytes[f.index()]));
-                jobs.push((f, dn.offset + e * dsrc, dsrc, n, nff, sd[e], layers[i].down + e * down_bytes[f.index()], down_bytes[f.index()]));
-            }
-        }
-        jobs.par_iter().for_each(|&(f, src, len, rows, k, scale, off, size)| {
-            // SAFETY: disjoint ranges of the fresh mapping
-            let out = unsafe { std::slice::from_raw_parts_mut((dst as *mut u8).add(off), size) };
-            repack(f, &g.mmap[src..src + len], rows, k, scale, out);
-        });
-        eprintln!("experts repacked in {:.1}s ({} MiB)", t.elapsed().as_secs_f64(), at >> 20);
-        let mut pinned = false;
-        if std::env::var("IK_NO_PIN").is_err() {
-            let t = std::time::Instant::now();
-            match crate::cuda::register_host(mem.ptr, mem.len) {
-                Ok(()) => {
-                    pinned = true;
-                    eprintln!("experts page-locked in {:.1}s", t.elapsed().as_secs_f64());
+        for i in 0..hp.n_phys {
+            let p = |w: &str, part: &str| format!("model.llm.layers.{i}.mlp.experts.{w}_{part}");
+            let fmt = match ck.tensor(&p("w13", "weight"))?.dtype {
+                Dtype::U8 => Fmt::NvFp4,
+                Dtype::F8E4M3 => Fmt::MxFp8,
+                d => return Err(format!("layer {i}: experts of {d:?}; the engine reads ModelOpt NVFP4 (U8 codes) or MXFP8 (F8_E4M3 values)")),
+            };
+            let (qt, st, per_byte, block) = match fmt {
+                Fmt::NvFp4 => (Dtype::U8, Dtype::F8E4M3, 2, 16),
+                Fmt::MxFp8 => (Dtype::F8E4M3, Dtype::U8, 1, 32),
+            };
+            let mut at = [[(0usize, 0usize); 2]; 2];
+            let mut fac = [vec![1f32; ne], vec![1f32; ne]];
+            let mut amax = [vec![], vec![]];
+            let mut denom = [0f32; 2];
+            for (m, (w, rows, k)) in [("w13", 2 * nff, n), ("w2", n, nff)].into_iter().enumerate() {
+                for (j, (part, dt, cols)) in [("weight", qt, k / per_byte), ("weight_scale", st, k / block)].into_iter().enumerate() {
+                    let name = p(w, part);
+                    ck.get(&name, dt, &[ne, rows, cols])?;
+                    let (f, r) = ck.tensor(&name)?.place();
+                    at[m][j] = (f, r.start);
+                    spans.push((f, r));
                 }
-                Err(e) => eprintln!("experts not page-locked ({e}): cache uploads stay synchronous"),
+                if fmt == Fmt::NvFp4 {
+                    ck.get(&p(w, "weight_amax"), Dtype::F32, &[ne])?;
+                    ck.get(&p(w, "weight_outer_scale_denominator"), Dtype::F32, &[1])?;
+                    amax[m] = ck.floats(&p(w, "weight_amax"))?;
+                    denom[m] = ck.floats(&p(w, "weight_outer_scale_denominator"))?[0];
+                    fac[m] = amax[m].iter().map(|&a| a / denom[m]).collect();
+                }
             }
+            let [gu_f, dn_f] = fac;
+            layers.push(HostExperts { fmt, gu: at[0], dn: at[1], gu_f, dn_f, amax, denom });
         }
-        Ok(Experts { mem, pinned, layers, fmt, gu_bytes, down_bytes, n_embd: n, n_ff: nff, beta: hp.situ_beta, lb: hp.situ_lb })
+        let fmt: Vec<Fmt> = layers.iter().map(|l| l.fmt).collect();
+        let gu_bytes = [Fmt::NvFp4.bytes(2 * nff, n), Fmt::MxFp8.bytes(2 * nff, n)];
+        let down_bytes = [Fmt::NvFp4.bytes(n, nff), Fmt::MxFp8.bytes(n, nff)];
+        let mut copy = None;
+        if std::env::var("IK_MAP_EXPERTS").is_ok() {
+            let ranges = page_ranges(&ck, spans);
+            let total: usize = ranges.iter().map(|r| r.1).sum();
+            let t = std::time::Instant::now();
+            ranges.par_iter().for_each(|&(p, len)| populate(p, len));
+            eprintln!("experts read in {:.1}s ({} MiB, not copied)", t.elapsed().as_secs_f64(), total >> 20);
+        } else {
+            // each tensor at a page of its own in the copy; the copy in pieces of 16 MiB for the threads
+            let mut len = 0usize;
+            let mut jobs = vec![];
+            for (i, h) in layers.iter_mut().enumerate() {
+                for (m, at) in [&mut h.gu, &mut h.dn].into_iter().enumerate() {
+                    for (j, at) in at.iter_mut().enumerate() {
+                        let (f, r) = &spans[4 * i + 2 * m + j];
+                        for (c, piece) in ck.file(*f)[r.clone()].chunks(16 << 20).enumerate() {
+                            jobs.push((piece, len + c * (16 << 20)));
+                        }
+                        *at = (0, len);
+                        len = (len + r.len()).next_multiple_of(4096);
+                    }
+                }
+            }
+            let mem = HugeMem::new(len)?;
+            let t = std::time::Instant::now();
+            let dst = mem.ptr as usize;
+            jobs.par_iter().for_each(|&(piece, off)| {
+                // SAFETY: disjoint ranges of the fresh mapping
+                let out = unsafe { std::slice::from_raw_parts_mut((dst as *mut u8).add(off), piece.len()) };
+                out.copy_from_slice(piece);
+                page_out(piece);
+            });
+            eprintln!("experts copied in {:.1}s ({} MiB; their pages of the file dropped)", t.elapsed().as_secs_f64(), len >> 20);
+            copy = Some(mem);
+        }
+        Ok(Experts { ck, copy, layers, fmt, gu_bytes, down_bytes, n_embd: n, n_ff: nff, beta: hp.situ_beta, lb: hp.situ_lb })
     }
 
-    /// Expert e's gate_up of `layer`: 2 n_ff rows of n_embd (gate rows, then up rows).
+    fn mat(&self, layer: usize, which: [(usize, usize); 2], f: &[f32], e: usize, rows: usize, k: usize) -> Mat<'_> {
+        let fmt = self.fmt[layer];
+        let (qb, sb) = fmt.parts(rows, k);
+        let at = |(file, off): (usize, usize), len: usize| match &self.copy {
+            Some(m) => &m.slice()[off..][..len],
+            None => &self.ck.file(file)[off..][..len],
+        };
+        Mat { fmt, q: at((which[0].0, which[0].1 + e * qb), qb), s: at((which[1].0, which[1].1 + e * sb), sb), factor: f[e], rows, k }
+    }
+
+    /// Expert e's gate_up of `layer`: 2 n_ff rows of n_embd, gate i in row 2i and up i in row 2i + 1.
     pub fn gate_up(&self, layer: usize, e: usize) -> Mat<'_> {
-        let f = self.fmt[layer];
-        let (o, len) = (self.layers[layer].gate_up + e * self.gu_bytes[f.index()], self.gu_bytes[f.index()]);
-        Mat { fmt: f, b: &self.mem.slice()[o..o + len], rows: 2 * self.n_ff, k: self.n_embd }
+        let h = &self.layers[layer];
+        self.mat(layer, h.gu, &h.gu_f, e, 2 * self.n_ff, self.n_embd)
     }
 
     /// Expert e's down of `layer`: n_embd rows of n_ff.
     pub fn down(&self, layer: usize, e: usize) -> Mat<'_> {
-        let f = self.fmt[layer];
-        let (o, len) = (self.layers[layer].down + e * self.down_bytes[f.index()], self.down_bytes[f.index()]);
-        Mat { fmt: f, b: &self.mem.slice()[o..o + len], rows: self.n_embd, k: self.n_ff }
-    }
-
-    /// Reference CPU path in f32: y = down(situ(gate_up x)) of expert e of `layer`.
-    pub fn compute_cpu(&self, layer: usize, e: usize, x: &[f32], y: &mut [f32]) {
-        let (gu, dn) = (self.gate_up(layer, e), self.down(layer, e));
-        let nff = self.n_ff;
-        let mut h = vec![0f32; 2 * nff];
-        h.par_chunks_mut(64).enumerate().for_each(|(c, out)| {
-            let mut row = vec![0f32; self.n_embd];
-            for (i, o) in out.iter_mut().enumerate() {
-                gu.dequant_row(c * 64 + i, &mut row);
-                *o = dot(&row, x) * gu.scale();
-            }
-        });
-        let a: Vec<f32> = (0..nff)
-            .map(|i| {
-                let (gv, uv) = (h[i], h[nff + i]);
-                let act = self.beta * (gv / self.beta).tanh() * (1.0 / (1.0 + (-gv).exp()));
-                act * self.lb * (uv / self.lb).tanh()
-            })
-            .collect();
-        y.par_chunks_mut(64).enumerate().for_each(|(c, out)| {
-            let mut row = vec![0f32; nff];
-            for (i, o) in out.iter_mut().enumerate() {
-                dn.dequant_row(c * 64 + i, &mut row);
-                *o = dot(&row, &a) * dn.scale();
-            }
-        });
+        let h = &self.layers[layer];
+        self.mat(layer, h.dn, &h.dn_f, e, self.n_embd, self.n_ff)
     }
 }
 
@@ -312,8 +349,6 @@ pub struct Bank {
     pub max_slots: usize,
     /// [slot] -> (layer, expert), usize::MAX if free
     pub owner: Vec<(usize, usize)>,
-    /// slots being filled by an async upload: not cached yet, and no victims
-    pub busy: Vec<bool>,
 }
 
 impl Bank {
@@ -321,13 +356,10 @@ impl Bank {
         self.gu.pages_for(n * self.gu_bytes) + self.down.pages_for(n * self.down_bytes)
     }
 
-    /// The least used slot, free slots first; None if all are being filled.
+    /// The least used slot, free slots first; None if the bank has no slots.
     fn victim(&self, uses: &[Vec<f32>]) -> Option<usize> {
         let mut best = (f32::INFINITY, usize::MAX);
         for (s, &(l, e)) in self.owner[..self.n_slots].iter().enumerate() {
-            if self.busy[s] {
-                continue;
-            }
             if l == usize::MAX {
                 return Some(s);
             }
@@ -341,25 +373,19 @@ impl Bank {
 
 /// GPU cache of experts: a bank of slots per format, and the slot of each (physical layer, expert) in its layer's bank.
 pub struct ExpertCache {
-    /// [NVFP4, Q8_0]
+    /// [NVFP4, MXFP8]
     pub banks: [Bank; 2],
-    /// the share of the cache's VRAM that the Q8_0 bank gets when both formats are there (IK_Q8_SHARE, 0.15)
+    /// the share of the cache's VRAM that the MXFP8 bank gets when both formats are there (IK_MX_SHARE, 0.15)
     pub q8_share: f64,
+    /// the NVFP4 layers' weight_amax and weight_outer_scale_denominator of w13 and w2 as stored: [layer][matrix] at
+    /// FACTORS floats each, amax at 0, the denominator at E
+    pub factors: DevBuf,
+    n_expert: usize,
     pub slot_of: Vec<Vec<i32>>, // [layer][expert] -> slot or -1
     pub uses: Vec<Vec<f32>>,    // decayed use counts
     pub hits: u64,
     pub misses: u64,
     pub uploads: u64,
-    pub pending: Vec<Pending>,
-}
-
-/// An async upload of expert e of `layer` into `slot` of bank `bank`.
-pub struct Pending {
-    pub bank: usize,
-    pub slot: usize,
-    pub layer: usize,
-    pub e: usize,
-    pub ev: crate::cuda::Event,
 }
 
 impl ExpertCache {
@@ -369,19 +395,37 @@ impl ExpertCache {
         let bank = |f: Fmt| -> Result<Bank> {
             let m = if has(f) { max_slots } else { 0 };
             let (gb, db) = (ex.gu_bytes[f.index()], ex.down_bytes[f.index()]);
-            Ok(Bank { gu: VmBuf::reserve(gb * m.max(1), dev)?, down: VmBuf::reserve(db * m.max(1), dev)?, gu_bytes: gb, down_bytes: db, n_slots: 0, max_slots: m, owner: vec![(usize::MAX, usize::MAX); m], busy: vec![false; m] })
+            Ok(Bank { gu: VmBuf::reserve(gb * m.max(1), dev)?, down: VmBuf::reserve(db * m.max(1), dev)?, gu_bytes: gb, down_bytes: db, n_slots: 0, max_slots: m, owner: vec![(usize::MAX, usize::MAX); m] })
         };
-        let q8_share = if has(Fmt::Nv4) && has(Fmt::Q8) { std::env::var("IK_Q8_SHARE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.15) } else if has(Fmt::Q8) { 1.0 } else { 0.0 };
+        let q8_share = if has(Fmt::NvFp4) && has(Fmt::MxFp8) { std::env::var("IK_MX_SHARE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.15) } else if has(Fmt::MxFp8) { 1.0 } else { 0.0 };
+        let ne = hp.n_expert;
+        let mut fv = vec![0f32; ex.layers.len() * 2 * (ne + 4)];
+        for (l, h) in ex.layers.iter().enumerate() {
+            for m in 0..2 {
+                if h.fmt == Fmt::NvFp4 {
+                    let o = (2 * l + m) * (ne + 4);
+                    fv[o..o + ne].copy_from_slice(&h.amax[m]);
+                    fv[o + ne] = h.denom[m];
+                }
+            }
+        }
         Ok(ExpertCache {
-            banks: [bank(Fmt::Nv4)?, bank(Fmt::Q8)?],
+            banks: [bank(Fmt::NvFp4)?, bank(Fmt::MxFp8)?],
             q8_share,
+            factors: DevBuf::from_slice(&fv)?,
+            n_expert: ne,
             slot_of: vec![vec![-1; hp.n_expert]; hp.n_phys],
             uses: vec![vec![0.0; hp.n_expert]; hp.n_phys],
             hits: 0,
             misses: 0,
             uploads: 0,
-            pending: vec![],
         })
+    }
+
+    /// The device addresses of matrix m's (0 gate_up, 1 down) weight_amax and denominator of NVFP4 layer `layer`.
+    pub fn factor_ptrs(&self, layer: usize, m: usize) -> (crate::cuda::CUdeviceptr, crate::cuda::CUdeviceptr) {
+        let o = (2 * layer + m) * (self.n_expert + 4);
+        (self.factors.at(4 * o), self.factors.at(4 * (o + self.n_expert)))
     }
 
     /// All the usable slots.
@@ -389,7 +433,7 @@ impl ExpertCache {
         self.banks.iter().map(|b| b.n_slots).sum()
     }
 
-    /// The slots of each bank that `bytes` of memory hold: the Q8_0 bank its share, the NVFP4 bank the rest.
+    /// The slots of each bank that `bytes` of memory hold: the MXFP8 bank its share, the NVFP4 bank the rest.
     pub fn fit(&self, bytes: usize) -> [usize; 2] {
         let most = |b: &Bank, bytes: usize| {
             let mut n = (bytes / (b.gu_bytes + b.down_bytes)).min(b.max_slots);
@@ -409,12 +453,11 @@ impl ExpertCache {
     }
 
     /// Sets the number of usable slots of each bank: the experts in the slots that go are dropped, and new slots start
-    /// free. No upload may be pending into a slot that goes, and no work in flight may read it.
+    /// free. No work in flight may read a slot that goes.
     pub fn set_slots(&mut self, n: [usize; 2], s: &Stream) -> Result<()> {
         for (b, &n) in self.banks.iter_mut().zip(&n) {
             let n = n.min(b.max_slots);
             for v in n..b.n_slots {
-                assert!(!b.busy[v], "slot {v} is being filled");
                 let (l, e) = b.owner[v];
                 if l != usize::MAX {
                     self.slot_of[l][e] = -1;
@@ -435,8 +478,11 @@ impl ExpertCache {
         if ol != usize::MAX {
             self.slot_of[ol][oe] = -1;
         }
-        b.gu.upload_at(slot * b.gu_bytes, ex.gate_up(layer, e).b)?;
-        b.down.upload_at(slot * b.down_bytes, ex.down(layer, e).b)?;
+        let (gu, dn) = (ex.gate_up(layer, e), ex.down(layer, e));
+        b.gu.upload_at(slot * b.gu_bytes, gu.q)?;
+        b.gu.upload_at(slot * b.gu_bytes + gu.q.len(), gu.s)?;
+        b.down.upload_at(slot * b.down_bytes, dn.q)?;
+        b.down.upload_at(slot * b.down_bytes + dn.q.len(), dn.s)?;
         b.owner[slot] = (layer, e);
         self.slot_of[layer][e] = slot as i32;
         self.uploads += 1;
@@ -454,33 +500,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repacks_nvfp4_and_q8() {
-        // one NVFP4 row of 64: scales 0x38 (1/2 halved: value = FP4 * 0.5), nibbles counting up
-        let mut blk = vec![0u8; 36];
-        blk[..4].copy_from_slice(&[0x38, 0x40, 0x38, 0x40]); // 0.5, 1.0, 0.5, 1.0
-        for (j, b) in blk[4..].iter_mut().enumerate() {
-            *b = (j % 16) as u8 | (((j + 5) % 16) as u8) << 4;
+    fn formats_decode() {
+        assert_eq!((e4m3(0x38), e4m3(0x40), e4m3(0xC4), e4m3(0x7E), e4m3(0x01), e4m3(0x80)), (1.0, 2.0, -3.0, 448.0, 2f32.powi(-9), -0.0));
+        assert_eq!((ue8m0(127), ue8m0(120), ue8m0(130)), (1.0, 2f32.powi(-7), 8.0));
+        // NVFP4: a row of 32, bytes j = codes (2j, 2j + 1); scales 0x38 (1) and 0x40 (2)
+        let q: Vec<u8> = (0..16u8).map(|j| (j & 15) | (((15 - j) & 15) << 4)).collect();
+        let s = [0x38u8, 0x40];
+        let m = Mat { fmt: Fmt::NvFp4, q: &q, s: &s, factor: 0.5, rows: 1, k: 32 };
+        let mut out = vec![0f32; 32];
+        m.dequant_row(0, &mut out);
+        let e2m1 = |c: usize| FP4X2[c] as f32 / 2.0;
+        for i in 0..32 {
+            let c = if i % 2 == 0 { i / 2 } else { 15 - i / 2 };
+            assert_eq!(out[i], e2m1(c) * if i < 16 { 1.0 } else { 2.0 }, "element {i}");
         }
-        let mut want = vec![0f32; 64];
-        crate::quant::dequant_nvfp4_row(&blk, &mut want);
-        let mut dst = vec![0u8; Fmt::Nv4.bytes(1, 64)];
-        repack(Fmt::Nv4, &blk, 1, 64, 3.0, &mut dst);
-        let m = Mat { fmt: Fmt::Nv4, b: &dst, rows: 1, k: 64 };
-        let mut got = vec![0f32; 64];
-        m.dequant_row(0, &mut got);
-        assert_eq!(got, want);
-        assert_eq!(m.scale(), 3.0);
-        // two Q8_0 rows of 32
-        let mut src = vec![];
-        for r in 0..2u8 {
-            src.extend_from_slice(&half::f16::from_f32(0.5 + r as f32).to_le_bytes());
-            src.extend((0..32).map(|i| (i as i8 - 16 + r as i8) as u8));
+        // MXFP8: a row of 64, scales 2^-3 and 2^2
+        let q: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(37)).collect();
+        let s = [124u8, 129];
+        let m = Mat { fmt: Fmt::MxFp8, q: &q, s: &s, factor: 1.0, rows: 1, k: 64 };
+        let mut out = vec![0f32; 64];
+        m.dequant_row(0, &mut out);
+        for i in 0..64 {
+            assert_eq!(out[i], e4m3(q[i]) * if i < 32 { 0.125 } else { 4.0 }, "element {i}");
         }
-        let mut dst = vec![0u8; Fmt::Q8.bytes(2, 32)];
-        repack(Fmt::Q8, &src, 2, 32, 1.0, &mut dst);
-        let m = Mat { fmt: Fmt::Q8, b: &dst, rows: 2, k: 32 };
-        let mut got = vec![0f32; 32];
-        m.dequant_row(1, &mut got);
-        assert_eq!((got[0], got[31]), (-15.0 * 1.5, 16.0 * 1.5));
     }
 }

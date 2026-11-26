@@ -1,10 +1,9 @@
-//! Speed against context depth: `ik-ctx <model.gguf> <text file> <n_ctx> [n_gen] [max depth]`.
+//! Speed against context depth: `ik-ctx <checkpoint dir> <text file> <n_ctx> [n_gen] [max depth]`.
 //! Feeds the text in growing prefixes (1k, 2k, 4k, ... tokens, up to n_ctx) through the batched prefill and, at
 //! each depth, decodes n_gen tokens greedily; reports prefill speed of each new segment, decode speed and the
-//! expert-cache hit rate. IK_THREADS sets the expert threads. IK_PROF adds, at each depth, the GPU time of each kind
-//! of kernel in the last token, and the CPU expert time and misses per token.
+//! expert-cache hit rate. IK_THREADS sets the expert threads. IK_PROF adds, at each depth, where the prefill's time
+//! went, the GPU time of each kind of kernel in the last token, and the CPU expert time and misses per token.
 use ik_engine::engine::{Engine, Options, threads_from_env};
-use ik_engine::tokenizer::Tokenizer;
 use std::time::Instant;
 
 fn argmax(v: &[f32]) -> u32 {
@@ -14,7 +13,7 @@ fn argmax(v: &[f32]) -> u32 {
 fn main() -> Result<(), String> {
     let a: Vec<String> = std::env::args().collect();
     if a.len() < 4 {
-        return Err("usage: ik-ctx <model.gguf> <text file> <n_ctx> [n_gen]".into());
+        return Err("usage: ik-ctx <checkpoint dir> <text file> <n_ctx> [n_gen]".into());
     }
     let n_ctx: usize = a[3].parse().map_err(|_| "bad n_ctx")?;
     let n_gen: usize = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(64);
@@ -22,7 +21,7 @@ fn main() -> Result<(), String> {
     let t0 = Instant::now();
     let opt = Options { n_ctx, cache_slots: usize::MAX, threads: threads_from_env(), graph: true, upload_budget: 4 };
     let mut e = Engine::new(std::path::Path::new(&a[1]), opt)?;
-    let tok = Tokenizer::from_gguf(&e.g)?;
+    let tok = e.ck.tokenizer()?;
     let (free, total) = e.ctx.mem_info()?;
     eprintln!(
         "n_ctx {n_ctx}: loaded in {:.1?}, {} expert cache slots ({} MiB), {} MiB VRAM free of {}",
@@ -32,6 +31,9 @@ fn main() -> Result<(), String> {
         free >> 20,
         total >> 20
     );
+    let (sizes, floor) = e.pf_sizes();
+    let sizes: Vec<String> = sizes.iter().map(|&(t, b)| format!("{t} tokens {} MiB", b >> 20)).collect();
+    eprintln!("prefill's region by ubatch: {}; room for {floor} beside the KV rows", sizes.join(", "));
     let text = std::fs::read_to_string(&a[2]).map_err(|x| x.to_string())?;
     let mut ids = tok.encode("<|message_user|><|content_text|>", true);
     ids.extend(tok.encode(&text, false));
@@ -50,9 +52,11 @@ fn main() -> Result<(), String> {
     let mut prev = 0;
     let mut total_pf = 0.0;
     for &d in &depths {
+        let st0 = e.stats.clone();
         let t = Instant::now();
         let (mut logits, reused) = e.feed(&ids[..d])?;
         let dt = t.elapsed().as_secs_f64();
+        let st = e.stats.clone();
         total_pf += dt;
         assert_eq!(reused, prev, "prefix was not reused");
         let (h0, m0) = {
@@ -62,6 +66,9 @@ fn main() -> Result<(), String> {
         // the first decoded token warms up; time the rest
         logits = e.decode(argmax(&logits))?;
         let busy0 = e.pool.busy_ns.load(std::sync::atomic::Ordering::Relaxed);
+        let uw0 = e.stats.unembed_wait_s;
+        let attn0: [u64; 4] = std::array::from_fn(|i| ik_engine::cpu_pool::ATTN_NS[i].load(std::sync::atomic::Ordering::Relaxed));
+        let dense0: [u64; 2] = std::array::from_fn(|i| ik_engine::cpu_pool::DENSE_NS[i].load(std::sync::atomic::Ordering::Relaxed));
         let (h1, m1) = {
             let u = e.pool.usage.lock().unwrap();
             (u.hits, u.miss_count)
@@ -78,10 +85,33 @@ fn main() -> Result<(), String> {
         let hit = 100.0 * (h - h0) as f64 / ((h - h0 + m - m0).max(1)) as f64;
         println!("{d:>7} {:>10.1} {:>11.1}s {dec:>11.2} {hit:>8.1}%", (d - prev) as f64 / dt, total_pf);
         if let Some((v, total)) = e.profile()? {
+            println!(
+                "        prefill: GPU wait {:.2}s, host {:.2}s, CPU experts {:.2}s, pairs GPU {} CPU {} streamed {}; stream {:.2}s, its copies {:.2}s, waits {:.2}s; KV pages moved {} in {:.2}s",
+                st.pf_gpu_s - st0.pf_gpu_s,
+                st.pf_host_s - st0.pf_host_s,
+                st.pf_cpu_s - st0.pf_cpu_s,
+                st.pf_gpu_pairs - st0.pf_gpu_pairs,
+                (st.pf_cpu_pairs - st.pf_stream_pairs) - (st0.pf_cpu_pairs - st0.pf_stream_pairs),
+                st.pf_stream_pairs - st0.pf_stream_pairs,
+                st.pf_stream_s - st0.pf_stream_s,
+                st.pf_stream_copy_s - st0.pf_stream_copy_s,
+                st.pf_stream_wait_s - st0.pf_stream_wait_s,
+                st.kv_moved - st0.kv_moved,
+                st.kv_move_s - st0.kv_move_s
+            );
             let busy = (e.pool.busy_ns.load(std::sync::atomic::Ordering::Relaxed) - busy0) as f64 / 1e6 / (n_gen - 1) as f64;
             let misses = (m - m1) as f64 / (n_gen - 1) as f64;
             let uses = (h - h1 + m - m1) as f64 / (n_gen - 1) as f64;
-            println!("        last token {total:.0} us on the GPU timeline; CPU experts {busy:.2} ms/token (all threads), {misses:.1} misses of {uses:.0} uses a token; {} slots", e.cache.n_slots());
+            let uw = (e.stats.unembed_wait_s - uw0) * 1e6 / (n_gen - 1) as f64;
+            println!("        last token {total:.0} us on the GPU timeline; CPU experts {busy:.2} ms/token (all threads), {misses:.1} misses of {uses:.0} uses a token; {} slots; {} MiB of KV in host memory; {uw:.0} us a token waiting for the CPU's logits", e.cache.n_slots(), e.kv_host_bytes() >> 20);
+            let attn = |i: usize| (ik_engine::cpu_pool::ATTN_NS[i].load(std::sync::atomic::Ordering::Relaxed) - attn0[i]) as f64 / (n_gen - 1) as f64;
+            if attn(0) > 0.0 {
+                println!("        CPU attention {:.2} ms/token over {:.0} host rows ({:.1} us per job)", attn(2) / 1e6, attn(3), attn(2) / attn(0) / 1e3);
+            }
+            let dense = |i: usize| (ik_engine::cpu_pool::DENSE_NS[i].load(std::sync::atomic::Ordering::Relaxed) - dense0[i]) as f64 / (n_gen - 1) as f64;
+            if dense(0) > 0.0 {
+                println!("        CPU rows of the output gates {:.2} ms/token ({:.1} us per job)", dense(1) / 1e6, dense(1) / dense(0) / 1e3);
+            }
             for (name, n, us) in v.iter().take(10) {
                 println!("          {name:22} {n:5} x {:7.1} us = {us:7.0} us ({:4.1}%)", us / *n as f64, 100.0 * us / total);
             }
