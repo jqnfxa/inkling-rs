@@ -1484,9 +1484,10 @@ impl Engine {
             let dst = &mut ps.bounce.as_mut_slice::<u8>()[slot * sb..(slot + 1) * sb];
             let mut at = 0;
             for part in [gu.q, gu.s, dn.q, dn.s] {
-                dst[at..at + part.len()].copy_from_slice(part);
+                crate::cpu::copy_nt(&mut dst[at..at + part.len()], part);
                 at += part.len();
             }
+            crate::cpu::store_fence();
             assert_eq!(at, gu_b + dn_b, "an expert's parts fill its slots");
             self.stats.pf_stream_wait_s += (tc - tw).as_secs_f64();
             self.stats.pf_stream_copy_s += tc.elapsed().as_secs_f64();
