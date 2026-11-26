@@ -73,6 +73,9 @@ pub struct Layer {
     pub gk: Vec<Mat>,
     pub gv: Vec<Mat>,
     pub wo: Mat,
+    /// the last rows of the output gate (gate_attn), which the CPU team takes in decode: BF16 [rows][n_embd] in host
+    /// memory, until the engine gives them to the pool
+    pub gate_cpu: Vec<u16>,
     pub q_clip: DevBuf,   // [n_head][head_dim]
     pub rel_clip: DevBuf, // [n_head][n_rel]
     pub rel_proj: DevBuf, // [n_rel][extent]: the bias profiles (extent n_swa or rel_extent)
@@ -109,9 +112,13 @@ pub struct Weights {
 }
 
 impl Weights {
-    /// The weights, with the last `cpu_rows` rows of the unembedding in host memory.
-    pub fn load(ck: &Checkpoint, hp: &Hp, cpu_rows: usize) -> Result<Weights> {
+    /// The weights, with the last `cpu_rows` rows of the unembedding and the last `gate_rows` of each output gate in
+    /// host memory.
+    pub fn load(ck: &Checkpoint, hp: &Hp, cpu_rows: usize, gate_rows: usize) -> Result<Weights> {
         let (n, nh, kv) = (hp.n_embd, hp.n_head * hp.head_dim, hp.kv_dim());
+        if gate_rows >= nh {
+            return Err(format!("{gate_rows} rows of the output gate for the CPU, of {nh}"));
+        }
         let (bf, f32_) = (Dtype::BF16, Dtype::F32);
         let core = hp.loop_end - hp.loop_start;
         let msg_queries = tensor(ck, "model.llm.middle_cycle_cross_pass_queries", f32_, &[2 * core, n])?;
@@ -151,6 +158,8 @@ impl Weights {
                 (tensor(ck, &p("attn.k_sconv.static_w"), bf, &[hp.n_conv, kv])?, tensor(ck, &p("attn.v_sconv.static_w"), bf, &[hp.n_conv, kv])?)
             };
             let wo = Mat::load(ck, &p("attn.wo_ud.weight"), n, nh)?;
+            let gb = ck.get(&p("attn.gate_attn.weight"), bf, &[nh, n])?;
+            let gate_cpu = gb[(nh - gate_rows) * n * 2..nh * n * 2].as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
             let lp = if i >= hp.loop_start && i < hp.loop_end {
                 let j = i - hp.loop_start;
                 let (mut down, mut gain, mut forget) = (vec![], vec![], vec![]);
@@ -177,6 +186,7 @@ impl Weights {
                 gk,
                 gv,
                 wo,
+                gate_cpu,
                 q_clip: tensor(ck, &p("attn.q_l2_clip.scale"), bf, &[hp.n_head, hp.head_dim])?,
                 rel_clip: tensor(ck, &p("attn.rel_l2_clip.scale"), bf, &[hp.n_head, hp.n_rel])?,
                 rel_proj: tensor(ck, &p("attn.rel_logits_proj.proj"), bf, &[hp.n_rel, if swa { hp.n_swa } else { hp.rel_extent }])?,

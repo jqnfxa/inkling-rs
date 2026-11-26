@@ -68,6 +68,7 @@ fn main() -> Result<(), String> {
         let busy0 = e.pool.busy_ns.load(std::sync::atomic::Ordering::Relaxed);
         let uw0 = e.stats.unembed_wait_s;
         let attn0: [u64; 4] = std::array::from_fn(|i| ik_engine::cpu_pool::ATTN_NS[i].load(std::sync::atomic::Ordering::Relaxed));
+        let dense0: [u64; 2] = std::array::from_fn(|i| ik_engine::cpu_pool::DENSE_NS[i].load(std::sync::atomic::Ordering::Relaxed));
         let (h1, m1) = {
             let u = e.pool.usage.lock().unwrap();
             (u.hits, u.miss_count)
@@ -106,6 +107,10 @@ fn main() -> Result<(), String> {
             let attn = |i: usize| (ik_engine::cpu_pool::ATTN_NS[i].load(std::sync::atomic::Ordering::Relaxed) - attn0[i]) as f64 / (n_gen - 1) as f64;
             if attn(0) > 0.0 {
                 println!("        CPU attention {:.2} ms/token over {:.0} host rows ({:.1} us per job)", attn(2) / 1e6, attn(3), attn(2) / attn(0) / 1e3);
+            }
+            let dense = |i: usize| (ik_engine::cpu_pool::DENSE_NS[i].load(std::sync::atomic::Ordering::Relaxed) - dense0[i]) as f64 / (n_gen - 1) as f64;
+            if dense(0) > 0.0 {
+                println!("        CPU rows of the output gates {:.2} ms/token ({:.1} us per job)", dense(1) / 1e6, dense(1) / dense(0) / 1e3);
             }
             for (name, n, us) in v.iter().take(10) {
                 println!("          {name:22} {n:5} x {:7.1} us = {us:7.0} us ({:4.1}%)", us / *n as f64, 100.0 * us / total);

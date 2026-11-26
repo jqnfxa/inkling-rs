@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::checkpoint::{Checkpoint, Dtype};
-use crate::cpu_pool::{ATTN_JOB, ATTN_OUT, ATTN_STEP, AttnCtx, Pool, STEPS, UNEMBED_STEP, UnembedCtx};
+use crate::cpu_pool::{ATTN_JOB, ATTN_OUT, ATTN_STEP, AttnCtx, DENSE_STEP, DenseCtx, Pool, STEPS, UNEMBED_STEP, UnembedCtx};
 use crate::cuda::{self, Ctx, DevBuf, Graph, HostBuf, Region, Result, Stream, VmBuf};
 use crate::experts::{ExpertCache, Experts, Fmt};
 use crate::hp::{Hp, Step};
@@ -33,6 +33,11 @@ const MSG: [usize; 4] = [0, 2, 3, 1];
 /// its rows at ~185 GB/s, the team its own at ~30 GB/s at once, so about 1/7 take as long; their VRAM goes to the
 /// expert cache and the KV rows.
 const UNEMBED_CPU_ROWS: usize = 27 * 1024;
+
+/// The last rows of each layer's output gate that the CPU team takes in decode (IK_DENSE_CPU_ROWS, a multiple of 16):
+/// the team computes them while the GPU does the rest of the layer's q, k and v projections, and the attention where
+/// no attention job follows.
+const DENSE_CPU_ROWS: usize = 1280;
 
 /// Tokens of a prefill ubatch, at most; the SWA rings hold this many rows past the window.
 pub const T_MAX: usize = 1024;
@@ -424,6 +429,8 @@ pub struct Engine {
     ack: HostBuf,      // the seq the CPU acknowledged
     err: HostBuf,      // the seq of a wait that timed out
     cpu_out: HostBuf,  // [8][n] the experts computed on the CPU
+    dense_rows: usize,   // the rows of each output gate that the CPU team takes in decode
+    dense_out: HostBuf,  // [dense_rows] f32: the team's rows of the output gate
     logits_h: HostBuf, // the logits, written by the GPU
     map: DevBuf,       // [n_phys][n_expert] slot of each expert, -1 if not cached
     graph: Option<Graph>,
@@ -506,7 +513,11 @@ impl Engine {
         let hp = Hp::from_config(&ck.config)?;
         let k = Kernels::load()?;
         let cpu_rows = std::env::var("IK_UNEMBED_CPU_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(UNEMBED_CPU_ROWS);
-        let mut w = Weights::load(&ck, &hp, cpu_rows)?;
+        let dense_rows = std::env::var("IK_DENSE_CPU_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(DENSE_CPU_ROWS);
+        if !dense_rows.is_multiple_of(16) {
+            return Err(format!("IK_DENSE_CPU_ROWS {dense_rows}: not a multiple of 16"));
+        }
+        let mut w = Weights::load(&ck, &hp, cpu_rows, dense_rows)?;
         let output_cpu = std::mem::take(&mut w.output_cpu);
         let ex = Arc::new(Experts::new(ck.clone(), &hp)?);
         let n_swa = hp.n_swa;
@@ -634,6 +645,8 @@ impl Engine {
             ack,
             err,
             cpu_out,
+            dense_rows,
+            dense_out: HostBuf::new(4 * dense_rows)?,
             logits_h: HostBuf::new(4 * hp.n_vocab)?,
             map: DevBuf::from_slice(&vec![-1i32; hp.n_phys * hp.n_expert])?,
             pool,
@@ -692,6 +705,13 @@ impl Engine {
         };
         let first = e.w.output.rows;
         e.pool.set_unembed(UnembedCtx { w: output_cpu, k: e.hp.n_embd, first, cap: e.hp.softcap, out: e.logits_h.ptr as usize });
+        if e.sched.len() > (STEPS - DENSE_STEP) as usize {
+            return Err(format!("{} layer passes: more dense jobs than a token has steps for", e.sched.len()));
+        }
+        if dense_rows > 0 {
+            let w = e.w.layers.iter_mut().map(|l| std::mem::take(&mut l.gate_cpu)).collect();
+            e.pool.set_dense(DenseCtx { w, k: e.hp.n_embd, rows: dense_rows, out: e.dense_out.ptr as usize });
+        }
         // the full-attention KV rows: in VRAM as far as the budget goes (IK_KV_VRAM_ROWS caps them while prefill runs;
         // decode's follow dec_split), the rest in host memory where the device can map it there
         let all = e.n_ctx.div_ceil(KV_STEP) * KV_STEP;
@@ -1975,6 +1995,13 @@ impl Engine {
         Ok(())
     }
 
+    /// Waits for the CPU team's rows of the output gate (the dense job of layer pass si) and copies them after the
+    /// GPU's in g0.
+    fn take_dense(&self, si: u32, nh: usize, dr: usize) -> Result<()> {
+        self.k.moe_wait(&self.s, self.ack.dev, self.params.ptr, DENSE_STEP + si, self.err.dev, 5_000_000_000)?;
+        cuda::copy_d2d(self.sc.g0.at((2 * nh - dr) * 4), self.dense_out.dev, dr * 4, &self.s)
+    }
+
     fn layer(&mut self, st: Step, si: u32, blocks: &mut Vec<P>, p_pos: P, p_tau: P, p_one: P) -> Result<()> {
         let hp = self.hp.clone();
         let (n, nu) = (hp.n_embd, hp.n_embd as u32);
@@ -2048,17 +2075,23 @@ impl Engine {
             ins[2] = ins[0];
         }
 
+        // the CPU team's rows of the output gate (a dense job, posted first so that the two parts run together)
+        let dr = self.dense_rows;
+        if dr > 0 {
+            self.k.job_post(&self.s, ins[0], nu, ins[0], 0, ins[0], 0, self.job.dev, p_pos, DENSE_STEP + si, ip as u32)?;
+        }
         // the projections of the q, k and v inputs in one launch, each checkpoint matrix into its part of g0 (q | gate |
-        // rel | sink), gk (k | k taps) or gv (v | v taps)
+        // rel | sink), gk (k | k taps) or gv (v | v taps); the gate less the CPU's rows
         let l = &self.w.layers[ip];
         let mut tab = vec![];
         let mut max_rows = 0;
-        for (mats, x, y) in [(&l.g0, ins[0], &self.sc.g0), (&l.gk, ins[1], &self.sc.gk), (&l.gv, ins[2], &self.sc.gv)] {
+        for (j, (mats, x, y)) in [(&l.g0, ins[0], &self.sc.g0), (&l.gk, ins[1], &self.sc.gk), (&l.gv, ins[2], &self.sc.gv)].into_iter().enumerate() {
             let mut off = 0;
-            for m in mats {
-                tab.extend([m.w.ptr, x, y.at(off * 4), m.rows as u64]);
+            for (i, m) in mats.iter().enumerate() {
+                let rows = if (j, i) == (0, 1) { m.rows - dr } else { m.rows };
+                tab.extend([m.w.ptr, x, y.at(off * 4), rows as u64]);
                 off += m.rows;
-                max_rows = max_rows.max(m.rows);
+                max_rows = max_rows.max(rows);
             }
         }
         let nz = (tab.len() / 4) as u32;
@@ -2104,6 +2137,10 @@ impl Engine {
         // parts run together), the GPU the rows in VRAM
         let cpu = !swa && self.kv_cpu;
         let (vram, step) = if cpu { (self.kv_split as u32, ATTN_STEP + self.attn_idx[il]) } else { (u32::MAX, 0) };
+        // the CPU's rows of the gate: before an attention job takes the job buffer, else when they are needed
+        if dr > 0 && cpu {
+            self.take_dense(si, nh as usize, dr)?;
+        }
         if cpu {
             let nr = (hp.n_head * hp.n_rel) as u32;
             self.k.job_post(&self.s, self.sc.q.ptr, nh, self.sc.r.ptr, nr, sink, hp.n_head as u32, self.job.dev, p_pos, step, il as u32)?;
@@ -2120,6 +2157,9 @@ impl Engine {
         }
         self.k.attn_reduce(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, p_pos, window, maxs, cs, hp.n_head as u32, self.attn_out.dev, vram)?;
         self.probe("kqv_out", il, self.sc.att.ptr, nh as usize)?;
+        if dr > 0 && !cpu {
+            self.take_dense(si, nh as usize, dr)?;
+        }
         self.k.mul_sigmoid(&self.s, self.sc.att.ptr, gate, self.sc.att2.ptr, nh)?;
         let l = &self.w.layers[ip];
         self.gemv(&l.wo, self.sc.att2.ptr, self.sc.a.ptr)?;

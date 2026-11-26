@@ -27,6 +27,10 @@ pub const ATTN_OUT: usize = HEADS * (2 + DIM);
 /// The step of a token's unembedding job, its last: the CPU team's rows of the logits, which the GPU does not wait for.
 pub const UNEMBED_STEP: u32 = 63;
 const U_ROWS: usize = 256; // unembedding rows per chunk
+/// The step of a token's first dense job: the CPU team's rows of the output gate of layer pass si are the job of step
+/// DENSE_STEP + si.
+pub const DENSE_STEP: u32 = 64;
+const D_ROWS: usize = 32; // dense rows per chunk
 
 /// The unembedding rows that the CPU team takes: BF16 [rows][k], rows `first`.. of the vocabulary, the soft cap of the
 /// logits, and the host address of the logits, [n_vocab] f32, where the team writes its rows'.
@@ -49,6 +53,15 @@ impl UnembedCtx {
             *o = self.cap * (crate::cpu::dot_bf16(&self.w[r * self.k..(r + 1) * self.k], x) / self.cap).tanh();
         }
     }
+}
+
+/// The rows of the attention's output gate that the CPU team takes at each physical layer, its last: BF16 [rows][k]
+/// each, and the host address of the team's output, [rows] f32, which the GPU copies after the ack.
+pub struct DenseCtx {
+    pub w: Vec<Vec<u16>>,
+    pub k: usize,
+    pub rows: usize,
+    pub out: usize,
 }
 
 /// What the attention jobs need besides the job: the full-attention caches of each layer slot (host addresses of K
@@ -88,19 +101,21 @@ struct Shared {
     dn_next: AtomicU64,
     gu_done: AtomicU32,
     dn_done: AtomicU32,
-    kind: AtomicU64,      // epoch << 2 | KIND_*
+    kind: AtomicU64,      // epoch << 3 | KIND_*
     batch_req: AtomicU32,  // the host posts a batch job (prefill): 1 pending, 0 done
     batch_ns: AtomicU64,   // the last batch job's time on the team, from the leader taking it to its end
     n: usize,
     work: UnsafeCell<Work>,
     attn: std::sync::OnceLock<AttnCtx>,
     unembed: std::sync::OnceLock<UnembedCtx>,
+    dense: std::sync::OnceLock<DenseCtx>,
 }
 
 const KIND_DECODE: u64 = 0;
 const KIND_BATCH: u64 = 1;
 const KIND_ATTN: u64 = 2;
 const KIND_UNEMBED: u64 = 3;
+const KIND_DENSE: u64 = 4;
 
 // SAFETY: `work` is written by the leader before it bumps `epoch`, and read by helpers after: a batch job's phases are
 // separated by barriers, a decode job's by the done counters (see `take`).
@@ -133,7 +148,8 @@ struct Work {
     a_d0: usize,
     a_chunk: usize,
     a_parts: Vec<[Partial; HEADS]>,
-    ux: Vec<f32>, // an unembedding job's normed state
+    ux: Vec<f32>, // the input of an unembedding or dense job
+    d_ip: usize,  // a dense job's physical layer
 }
 
 /// nanoseconds of the batch phases: gate_up, activations, down
@@ -323,13 +339,14 @@ fn wait_done(sh: &Shared, done: &AtomicU32, total: u32, epoch: u32) -> bool {
 /// The work of thread `t` on the job of epoch `epoch`.
 fn run(sh: &Shared, cx: &Ctx, t: usize, epoch: u32) {
     let kind = sh.kind.load(Ordering::Acquire);
-    if (kind >> 2) as u32 != epoch {
+    if (kind >> 3) as u32 != epoch {
         return; // a later job has started: this thread takes part in it next
     }
-    match kind & 3 {
+    match kind & 7 {
         KIND_BATCH => run_batch(sh, cx, t),
         KIND_ATTN => run_attn(sh, epoch),
         KIND_UNEMBED => run_unembed(sh, epoch),
+        KIND_DENSE => run_dense(sh, epoch),
         _ => run_decode(sh, cx, t, epoch),
     }
 }
@@ -374,6 +391,25 @@ fn run_unembed(sh: &Shared, epoch: u32) {
         unsafe {
             let out = std::slice::from_raw_parts_mut((u.out as *mut f32).add(u.first + lo), hi - lo);
             u.run(&(*w).ux, lo, hi, out);
+        }
+        sh.gu_done.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Chunks of a dense job: D_ROWS rows of the output gate each.
+fn run_dense(sh: &Shared, epoch: u32) {
+    let w = sh.work.get() as *const Work;
+    let Some(d) = sh.dense.get() else { return };
+    while let Take::Chunk(c) = take(&sh.gu_next, epoch) {
+        let (lo, hi) = (c * D_ROWS, ((c + 1) * D_ROWS).min(d.rows));
+        // SAFETY: the epoch holds while this chunk is not done, and the leader writes ux and d_ip only between epochs;
+        // the chunk's rows are its own, in host-mapped memory that the GPU reads after the ack
+        unsafe {
+            let w = &*w;
+            let m = &d.w[w.d_ip];
+            for r in lo..hi {
+                *(d.out as *mut f32).add(r) = crate::cpu::dot_bf16(&m[r * d.k..(r + 1) * d.k], &w.ux);
+            }
         }
         sh.gu_done.fetch_add(1, Ordering::Release);
     }
@@ -462,6 +498,7 @@ impl Pool {
             work: UnsafeCell::new(Work::default()),
             attn: std::sync::OnceLock::new(),
             unembed: std::sync::OnceLock::new(),
+            dense: std::sync::OnceLock::new(),
         });
         let usage = Arc::new(Mutex::new(Usage { freq: vec![vec![0.0; n_expert]; n_layers], misses: vec![], hits: 0, miss_count: 0 }));
         let busy_ns = Arc::new(AtomicU64::new(0));
@@ -543,7 +580,7 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
             }
             let t0 = std::time::Instant::now();
             let g = sh.epoch.load(Ordering::Relaxed).wrapping_add(1);
-            sh.kind.store((g as u64) << 2 | KIND_BATCH, Ordering::Release);
+            sh.kind.store((g as u64) << 3 | KIND_BATCH, Ordering::Release);
             sh.epoch.store(g, Ordering::Release);
             run_batch(sh, cx, 0);
             busy.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -578,12 +615,20 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
         let t0 = std::time::Instant::now();
         LEADER_T0.with(|c| c.set(t0));
         last = seq;
-        if (seq - 1) % STEPS == UNEMBED_STEP {
+        let step = (seq - 1) % STEPS;
+        if step == UNEMBED_STEP {
             unembed_job(sh, job, n);
             ack.store(seq, Ordering::Release);
             continue;
         }
-        if (seq - 1) % STEPS >= ATTN_STEP {
+        if step >= DENSE_STEP {
+            dense_job(sh, job, n);
+            ack.store(seq, Ordering::Release);
+            DENSE_NS[0].fetch_add(1, Ordering::Relaxed);
+            DENSE_NS[1].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            continue;
+        }
+        if step >= ATTN_STEP {
             attn_job(sh, job);
             ack.store(seq, Ordering::Release);
             ATTN_NS[2].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -617,7 +662,7 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
             sh.dn_done.store(0, Ordering::Relaxed);
             sh.gu_next.store((g as u64) << 32 | gu_total << 16, Ordering::Release);
             sh.dn_next.store((g as u64) << 32 | dn_total << 16, Ordering::Release);
-            sh.kind.store((g as u64) << 2 | KIND_DECODE, Ordering::Release);
+            sh.kind.store((g as u64) << 3 | KIND_DECODE, Ordering::Release);
             sh.epoch.store(g, Ordering::Release);
             let t1 = t0.elapsed().as_nanos() as u64;
             run_decode(sh, cx, 0, g);
@@ -661,9 +706,35 @@ fn unembed_job(sh: &Shared, job: *const u32, n: usize) {
     let g = sh.epoch.load(Ordering::Relaxed).wrapping_add(1);
     sh.gu_done.store(0, Ordering::Relaxed);
     sh.gu_next.store((g as u64) << 32 | (n_chunks as u64) << 16, Ordering::Release);
-    sh.kind.store((g as u64) << 2 | KIND_UNEMBED, Ordering::Release);
+    sh.kind.store((g as u64) << 3 | KIND_UNEMBED, Ordering::Release);
     sh.epoch.store(g, Ordering::Release);
     run_unembed(sh, g);
+    wait_done(sh, &sh.gu_done, n_chunks as u32, g);
+}
+
+/// dense jobs: [jobs, ns from the job to its ack]
+pub static DENSE_NS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The dense job in `job` (word: the physical layer; then the layer pass's q input, n floats): the CPU's rows of its
+/// output gate, in chunks on the team.
+fn dense_job(sh: &Shared, job: *const u32, n: usize) {
+    let Some(d) = sh.dense.get() else { return };
+    {
+        // SAFETY: no thread reads the job between epochs
+        let w = unsafe { &mut *sh.work.get() };
+        // SAFETY: host-mapped memory the GPU wrote before seq
+        w.d_ip = unsafe { std::ptr::read_volatile(job.add(1)) } as usize;
+        w.ux.clear();
+        // SAFETY: as above
+        w.ux.extend_from_slice(unsafe { std::slice::from_raw_parts(job.add(JOB_X) as *const f32, n) });
+    }
+    let n_chunks = d.rows.div_ceil(D_ROWS);
+    let g = sh.epoch.load(Ordering::Relaxed).wrapping_add(1);
+    sh.gu_done.store(0, Ordering::Relaxed);
+    sh.gu_next.store((g as u64) << 32 | (n_chunks as u64) << 16, Ordering::Release);
+    sh.kind.store((g as u64) << 3 | KIND_DENSE, Ordering::Release);
+    sh.epoch.store(g, Ordering::Release);
+    run_dense(sh, g);
     wait_done(sh, &sh.gu_done, n_chunks as u32, g);
 }
 
@@ -700,7 +771,7 @@ fn attn_job(sh: &Shared, job: *const u32) {
     let g = sh.epoch.load(Ordering::Relaxed).wrapping_add(1);
     sh.gu_done.store(0, Ordering::Relaxed);
     sh.gu_next.store((g as u64) << 32 | (n_chunks as u64) << 16, Ordering::Release);
-    sh.kind.store((g as u64) << 2 | KIND_ATTN, Ordering::Release);
+    sh.kind.store((g as u64) << 3 | KIND_ATTN, Ordering::Release);
     sh.epoch.store(g, Ordering::Release);
     run_attn(sh, g);
     wait_done(sh, &sh.gu_done, n_chunks as u32, g);
@@ -730,6 +801,11 @@ impl Pool {
     /// Sets the unembedding rows that the CPU team takes; once, before the first job.
     pub fn set_unembed(&self, u: UnembedCtx) {
         let _ = self.shared.unembed.set(u);
+    }
+
+    /// Sets the rows of the output gate that the CPU team takes; once, before the first job.
+    pub fn set_dense(&self, d: DenseCtx) {
+        let _ = self.shared.dense.set(d);
     }
 
     /// The CPU's rows of the logits of normed state x on this thread (prefill's last token), into out[first..].
