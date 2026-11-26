@@ -2,7 +2,7 @@
 //! Layer 3 (NVFP4) and the first MXFP8 layer, 8 experts each, read once per pass.
 use ik_engine::checkpoint::Checkpoint;
 use ik_engine::cpu::{dot_row, order_x};
-use ik_engine::cpu_batch::dot_tokens;
+use ik_engine::cpu_batch::dot_rows;
 use ik_engine::experts::{Experts, Fmt, Mat};
 use ik_engine::hp::Hp;
 
@@ -28,13 +28,13 @@ fn main() -> Result<(), String> {
         for nt in [1usize, 4, 8] {
             let xs: Vec<&[f32]> = (0..nt).map(|_| xq).collect();
             let as_: Vec<&[f32]> = (0..nt).map(|_| aq).collect();
-            let mut out = vec![0f32; nt];
+            let mut out = vec![0f32; 32 * nt];
             let mut s = 0f32;
             let (t0, mut bytes) = (std::time::Instant::now(), 0);
             for e in 0..8 {
                 let gu = ex.gate_up(layer, e);
-                for r in 0..gu.rows {
-                    if nt == 1 { s += dot_row(&gu, r, &xo) } else { dot_tokens(&gu, r, &xs, &mut out); s += out[0] }
+                for r in (0..gu.rows).step_by(if nt == 1 { 1 } else { 32 }) {
+                    if nt == 1 { s += dot_row(&gu, r, &xo) } else { dot_rows(&gu, r, 32.min(gu.rows - r), &xs, &mut out); s += out[0] }
                 }
                 bytes += self::bytes(&gu);
             }
@@ -42,8 +42,8 @@ fn main() -> Result<(), String> {
             let (t1, mut bytes2) = (std::time::Instant::now(), 0);
             for e in 8..16 {
                 let dn = ex.down(layer, e);
-                for r in 0..dn.rows {
-                    if nt == 1 { s += dot_row(&dn, r, &ao) } else { dot_tokens(&dn, r, &as_, &mut out); s += out[0] }
+                for r in (0..dn.rows).step_by(if nt == 1 { 1 } else { 32 }) {
+                    if nt == 1 { s += dot_row(&dn, r, &ao) } else { dot_rows(&dn, r, 32.min(dn.rows - r), &as_, &mut out); s += out[0] }
                 }
                 bytes2 += self::bytes(&dn);
             }
@@ -79,6 +79,38 @@ fn main() -> Result<(), String> {
                 *pass = bytes(&gu) as f64 / t0.elapsed().as_secs_f64() / 1e9;
             }
             println!("layer {layer} expert {e}: gate_up ({} KiB) from RAM {:.2} GB/s, again (cached) {:.2} GB/s   [{s:.1}]", bytes(&gu) >> 10, v[0], v[1]);
+        }
+    }
+    // prefill's batched kernel, one thread, on distinct tokens as a ubatch has them: an expert's rows in chunks of 32 as
+    // the pool takes them; GFLOP/s of the FMAs
+    for layer in layers.into_iter().flatten() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 2000) as f32 / 1000.0 - 1.0
+        };
+        let xs_all: Vec<Vec<f32>> = (0..32).map(|_| (0..hp.n_embd).map(|_| rnd()).collect()).collect();
+        for nt in [4usize, 12, 32] {
+            let xs: Vec<&[f32]> = xs_all[..nt].iter().map(|x| &x[..]).collect();
+            let axs: Vec<&[f32]> = xs_all[..nt].iter().map(|x| &x[..hp.n_ff_exp]).collect();
+            let mut out = vec![0f32; 32 * nt];
+            let mut gf = [0f64; 2];
+            for (wi, g) in gf.iter_mut().enumerate() {
+                let (t0, mut flops, mut s) = (std::time::Instant::now(), 0f64, 0f32);
+                for e in 40..48 {
+                    let (m, x) = if wi == 0 { (ex.gate_up(layer, e), &xs) } else { (ex.down(layer, e), &axs) };
+                    for c in (0..m.rows).step_by(32) {
+                        dot_rows(&m, c, (m.rows - c).min(32), x, &mut out);
+                        s += out[0];
+                    }
+                    flops += 2.0 * (m.rows * m.k * nt) as f64;
+                }
+                *g = flops / t0.elapsed().as_secs_f64() / 1e9;
+                std::hint::black_box(s);
+            }
+            println!("layer {layer} ({:?}), {nt:2} distinct tokens, one thread: gate_up {:.1} GFLOP/s, down {:.1}", ex.fmt[layer], gf[0], gf[1]);
         }
     }
     // the pool's ceiling: n threads, each through its own NVFP4 experts for a second, either the same 2 again and again

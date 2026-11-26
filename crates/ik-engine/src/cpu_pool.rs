@@ -9,7 +9,7 @@ use std::thread::JoinHandle;
 
 use crate::cpu::{dot_row, order_x, x_pos};
 use crate::cpu_attn::{self, DIM, HEADS, N_REL, Partial};
-use crate::cpu_batch::dot_tokens;
+use crate::cpu_batch::dot_rows;
 use crate::cuda::HostBuf;
 use crate::experts::Experts;
 
@@ -192,12 +192,13 @@ fn run_batch(sh: &Shared, cx: &Ctx, t: usize) {
         let gu = ex.gate_up(job.layer, *e);
         let sg = gu.scale();
         let xs: Vec<&[f32]> = toks.iter().map(|&(tk, _)| &job.x[tk * n..(tk + 1) * n]).collect();
-        let mut out = vec![0f32; toks.len()];
-        for r in c * ROWS..((c + 1) * ROWS).min(2 * nff) {
-            dot_tokens(&gu, r, &xs, &mut out);
-            for (i, &v) in out.iter().enumerate() {
-                // SAFETY: row r of pair base[m] + i is written by the thread that took the chunk
-                unsafe { *(w.bh[base[m] + i].as_ptr() as *mut f32).add(r) = v * sg };
+        let (r0, nr) = (c * ROWS, ROWS.min(2 * nff - c * ROWS));
+        let mut out = vec![0f32; nr * toks.len()];
+        dot_rows(&gu, r0, nr, &xs, &mut out);
+        for (j, oj) in out.chunks(toks.len()).enumerate() {
+            for (i, &v) in oj.iter().enumerate() {
+                // SAFETY: row r0 + j of pair base[m] + i is written by the thread that took the chunk
+                unsafe { *(w.bh[base[m] + i].as_ptr() as *mut f32).add(r0 + j) = v * sg };
             }
         }
     }
@@ -230,12 +231,13 @@ fn run_batch(sh: &Shared, cx: &Ctx, t: usize) {
         let dn = ex.down(job.layer, *e);
         let sd = dn.scale();
         let xs: Vec<&[f32]> = (0..toks.len()).map(|i| &w.bact[base[m] + i][..]).collect();
-        let mut out = vec![0f32; toks.len()];
-        for r in c * ROWS..((c + 1) * ROWS).min(n) {
-            dot_tokens(&dn, r, &xs, &mut out);
-            for (i, &(_, pair)) in toks.iter().enumerate() {
-                // SAFETY: output row r of `pair` is written by the thread that took the chunk
-                unsafe { *(job.out as *mut f32).add(pair * n + r) = out[i] * sd };
+        let (r0, nr) = (c * ROWS, ROWS.min(n - c * ROWS));
+        let mut out = vec![0f32; nr * toks.len()];
+        dot_rows(&dn, r0, nr, &xs, &mut out);
+        for (j, oj) in out.chunks(toks.len()).enumerate() {
+            for (&v, &(_, pair)) in oj.iter().zip(toks) {
+                // SAFETY: output row r0 + j of `pair` is written by the thread that took the chunk
+                unsafe { *(job.out as *mut f32).add(pair * n + r0 + j) = v * sd };
             }
         }
     }
