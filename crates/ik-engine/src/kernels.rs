@@ -188,6 +188,15 @@ impl Kernels {
         self.run(s, "add", (n.div_ceil(256), 1, 1), 256, &[&a, &b, &y, &n])
     }
 
+    /// Rows of n floats (a multiple of 4): dst row didx[i] (or i, without didx) = src row sidx[i] (or i), for i < m.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_rows(&self, s: &Stream, src: P, sidx: Option<P>, dst: P, didx: Option<P>, n: u32, m: u32) -> Result<()> {
+        assert!(n.is_multiple_of(4), "copy_rows: n {n}");
+        let mode = sidx.is_some() as u32 | (didx.is_some() as u32) << 1;
+        let (si, di) = (sidx.unwrap_or(0), didx.unwrap_or(0));
+        self.run(s, "copy_rows", ((n / 4).div_ceil(128), m, 1), 128, &[&src, &si, &dst, &di, &n, &mode])
+    }
+
     pub fn mul_sigmoid(&self, s: &Stream, x: P, g: P, y: P, n: u32) -> Result<()> {
         self.mul_sigmoid_t(s, x, g, y, n, n, n)
     }

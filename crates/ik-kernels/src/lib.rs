@@ -1005,6 +1005,51 @@ pub mod gpu {
         st.global.f32([ya], av);
     }
 
+    /// Row didx[i] of dst (row i if mode bit 1 is clear) = row sidx[i] of src (row i if bit 0 is clear), rows of n
+    /// floats (a multiple of 4), for the rows i of grid.y: a gather when bit 0 is set, a scatter when bit 1 is. A thread
+    /// per 4 floats.
+    #[maxntid(128)]
+    pub unsafe extern "ptx-kernel" fn copy_rows(src: *const f32, sidx: *const u32, dst: *mut f32, didx: *const u32, n: u32, mode: u32) {
+        let (bk, nt, t, c, i): (u32, u32, u32, u32, u32);
+        mov.u32(bk, ctaid.x);
+        mov.u32(nt, ntid.x);
+        mov.u32(t, tid.x);
+        mov.u32(i, ctaid.y);
+        mad.lo.u32(c, bk, nt, t);
+        shl.b32(c, c, 2);
+        let past: pred;
+        setp.ge.u32(past, c, n);
+        if past {
+            ret();
+        }
+        let (si, di, bit): (u32, u32, u32);
+        mov.u32(si, i);
+        mov.u32(di, i);
+        let (by_s, by_d): (pred, pred);
+        and.b32(bit, mode, 1);
+        setp.ne.u32(by_s, bit, 0);
+        and.b32(bit, mode, 2);
+        setp.ne.u32(by_d, bit, 0);
+        let (ia, ja): (u64, u64);
+        mad.wide.u32(ia, i, 4, sidx);
+        mad.wide.u32(ja, i, 4, didx);
+        if by_s {
+            ld.global.u32(si, [ia]);
+        }
+        if by_d {
+            ld.global.u32(di, [ja]);
+        }
+        let (so, dof): (u32, u32);
+        mad.lo.u32(so, si, n, c);
+        mad.lo.u32(dof, di, n, c);
+        let (sa, da): (u64, u64);
+        mad.wide.u32(sa, so, 4, src);
+        mad.wide.u32(da, dof, 4, dst);
+        let (v0, v1, v2, v3): (f32, f32, f32, f32);
+        ld.global.v4.f32((v0, v1, v2, v3), [sa]);
+        st.global.v4.f32([da], (v0, v1, v2, v3));
+    }
+
     /// y = x * sigmoid(g) over n floats.
     #[maxntid(256)]
     pub unsafe extern "ptx-kernel" fn mul_sigmoid(x: *const f32, g: *const f32, y: *mut f32, n: u32, n_row: u32, g_stride: u32) {

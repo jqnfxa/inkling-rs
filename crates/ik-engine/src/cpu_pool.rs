@@ -649,11 +649,16 @@ impl Pool {
         let _ = self.shared.attn.set(ac);
     }
 
-    /// Runs a prefill job on the team, and returns when it is done.
-    pub fn run_batch(&self, job: BatchJob) {
+    /// Starts a prefill job on the team; wait_batch returns when it is done.
+    pub fn start_batch(&self, job: BatchJob) {
+        assert_eq!(self.shared.batch_req.load(Ordering::Acquire), 0, "a batch job is running");
         // SAFETY: the leader reads the job only after batch_req is set, and the previous one is done
         unsafe { (*self.shared.work.get()).batch = Some(job) };
         self.shared.batch_req.store(1, Ordering::Release);
+    }
+
+    /// Returns when the job of start_batch is done.
+    pub fn wait_batch(&self) {
         let mut spins = 0;
         while self.shared.batch_req.load(Ordering::Acquire) != 0 {
             pause(&mut spins);

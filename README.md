@@ -125,9 +125,12 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
   on a flag (`moe_wait`). No host round trip per layer.
 - The CPU threads take work from shared counters with no barrier; each gate/up chunk also applies the activation to
   its block, which the down projection reads.
-- Prefill runs ubatches of up to 256 tokens. The BF16 GEMVs over the ubatch's tokens and flash-style attention run
-  on the GPU. The experts run on the CPU, grouped so each is read once per ubatch. Prefill is slow until tensor-core
-  BF16 GEMMs and grouped NVFP4/MXFP8 GEMMs move it to the GPU.
+- Prefill runs ubatches of up to 256 tokens. The dense matrices run as a tiled BF16 GEMM and attention by tiles of 16
+  tokens and 32 keys, on the GPU, and so do the pairs of the cached experts. The other experts are grouped by expert,
+  each read once per ubatch for all its tokens. The CPU threads take most of them; an expert stream takes those with
+  the most tokens, as many as it can upload in the time the CPU takes for the rest. The copy stream uploads each to a
+  staging slot (through a page-locked slot on the host, which the host copies the expert to, unless `IK_PIN=1`), and
+  the GPU runs its pairs. `IK_PF_STREAM=0` turns the stream off.
 - Activations stay f32; the engine adds no quantization. The KV caches hold K and V in f16, as the reference code keeps
   them in BF16: the f32 values the kernels compute, rounded once (2048 bytes each per position and layer pass). The
   sliding-window passes' caches are rings of 1280 positions (the window and a ubatch). Perplexity over the first 2048

@@ -50,6 +50,8 @@ const STAGE_ROWS: usize = 4096;
 const PF_STATE: usize = 390;
 /// Prefill runs the pairs of cached experts on the GPU this many tokens at a time.
 const PF_GROUP: usize = 32;
+/// Staging slots of prefill's expert stream: the copy stream fills one while the GPU runs the pairs of another.
+const STREAM_SLOTS: usize = 4;
 /// From this many tokens on, prefill's dense matrices run as gemm_bf16 (W read once for 128 tokens) and not as
 /// gemv_bf16 (W read once a token).
 const GEMM_MIN: usize = 8;
@@ -156,6 +158,66 @@ struct BatchBufs {
     pf_dn: DevBuf,
 }
 
+/// Prefill's stream of uncached experts: the copy stream uploads each to a staging slot and the GPU runs its pairs,
+/// beside the CPU team, which takes the other uncached experts.
+struct PfStream {
+    /// the staging slots of gate_up and of down, sized for the larger format
+    gu: DevBuf,
+    dn: DevBuf,
+    /// an expert's pairs: x [T_MAX][n] (gathered, then the down outputs), gate_up [T_MAX][2 n_ff], activations
+    /// [T_MAX][n_ff]
+    x: DevBuf,
+    gu_out: DevBuf,
+    af: DevBuf,
+    /// the streamed pairs in expert order, [4][8 T_MAX] u32: staging slot, expert, token, pair (8 t + k); and the host
+    /// copy they are written to
+    lists: DevBuf,
+    lists_h: HostBuf,
+    s: Stream,
+    /// per staging slot: its upload is done; its last reader is done
+    up: Vec<cuda::Event>,
+    free: Vec<cuda::Event>,
+    /// the copy stream at a layer's first upload, and the stream past its last pair, for the throughput
+    t0: cuda::Event,
+    t1: cuda::Event,
+    /// bytes a second through the stream, and the CPU team's seconds a pair, as measured (moving averages)
+    bw: f64,
+    cpu_pair_s: f64,
+    /// bytes of the layer in flight, measured once its events are done
+    last_bytes: usize,
+    /// when the experts are not page-locked: page-locked slots that the host copies each expert to for its upload
+    /// ([STREAM_SLOTS] of gate_up then down), and per slot the copy stream past its last upload from it
+    bounce: Option<HostBuf>,
+    bounced: Vec<cuda::Event>,
+}
+
+impl PfStream {
+    fn new(ex: &Experts, hp: &Hp) -> Result<PfStream> {
+        let (n, nff, cap) = (hp.n_embd, hp.n_ff_exp, 8 * T_MAX);
+        let events = || (0..STREAM_SLOTS).map(|_| cuda::Event::new(false)).collect::<Result<Vec<_>>>();
+        let slot = ex.gu_bytes.iter().max().unwrap() + ex.down_bytes.iter().max().unwrap();
+        Ok(PfStream {
+            gu: DevBuf::new(STREAM_SLOTS * ex.gu_bytes.iter().max().unwrap())?,
+            dn: DevBuf::new(STREAM_SLOTS * ex.down_bytes.iter().max().unwrap())?,
+            x: DevBuf::new(T_MAX * n * 4)?,
+            gu_out: DevBuf::new(T_MAX * 2 * nff * 4)?,
+            af: DevBuf::new(T_MAX * nff * 4)?,
+            lists: DevBuf::new(4 * cap * 4)?,
+            lists_h: HostBuf::new(4 * cap * 4)?,
+            s: Stream::new_nonblocking()?,
+            up: events()?,
+            free: events()?,
+            t0: cuda::Event::new(true)?,
+            t1: cuda::Event::new(true)?,
+            bw: 6.0e9,
+            cpu_pair_s: 55e-6,
+            last_bytes: 0,
+            bounce: if ex.pinned { None } else { Some(HostBuf::new(STREAM_SLOTS * slot)?) },
+            bounced: events()?,
+        })
+    }
+}
+
 /// Storage of the depth blocks and loop banks.
 struct Blocks {
     b0: DevBuf,
@@ -235,6 +297,8 @@ pub struct Engine {
     ckpt_pos: Option<usize>,
     ckpt_conv: DevBuf,
     copy_s: Stream,       // async cache uploads
+    /// prefill's expert stream (IK_PF_STREAM=0: none)
+    pf_stream: Option<PfStream>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -249,6 +313,14 @@ pub struct Stats {
     pub pf_cpu_s: f64,
     pub pf_cpu_pairs: u64,
     pub pf_gpu_pairs: u64,
+    /// prefill: pairs and experts of the expert stream (counted in pf_cpu_pairs too: they are not cached), its bytes
+    /// and seconds, and the layers where it was still running when the CPU team was done, and the seconds it ran on
+    pub pf_stream_pairs: u64,
+    pub pf_stream_experts: u64,
+    pub pf_stream_bytes: u64,
+    pub pf_stream_s: f64,
+    pub pf_stream_late: u64,
+    pub pf_stream_late_s: f64,
 }
 
 /// Host memory that can still be taken: MemAvailable, and within the memory limit of this process's cgroup if it has
@@ -406,6 +478,8 @@ impl Engine {
             pf_af: f(8 * PF_GROUP * hp.n_ff_exp)?,
             pf_dn: f(8 * PF_GROUP * n)?,
         };
+        let stream_on = std::env::var("IK_PF_STREAM").map_or(true, |v| v != "0");
+        let pf_stream = if GPU_EXPERTS && stream_on { Some(PfStream::new(&ex, &hp)?) } else { None };
         // the expert cache and the full-attention KV rows share what is free once the rest exists, less a margin for
         // the CUDA graph and the driver (IK_VRAM_MARGIN_MIB, default 160); the KV rows take memory as the context grows
         // and give it back when a new sequence is shorter (plan_kv)
@@ -476,6 +550,7 @@ impl Engine {
             ckpt_conv: DevBuf::new(n_slots * (2 * kv + 2 * n) * 3 * 4)?,
             snap_swa: HostBuf::new(n_slots * 2 * n_swa * KV_ROW)?,
             copy_s: Stream::new_nonblocking()?,
+            pf_stream,
         };
         // the full-attention KV rows: in VRAM as far as the budget goes (IK_KV_VRAM_ROWS caps them), the rest in host
         // memory where the device can map it there
@@ -1296,9 +1371,10 @@ impl Engine {
         Ok(())
     }
 
-    /// The experts of a ubatch. The (token, expert) pairs of cached experts run on the GPU, PF_GROUP tokens at a time,
-    /// while the host groups the others by expert and the CPU team computes them; their outputs are added to the GPU's
-    /// once the team is done.
+    /// The experts of a ubatch. The (token, expert) pairs of cached experts run on the GPU, PF_GROUP tokens at a time.
+    /// Of the others, grouped by expert on the host, the expert stream takes those with the most tokens while its time
+    /// stays under the CPU's for the rest, and the CPU team computes the rest meanwhile; the outputs of both are added
+    /// to the GPU's once they are done.
     fn moe_t(&mut self, ip: usize, nt: usize) -> Result<()> {
         let n = self.hp.n_embd;
         let nu = n as u32;
@@ -1308,6 +1384,18 @@ impl Engine {
         self.s.sync()?;
         let t1 = std::time::Instant::now();
         self.stats.pf_gpu_s += (t1 - t0).as_secs_f64();
+        // the last layer's stream is done (self.s waited for it): its throughput
+        if let Some(ps) = self.pf_stream.as_mut()
+            && ps.last_bytes > 0
+        {
+            let secs = ps.t1.ms_since(&ps.t0)? as f64 / 1e3;
+            if secs > 0.0 {
+                ps.bw = 0.8 * ps.bw + 0.2 * ps.last_bytes as f64 / secs;
+            }
+            self.stats.pf_stream_bytes += ps.last_bytes as u64;
+            self.stats.pf_stream_s += secs;
+            ps.last_bytes = 0;
+        }
         let ids: Vec<u32> = self.b.host_ids.as_slice::<u32>()[..nt * 8].to_vec();
         let slots: Vec<i32> = ids.iter().map(|&e| self.cache.slot_of[ip][e as usize]).collect();
         let mut groups: Vec<(usize, Vec<(usize, usize)>)> = vec![];
@@ -1319,17 +1407,43 @@ impl Engine {
             });
             groups[g].1.push((p / 8, p));
         }
+        // the stream's share: an expert costs it its bytes, and the CPU its pairs
+        let mut streamed = vec![];
+        if let Some(ps) = &self.pf_stream {
+            let f = self.ex.fmt[ip].index();
+            let bytes = (self.ex.gu_bytes[f] + self.ex.down_bytes[f]) as f64;
+            groups.sort_by_key(|g| std::cmp::Reverse(g.1.len()));
+            let mut rest: usize = groups.iter().map(|g| g.1.len()).sum();
+            let mut k = 0;
+            while k < groups.len() && (k + 1) as f64 * bytes / ps.bw <= (rest - groups[k].1.len()) as f64 * ps.cpu_pair_s {
+                rest -= groups[k].1.len();
+                k += 1;
+            }
+            streamed = groups.drain(..k).collect::<Vec<_>>();
+        }
         self.b.host_slots.as_mut_slice::<i32>()[..nt * 8].copy_from_slice(&slots);
         cuda::copy_h2d_async(self.b.slots.ptr, self.b.host_slots.ptr, nt * 8 * 4, &self.s)?;
         let on_gpu = slots.iter().filter(|&&s| s >= 0).count();
         self.stats.pf_gpu_pairs += on_gpu as u64;
         self.stats.pf_cpu_pairs += (nt * 8 - on_gpu) as u64;
         // the CPU team counts the uses of its pairs; these are the GPU's
-        if on_gpu > 0 {
+        if on_gpu > 0 || !streamed.is_empty() {
             let mut u = self.pool.usage.lock().unwrap();
             for (&e, _) in ids.iter().zip(&slots).filter(|&(_, &s)| s >= 0) {
                 u.freq[ip][e as usize] += 1.0;
             }
+            for (e, pairs) in &streamed {
+                u.freq[ip][*e] += pairs.len() as f32;
+                u.misses.push((ip, *e));
+            }
+        }
+        // the CPU team starts, and the GPU's work is queued while it runs
+        let cpu_pairs: usize = groups.iter().map(|g| g.1.len()).sum();
+        let t3 = std::time::Instant::now();
+        self.stats.pf_host_s += (t3 - t1).as_secs_f64();
+        if !groups.is_empty() {
+            let x = self.b.host_xn.as_slice::<f32>()[..nt * n].to_vec();
+            self.pool.start_batch(crate::cpu_pool::BatchJob { layer: ip, x, misses: groups, out: self.b.cpu_out.ptr as usize });
         }
         let spans: Vec<(usize, usize, bool)> = (0..nt)
             .step_by(PF_GROUP)
@@ -1343,15 +1457,31 @@ impl Engine {
                 self.experts_pf(ip, ta, tb)?;
             }
         }
-        let x = self.b.host_xn.as_slice::<f32>()[..nt * n].to_vec();
-        let t3 = std::time::Instant::now();
-        if !groups.is_empty() {
-            self.pool.run_batch(crate::cpu_pool::BatchJob { layer: ip, x, misses: groups, out: self.b.cpu_out.ptr as usize });
+        if !streamed.is_empty() {
+            self.stream_experts(ip, &streamed)?;
         }
-        let t4 = std::time::Instant::now();
-        self.stats.pf_host_s += (t3 - t1).as_secs_f64();
-        self.stats.pf_cpu_s += (t4 - t3).as_secs_f64();
-        // the CPU's pairs, added to the GPU's where a group has some
+        if cpu_pairs > 0 {
+            let te = std::time::Instant::now();
+            self.pool.wait_batch();
+            let t4 = std::time::Instant::now();
+            self.stats.pf_cpu_s += (t4 - t3).as_secs_f64();
+            // the team's time is known when it was still running once the GPU's work was queued
+            if let Some(ps) = self.pf_stream.as_mut()
+                && (t4 - te).as_secs_f64() > 1e-3
+            {
+                ps.cpu_pair_s = 0.8 * ps.cpu_pair_s + 0.2 * (t4 - t3).as_secs_f64() / cpu_pairs as f64;
+            }
+        }
+        if let Some(ps) = &self.pf_stream
+            && !streamed.is_empty()
+            && !ps.t1.done()
+        {
+            let t = std::time::Instant::now();
+            ps.t1.sync()?;
+            self.stats.pf_stream_late += 1;
+            self.stats.pf_stream_late_s += t.elapsed().as_secs_f64();
+        }
+        // the CPU's and the stream's pairs (cpu_out), added to the GPU's where a group has some
         let cpu = self.b.cpu_out.dev;
         for &(ta, tb, gpu) in &spans {
             let (b, nn) = (&self.b, n * 4);
@@ -1367,6 +1497,83 @@ impl Engine {
             }
             self.admit_d(false)?;
         }
+        Ok(())
+    }
+
+    /// Queues the pairs of `streamed` (expert, its (token, pair)s) on the expert stream: the copy stream uploads each
+    /// expert to a staging slot once the slot's last reader is done, and the stream gathers its tokens' x, runs gate_up,
+    /// SITU and down, and puts the outputs in cpu_out's rows of their pairs, as the CPU team does. self.s waits for it.
+    /// Experts that are not page-locked go through the bounce slots: the host copies each there once its last upload
+    /// is done, so this returns about when the last upload starts.
+    fn stream_experts(&mut self, ip: usize, streamed: &[(usize, Vec<(usize, usize)>)]) -> Result<()> {
+        let (n, ffu) = (self.hp.n_embd as u32, self.hp.n_ff_exp as u32);
+        let f = self.ex.fmt[ip];
+        let (gu_b, dn_b) = (self.ex.gu_bytes[f.index()], self.ex.down_bytes[f.index()]);
+        let cap = 8 * T_MAX;
+        let Some(ps) = self.pf_stream.as_mut() else { return Ok(()) };
+        let l = ps.lists_h.as_mut_slice::<u32>();
+        let mut i = 0;
+        for (j, (e, pairs)) in streamed.iter().enumerate() {
+            for &(t, p) in pairs {
+                (l[i], l[cap + i], l[2 * cap + i], l[3 * cap + i]) = ((j % STREAM_SLOTS) as u32, *e as u32, t as u32, p as u32);
+                i += 1;
+            }
+        }
+        cuda::copy_h2d_async(ps.lists.ptr, ps.lists_h.ptr, 4 * cap * 4, &ps.s)?;
+        ps.t0.record(&self.copy_s)?;
+        let mut o = 0;
+        for (j, (e, pairs)) in streamed.iter().enumerate() {
+            let slot = j % STREAM_SLOTS;
+            self.copy_s.wait(&ps.free[slot])?;
+            let (gu, dn) = (self.ex.gate_up(ip, *e), self.ex.down(ip, *e));
+            if let Some(bb) = &ps.bounce {
+                while !ps.bounced[slot].done() {
+                    std::thread::yield_now();
+                }
+                let sb = bb.len / STREAM_SLOTS;
+                let dst = &mut bb.as_mut_slice::<u8>()[slot * sb..(slot + 1) * sb];
+                let mut at = 0;
+                for part in [gu.q, gu.s, dn.q, dn.s] {
+                    dst[at..at + part.len()].copy_from_slice(part);
+                    at += part.len();
+                }
+                assert_eq!(at, gu_b + dn_b, "an expert's parts fill its slots");
+                let src = dst.as_ptr();
+                cuda::copy_h2d_async(ps.gu.at(slot * gu_b), src, gu_b, &self.copy_s)?;
+                cuda::copy_h2d_async(ps.dn.at(slot * dn_b), src.wrapping_add(gu_b), dn_b, &self.copy_s)?;
+                ps.bounced[slot].record(&self.copy_s)?;
+            } else {
+                upload_slot(ps.gu.at(slot * gu_b), &gu, &self.copy_s)?;
+                upload_slot(ps.dn.at(slot * dn_b), &dn, &self.copy_s)?;
+            }
+            ps.up[slot].record(&self.copy_s)?;
+            ps.s.wait(&ps.up[slot])?;
+            let m = pairs.len() as u32;
+            let at = |k: usize| ps.lists.at(4 * (k * cap + o));
+            let (sl, id, tk, pr) = (at(0), at(1), at(2), at(3));
+            self.k.copy_rows(&ps.s, self.b.xn.ptr, Some(tk), ps.x.ptr, None, n, m)?;
+            match f {
+                Fmt::NvFp4 => {
+                    let ((gu_a, gu_d), (dn_a, dn_d)) = (self.cache.factor_ptrs(ip, 0), self.cache.factor_ptrs(ip, 1));
+                    self.k.moe_nvfp4_d(&ps.s, ps.gu.ptr, gu_b as u64, sl, id, gu_a, gu_d, ps.x.ptr, n, 0, ps.gu_out.ptr, 2 * ffu, n, m)?;
+                    self.k.situ(&ps.s, ps.gu_out.ptr, sl, ps.af.ptr, ffu, self.ex.beta, self.ex.lb, m)?;
+                    self.k.moe_nvfp4_d(&ps.s, ps.dn.ptr, dn_b as u64, sl, id, dn_a, dn_d, ps.af.ptr, ffu, 0, ps.x.ptr, n, ffu, m)?;
+                }
+                Fmt::MxFp8 => {
+                    self.k.moe_mxfp8_d(&ps.s, ps.gu.ptr, gu_b as u64, sl, ps.x.ptr, n, 0, ps.gu_out.ptr, 2 * ffu, n, m)?;
+                    self.k.situ(&ps.s, ps.gu_out.ptr, sl, ps.af.ptr, ffu, self.ex.beta, self.ex.lb, m)?;
+                    self.k.moe_mxfp8_d(&ps.s, ps.dn.ptr, dn_b as u64, sl, ps.af.ptr, ffu, 0, ps.x.ptr, n, ffu, m)?;
+                }
+            }
+            ps.free[slot].record(&ps.s)?;
+            self.k.copy_rows(&ps.s, ps.x.ptr, None, self.b.cpu_out.dev, Some(pr), n, m)?;
+            o += pairs.len();
+        }
+        ps.t1.record(&ps.s)?;
+        self.s.wait(&ps.t1)?;
+        ps.last_bytes = streamed.len() * (gu_b + dn_b);
+        self.stats.pf_stream_pairs += o as u64;
+        self.stats.pf_stream_experts += streamed.len() as u64;
         Ok(())
     }
 

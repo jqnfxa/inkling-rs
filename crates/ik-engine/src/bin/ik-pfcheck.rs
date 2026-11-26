@@ -35,6 +35,16 @@ fn main() -> Result<(), String> {
     let st = &e.stats;
     let ph: Vec<f64> = ik_engine::cpu_pool::PHASE_NS.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9).collect();
     println!("CPU batch phases: gate_up {:.2}s, activations {:.2}s, down {:.2}s", ph[0], ph[1], ph[2]);
-    println!("prefill totals (both runs): GPU wait {:.2}s, host {:.2}s, CPU experts {:.2}s; pairs GPU {} CPU {}", st.pf_gpu_s, st.pf_host_s, st.pf_cpu_s, st.pf_gpu_pairs, st.pf_cpu_pairs);
+    println!(
+        "prefill totals (both runs): GPU wait {:.2}s, host {:.2}s, CPU experts {:.2}s; pairs GPU {} CPU {} streamed {} (of {} experts)",
+        st.pf_gpu_s, st.pf_host_s, st.pf_cpu_s, st.pf_gpu_pairs, st.pf_cpu_pairs - st.pf_stream_pairs, st.pf_stream_pairs, st.pf_stream_experts
+    );
+    println!(
+        "expert stream: {:.2} GB/s over {:.2}s; still running after the CPU team at {} layers, for {:.2}s",
+        st.pf_stream_bytes as f64 / st.pf_stream_s.max(1e-9) / 1e9,
+        st.pf_stream_s,
+        st.pf_stream_late,
+        st.pf_stream_late_s
+    );
     Ok(())
 }
