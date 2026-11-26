@@ -28,8 +28,13 @@ const GPU_EXPERTS: bool = true;
 /// queries give the q and MoE messages (rows 0, 1), its kv queries the k and v ones (rows 2, 3).
 const MSG: [usize; 4] = [0, 2, 3, 1];
 
-/// Tokens of a prefill ubatch, at most.
+/// Tokens of a prefill ubatch, at most; the SWA rings hold this many rows past the window.
 pub const T_MAX: usize = 256;
+/// The ubatch that the KV rows in VRAM leave prefill's region room for, at any context.
+const T_FLOOR: usize = 256;
+/// The fewest tokens that prefill's buffers are laid out for: a prompt takes the layout for the least power of two from
+/// this up that holds it, as far as the VRAM beside the KV rows goes (pf_plan).
+const T_MIN: usize = 32;
 
 /// The expert usage counts decay by this much at each token: an expert that every token uses counts about 100.
 const DECAY: f32 = 0.99;
@@ -50,16 +55,19 @@ const PF_GROUP: usize = 32;
 /// A cached NVFP4 expert with at least this many of a ubatch's tokens runs them grouped (moe_nvfp4_g, a tile of 32
 /// tokens decoding each weight once), the others pair by pair (moe_nvfp4_d, the weights read a pair at a time).
 const G_MIN: usize = 12;
-/// Chunks of grouped pairs in a ubatch, at most: they fill the pf buffers' 8 PF_GROUP rows.
-const G_CHUNKS: usize = T_MAX / PF_GROUP;
 
 /// Addresses reserved for prefill's region, more than its buffers take.
 const PF_REGION: usize = 2 << 30;
 
-/// Bytes of BatchBufs::grp: for nt tokens, the tokens at 0, the pair by pair slots at 32 nt, chunk c's rows at
-/// 32 nt (2 + c), and the entries after the last chunk's rows.
-fn grp_bytes(hp: &Hp) -> usize {
-    32 * T_MAX * (2 + G_CHUNKS) + 64 * (hp.n_expert + G_CHUNKS)
+/// Pointers at the end of Engine::ptrs for the lists of single launches (ptr_list_once).
+const PTRS_ONCE: usize = 64;
+
+/// Bytes of BatchBufs::grp for ubatches of up to `tm` tokens: for nt tokens, the tokens at 0, the pair by pair slots at
+/// 32 nt, chunk c's rows at 32 nt (2 + c), and the entries after the last chunk's rows. A chunk fills the pf buffers'
+/// 8 PF_GROUP rows, so there are tm / PF_GROUP chunks at most.
+fn grp_bytes(hp: &Hp, tm: usize) -> usize {
+    let chunks = tm / PF_GROUP;
+    32 * tm * (2 + chunks) + 64 * (hp.n_expert + chunks)
 }
 /// Staging slots of prefill's expert stream: the copy stream fills one while the GPU runs the pairs of another.
 const STREAM_SLOTS: usize = 4;
@@ -123,7 +131,8 @@ struct Scratch {
     pacc: DevBuf,
 }
 
-/// Device buffers of a prefill ubatch of up to T_MAX tokens, [t][..] each.
+/// Device buffers of a prefill ubatch, [t][..] each: views in prefill's region, laid out for some number of tokens
+/// (Engine::place).
 struct BatchBufs {
     x: DevBuf,
     inp_sa: DevBuf,
@@ -158,20 +167,82 @@ struct BatchBufs {
     tau: DevBuf,
     one: DevBuf,
     bl: Blocks,
-    host_ids: HostBuf,
-    host_xn: HostBuf,
-    host_slots: HostBuf,
-    cpu_out: HostBuf,
     /// the GPU's pairs of PF_GROUP tokens: gate_up [8 PF_GROUP][2 n_ff], activations [8 PF_GROUP][n_ff], down
     /// [8 PF_GROUP][n]
     pf_gu: DevBuf,
     pf_af: DevBuf,
     pf_dn: DevBuf,
-    /// the lists of the grouped cached experts (experts_g): the tokens of the grouped pairs [8 T_MAX] u32, the slots
-    /// left to the pair by pair path [8 T_MAX] i32, each chunk's rows of the pairs [G_CHUNKS][8 T_MAX] i32, and the
-    /// moe_nvfp4_g entries of gate_up, then of down, [n_expert + G_CHUNKS][4] u64 each
+    /// the lists of the grouped cached experts (experts_g): the tokens of the grouped pairs [8 nt] u32, the slots left
+    /// to the pair by pair path [8 nt] i32, each chunk's rows of the pairs [chunks][8 nt] i32, and the moe_nvfp4_g
+    /// entries of gate_up, then of down, [n_expert + chunks][4] u64 each (grp_bytes)
     grp: DevBuf,
-    grp_h: HostBuf,
+}
+
+impl BatchBufs {
+    /// The buffers for ubatches of up to `tm` tokens, taken from `rg`.
+    fn new(rg: &mut Region, hp: &Hp, w: &Weights, tm: usize) -> BatchBufs {
+        let (n, kv) = (hp.n_embd, hp.kv_dim());
+        let g = |rg: &mut Region, len: usize| rg.take(len * 4);
+        let many = |rg: &mut Region, m: usize| (0..m).map(|_| rg.take(tm * n * 4)).collect::<Vec<_>>();
+        let bl = Blocks {
+            b0: g(rg, tm * n),
+            b6: many(rg, hp.n_passes),
+            b12: many(rg, hp.n_passes),
+            b18: g(rg, tm * n),
+            prelude: g(rg, tm * n),
+            pass_out: many(rg, hp.n_passes),
+        };
+        BatchBufs {
+            x: g(rg, tm * n),
+            inp_sa: g(rg, tm * n),
+            mix: many(rg, 3),
+            msg: many(rg, 4),
+            ctl: many(rg, 4),
+            ctl_g: g(rg, tm * 2 * n),
+            ctl_gate: g(rg, tm * 64),
+            inn: many(rg, 3),
+            g0: g(rg, tm * w.layers[0].g0_rows()),
+            gk: g(rg, tm * (kv + 32)),
+            gv: g(rg, tm * (kv + 32)),
+            kc: g(rg, tm * kv),
+            vc: g(rg, tm * kv),
+            q: g(rg, tm * hp.n_head * hp.head_dim),
+            k: g(rg, tm * kv),
+            v: g(rg, tm * kv),
+            r: g(rg, tm * hp.n_head * hp.n_rel),
+            att: g(rg, tm * hp.n_head * hp.head_dim),
+            att2: g(rg, tm * hp.n_head * hp.head_dim),
+            a: g(rg, tm * n),
+            a2: g(rg, tm * n),
+            ffm: g(rg, tm * n),
+            ffm2: g(rg, tm * n),
+            xn: g(rg, tm * n),
+            rlog: g(rg, tm * hp.n_expert),
+            ids: g(rg, tm * 8),
+            wts: g(rg, tm * 8),
+            slots: g(rg, tm * 8),
+            moe: g(rg, tm * n),
+            f: g(rg, tm * n),
+            tau: g(rg, tm),
+            one: g(rg, tm),
+            bl,
+            pf_gu: g(rg, 8 * PF_GROUP * 2 * hp.n_ff_exp),
+            pf_af: g(rg, 8 * PF_GROUP * hp.n_ff_exp),
+            pf_dn: g(rg, 8 * PF_GROUP * n),
+            grp: rg.take(grp_bytes(hp, tm)),
+        }
+    }
+}
+
+/// Page-locked host buffers of prefill's ubatches, for T_MAX tokens: the experts' ids and inputs as the host reads
+/// them, the slots it writes, the outputs of the CPU team and the expert stream [8 t][n], and the grouped experts'
+/// lists (BatchBufs::grp).
+struct BatchHost {
+    ids: HostBuf,
+    xn: HostBuf,
+    slots: HostBuf,
+    cpu_out: HostBuf,
+    grp: HostBuf,
 }
 
 /// Prefill's stream of uncached experts: the copy stream uploads each to a staging slot and the GPU runs its pairs,
@@ -180,13 +251,12 @@ struct PfStream {
     /// the staging slots of gate_up and of down, sized for the larger format
     gu: DevBuf,
     dn: DevBuf,
-    /// an expert's pairs: x [T_MAX][n] (gathered, then the down outputs), gate_up [T_MAX][2 n_ff], activations
-    /// [T_MAX][n_ff]
+    /// an expert's pairs: x [t][n] (gathered, then the down outputs), gate_up [t][2 n_ff], activations [t][n_ff]
     x: DevBuf,
     gu_out: DevBuf,
     af: DevBuf,
-    /// the streamed pairs in expert order, [3][8 T_MAX] u32: staging slot, token, pair (8 t + k); and the host copy
-    /// they are written to
+    /// the streamed pairs in expert order, [3][8 tm] u32: staging slot, token, pair (8 t + k); and the host copy they
+    /// are written to
     lists: DevBuf,
     lists_h: HostBuf,
     /// moe_nvfp4_g's entries of each streamed expert, [2 n_expert][4] u64: its gate_up, then its down; and the host
@@ -214,20 +284,20 @@ struct PfStream {
 }
 
 impl PfStream {
-    /// The stream, its device buffers in prefill's region `rg`.
-    fn new(ex: &Experts, hp: &Hp, rg: &mut Region) -> Result<PfStream> {
-        let (n, nff, cap) = (hp.n_embd, hp.n_ff_exp, 8 * T_MAX);
+    /// The stream; place lays its device buffers out.
+    fn new(ex: &Experts, hp: &Hp) -> Result<PfStream> {
         let events = || (0..STREAM_SLOTS).map(|_| cuda::Event::new(false)).collect::<Result<Vec<_>>>();
         let slot = ex.gu_bytes.iter().max().unwrap() + ex.down_bytes.iter().max().unwrap();
+        let none = || DevBuf::view(0, 0);
         Ok(PfStream {
-            gu: rg.take(STREAM_SLOTS * ex.gu_bytes.iter().max().unwrap()),
-            dn: rg.take(STREAM_SLOTS * ex.down_bytes.iter().max().unwrap()),
-            x: rg.take(T_MAX * n * 4),
-            gu_out: rg.take(T_MAX * 2 * nff * 4),
-            af: rg.take(T_MAX * nff * 4),
-            lists: rg.take(3 * cap * 4),
-            lists_h: HostBuf::new(3 * cap * 4)?,
-            tab: rg.take(2 * hp.n_expert * 32),
+            gu: none(),
+            dn: none(),
+            x: none(),
+            gu_out: none(),
+            af: none(),
+            lists: none(),
+            lists_h: HostBuf::new(3 * 8 * T_MAX * 4)?,
+            tab: none(),
             tab_h: HostBuf::new(2 * hp.n_expert * 32)?,
             s: Stream::new_nonblocking_high()?,
             up: events()?,
@@ -240,6 +310,18 @@ impl PfStream {
             bounce: HostBuf::new(STREAM_SLOTS * slot)?,
             bounced: events()?,
         })
+    }
+
+    /// Takes the device buffers from prefill's region `rg`, for ubatches of up to `tm` tokens.
+    fn place(&mut self, rg: &mut Region, ex: &Experts, hp: &Hp, tm: usize) {
+        let (n, nff) = (hp.n_embd, hp.n_ff_exp);
+        self.gu = rg.take(STREAM_SLOTS * ex.gu_bytes.iter().max().unwrap());
+        self.dn = rg.take(STREAM_SLOTS * ex.down_bytes.iter().max().unwrap());
+        self.x = rg.take(tm * n * 4);
+        self.gu_out = rg.take(tm * 2 * nff * 4);
+        self.af = rg.take(tm * nff * 4);
+        self.lists = rg.take(3 * 8 * tm * 4);
+        self.tab = rg.take(2 * hp.n_expert * 32);
     }
 }
 
@@ -281,7 +363,7 @@ pub struct Engine {
     /// the CPU team's partials of the host rows, [24] of m, l, acc[128]
     attn_out: HostBuf,
     /// when there are host rows: the VRAM copies of a chunk of them (K, V) that prefill reads, and its state between
-    /// passes [T_MAX][8][PF_STATE]
+    /// passes [t][8][PF_STATE], in prefill's region
     stage: Option<[DevBuf; 3]>,
     /// VRAM for the expert cache, the mapped rows of kv_vm and, while prefill runs, its region
     vram_budget: usize,
@@ -290,6 +372,9 @@ pub struct Engine {
     region: Region,
     /// whether prefill has the region's memory
     pf_on: bool,
+    /// the tokens that prefill's buffers are laid out for (place), and the region's bytes in each layout (T_MIN up)
+    tm: usize,
+    pf_sizes: Vec<(usize, usize)>,
     ring: Vec<u32>,
     conv: Vec<DevBuf>, // per slot: k [kv][3], v [kv][3], post [n][3], ffn [n][3]
     sc: Scratch,
@@ -318,6 +403,7 @@ pub struct Engine {
     /// the tokens of the sequence in the caches
     pub tokens: Vec<u32>,
     b: BatchBufs,
+    bh: BatchHost,
     pass_bank_t: (Vec<P>, P),
     /// the state at the end of the last prompt, to roll back to: conv states, and the window rows of the SWA caches
     snap_pos: Option<usize>,
@@ -462,66 +548,18 @@ impl Engine {
             pass_out: (0..hp.n_passes).map(|_| f(n)).collect::<Result<_>>()?,
         };
         let sched = hp.schedule();
-        let tm = T_MAX;
-        // prefill's buffers: views in a region that has memory only while prefill runs (pf_region)
-        let rg = std::cell::RefCell::new(Region::reserve(PF_REGION, ctx.device)?);
-        let g = |len: usize| -> Result<DevBuf> { Ok(rg.borrow_mut().take(len * 4)) };
-        let fv = |m: usize| (0..m).map(|_| g(tm * n)).collect::<Result<Vec<_>>>();
-        let blocks_t = Blocks {
-            b0: g(tm * n)?,
-            b6: fv(hp.n_passes)?,
-            b12: fv(hp.n_passes)?,
-            b18: g(tm * n)?,
-            prelude: g(tm * n)?,
-            pass_out: fv(hp.n_passes)?,
-        };
-        let b = BatchBufs {
-            x: g(tm * n)?,
-            inp_sa: g(tm * n)?,
-            mix: fv(3)?,
-            msg: fv(4)?,
-            ctl: fv(4)?,
-            ctl_g: g(tm * 2 * n)?,
-            ctl_gate: g(tm * 64)?,
-            inn: fv(3)?,
-            g0: g(tm * w.layers[0].g0_rows())?,
-            gk: g(tm * (kv + 32))?,
-            gv: g(tm * (kv + 32))?,
-            kc: g(tm * kv)?,
-            vc: g(tm * kv)?,
-            q: g(tm * hp.n_head * hp.head_dim)?,
-            k: g(tm * kv)?,
-            v: g(tm * kv)?,
-            r: g(tm * hp.n_head * hp.n_rel)?,
-            att: g(tm * hp.n_head * hp.head_dim)?,
-            att2: g(tm * hp.n_head * hp.head_dim)?,
-            a: g(tm * n)?,
-            a2: g(tm * n)?,
-            ffm: g(tm * n)?,
-            ffm2: g(tm * n)?,
-            xn: g(tm * n)?,
-            rlog: g(tm * hp.n_expert)?,
-            ids: g(tm * 8)?,
-            wts: g(tm * 8)?,
-            slots: g(tm * 8)?,
-            moe: g(tm * n)?,
-            f: g(tm * n)?,
-            tau: g(tm)?,
-            one: g(tm)?,
-            bl: blocks_t,
-            host_ids: HostBuf::new(4 * tm * 8)?,
-            host_xn: HostBuf::new(4 * tm * n)?,
-            host_slots: HostBuf::new(4 * tm * 8)?,
-            cpu_out: HostBuf::new(4 * tm * 8 * n)?,
-            pf_gu: g(8 * PF_GROUP * 2 * hp.n_ff_exp)?,
-            pf_af: g(8 * PF_GROUP * hp.n_ff_exp)?,
-            pf_dn: g(8 * PF_GROUP * n)?,
-            grp: rg.borrow_mut().take(grp_bytes(&hp)),
-            grp_h: HostBuf::new(grp_bytes(&hp))?,
+        // prefill's buffers: views in a region that has memory only while prefill runs (pf_mode), laid out by place
+        let mut region = Region::reserve(PF_REGION, ctx.device)?;
+        let b = BatchBufs::new(&mut region, &hp, &w, T_FLOOR);
+        let bh = BatchHost {
+            ids: HostBuf::new(4 * T_MAX * 8)?,
+            xn: HostBuf::new(4 * T_MAX * n)?,
+            slots: HostBuf::new(4 * T_MAX * 8)?,
+            cpu_out: HostBuf::new(4 * T_MAX * 8 * n)?,
+            grp: HostBuf::new(grp_bytes(&hp, T_MAX))?,
         };
         let stream_on = std::env::var("IK_PF_STREAM").map_or(true, |v| v != "0");
-        let mut region = rg.into_inner();
-        let pf_stream = if GPU_EXPERTS && stream_on { Some(PfStream::new(&ex, &hp, &mut region)?) } else { None };
+        let pf_stream = if GPU_EXPERTS && stream_on { Some(PfStream::new(&ex, &hp)?) } else { None };
         // the expert cache and the full-attention KV rows share what is free once the rest exists, less a margin for
         // the CUDA graph and the driver (IK_VRAM_MARGIN_MIB, default 160); the KV rows take memory as the context grows
         // and give it back when a new sequence is shorter (plan_kv)
@@ -578,6 +616,8 @@ impl Engine {
             vram_budget,
             region,
             pf_on: false,
+            tm: T_FLOOR,
+            pf_sizes: vec![],
             ring,
             conv,
             sc,
@@ -587,6 +627,7 @@ impl Engine {
             maxs,
             tokens: vec![],
             b,
+            bh,
             pass_bank_t: (vec![], 0),
             snap_pos: None,
             snap_conv: DevBuf::new(n_slots * (2 * kv + 2 * n) * 3 * 4)?,
@@ -605,14 +646,15 @@ impl Engine {
             let r = (budget / per_step * KV_STEP).min(all);
             cap.map_or(r, |c| r.min(c.div_ceil(KV_STEP) * KV_STEP))
         };
-        // the VRAM rows leave prefill its region
+        // the VRAM rows leave prefill's region room in its layout for T_FLOOR tokens, with the stage if there are host
+        // rows
         let host_ok = VmBuf::host_pages_supported(e.ctx.device);
+        e.place(T_FLOOR);
         let mut vram_rows = if host_ok { rows_for(e.vram_budget.saturating_sub(e.region.bytes())) } else { all };
         if vram_rows < all {
-            let rg = &mut e.region;
-            let stage = [rg.take(STAGE_ROWS * KV_ROW), rg.take(STAGE_ROWS * KV_ROW), rg.take(T_MAX * e.hp.n_head_kv * PF_STATE * 4)];
+            e.kv_cpu = true;
+            e.place(T_FLOOR);
             vram_rows = rows_for(e.vram_budget.saturating_sub(e.region.bytes()));
-            e.stage = Some(stage);
         }
         let (need_vram, need_host) = (e.kv_bytes(vram_rows), e.kv_bytes(all) - e.kv_bytes(vram_rows));
         let host_free = host_mem_free().saturating_sub(HOST_MARGIN);
@@ -657,8 +699,21 @@ impl Engine {
                 out: e.attn_out.ptr as usize,
             });
         }
+        // the region's bytes in each layout, which pf_plan chooses from
+        let mut t = T_MIN;
+        while t <= T_MAX {
+            e.place(t);
+            e.pf_sizes.push((t, e.region.bytes()));
+            t *= 2;
+        }
+        e.place(T_FLOOR);
         e.plan_kv(T_MAX)?;
         Ok(e)
+    }
+
+    /// Prefill's layouts: the most tokens of a ubatch, and the bytes of the region then.
+    pub fn pf_sizes(&self) -> &[(usize, usize)] {
+        &self.pf_sizes
     }
 
     /// Bytes of the full-attention KV caches in host memory now.
@@ -730,10 +785,49 @@ impl Engine {
             self.plan_kv(self.kv_mapped)?;
             self.region.set(true, &self.s)?;
             self.s.sync()?;
-            self.b.one.upload(&[1f32; T_MAX])?;
+            self.b.one.upload(&vec![1f32; self.tm])?;
         } else {
             self.region.set(false, &self.s)?;
             self.plan_kv(self.kv_mapped)?;
+        }
+        Ok(())
+    }
+
+    /// Lays prefill's device buffers out in its region for ubatches of up to `tm` tokens: the batch buffers, the expert
+    /// stream's, and the stage if there are host rows. The region has no memory meanwhile.
+    fn place(&mut self, tm: usize) {
+        assert!(!self.pf_on);
+        self.region.clear();
+        self.b = BatchBufs::new(&mut self.region, &self.hp, &self.w, tm);
+        if let Some(ps) = self.pf_stream.as_mut() {
+            ps.place(&mut self.region, &self.ex, &self.hp, tm);
+        }
+        let (rg, nkv) = (&mut self.region, self.hp.n_head_kv);
+        self.stage = self.kv_cpu.then(|| [rg.take(STAGE_ROWS * KV_ROW), rg.take(STAGE_ROWS * KV_ROW), rg.take(tm * nkv * PF_STATE * 4)]);
+        self.tm = tm;
+    }
+
+    /// The VRAM that the KV rows leave prefill's region when the sequence reaches `end`, and the region's bytes in the
+    /// layout for `tm` tokens.
+    fn pf_room(&self, end: usize) -> usize {
+        let rows = (end.div_ceil(KV_STEP) * KV_STEP).max(self.kv_mapped).min(self.kv_vram_rows);
+        self.vram_budget.saturating_sub(self.kv_bytes(rows))
+    }
+    fn pf_size(&self, tm: usize) -> usize {
+        self.pf_sizes.iter().find(|&&(t, _)| t == tm).map_or(0, |&(_, b)| b)
+    }
+
+    /// Lays prefill's buffers out for a prompt of `len` tokens that ends at position `end`: for the fewest tokens of a
+    /// layout that hold it in one ubatch, or the most whose region fits beside the KV rows in VRAM then. The layout for
+    /// T_FLOOR tokens always fits (new).
+    fn pf_plan(&mut self, len: usize, end: usize) -> Result<()> {
+        let room = self.pf_room(end);
+        let fit = self.pf_sizes.iter().filter(|&&(t, b)| t <= T_FLOOR || b <= room).map(|&(t, _)| t).max().unwrap_or(T_FLOOR);
+        let need = self.pf_sizes.iter().map(|&(t, _)| t).find(|&t| t >= len).unwrap_or(T_MAX);
+        let tm = need.min(fit);
+        if tm != self.tm {
+            self.pf_mode(false)?;
+            self.place(tm);
         }
         Ok(())
     }
@@ -748,12 +842,21 @@ impl Engine {
             return Ok(self.ptrs.at(o));
         }
         let o = self.ptr_used;
-        if o + list.len() * 8 > self.ptrs.len {
+        if o + list.len() * 8 > self.ptrs.len - PTRS_ONCE * 8 {
             return Err("out of pointer list space".into());
         }
         self.ptrs.upload_at(o, list)?;
         self.ptr_lists.insert(list.to_vec(), o);
         self.ptr_used += list.len() * 8;
+        Ok(self.ptrs.at(o))
+    }
+
+    /// The device address of a pointer list for one launch: the end of the pointer list space, which the next such
+    /// list overwrites. Its one user, prefill, syncs before it returns, so the launch that read the last one is done.
+    fn ptr_list_once(&mut self, list: &[P]) -> Result<P> {
+        assert!(list.len() <= PTRS_ONCE);
+        let o = self.ptrs.len - PTRS_ONCE * 8;
+        self.ptrs.upload_at(o, list)?;
         Ok(self.ptrs.at(o))
     }
 
@@ -834,7 +937,11 @@ impl Engine {
             self.plan_kv(prompt.len() + 1)?;
         }
         let mut logits = vec![];
-        for chunk in prompt[reuse..].chunks(T_MAX) {
+        let todo = &prompt[reuse..];
+        if todo.len() > 1 {
+            self.pf_plan(todo.len(), prompt.len())?;
+        }
+        for chunk in todo.chunks(self.tm) {
             logits = if chunk.len() == 1 { self.decode(chunk[0])? } else { self.prefill(chunk)? };
             progress(self.pos, reuse);
         }
@@ -846,7 +953,10 @@ impl Engine {
     /// the last prompt). `progress(pos)` after each ubatch. Returns the logits after the last token.
     pub fn extend(&mut self, toks: &[u32], progress: &mut dyn FnMut(usize)) -> Result<Vec<f32>> {
         let mut logits = vec![];
-        for chunk in toks.chunks(T_MAX) {
+        if toks.len() > 1 {
+            self.pf_plan(toks.len(), self.pos + toks.len())?;
+        }
+        for chunk in toks.chunks(self.tm) {
             logits = if chunk.len() == 1 { self.decode(chunk[0])? } else { self.prefill(chunk)? };
             progress(self.pos);
         }
@@ -1144,8 +1254,8 @@ impl Engine {
         Ok(())
     }
 
-    /// Runs up to T_MAX tokens at once (no CUDA graph; the host groups the experts at each MoE layer).
-    /// Returns the logits after the last token.
+    /// Runs up to T_MAX tokens at once (no CUDA graph; the host groups the experts at each MoE layer), as many as the
+    /// VRAM beside the KV rows lets prefill's buffers be laid out for. Returns the logits after the last token.
     pub fn prefill(&mut self, toks: &[u32]) -> Result<Vec<f32>> {
         let hp = self.hp.clone();
         let n = hp.n_embd;
@@ -1153,6 +1263,13 @@ impl Engine {
         assert!(nt > 0 && nt <= T_MAX);
         if self.pos + nt > self.n_ctx {
             return Err(format!("context of {} tokens is full", self.n_ctx));
+        }
+        // a ubatch that feed or extend did not lay the buffers out for
+        if nt > self.tm || (self.tm > T_FLOOR && self.pf_size(self.tm) > self.pf_room(self.pos + nt)) {
+            self.pf_plan(nt, self.pos + nt)?;
+            if nt > self.tm {
+                return Err(format!("a ubatch of {nt} tokens does not fit beside the KV cache in VRAM; {} do", self.tm));
+            }
         }
         self.pf_mode(true)?;
         // the usage counts as decode leaves them: each token decays them once, and the ubatch's uses count at their
@@ -1201,7 +1318,7 @@ impl Engine {
         let mut list = blocks.clone();
         list.push(x);
         let last: Vec<P> = list.iter().map(|&p| p + ((nt - 1) * n * 4) as u64).collect();
-        let pl = self.ptr_list(&last)?;
+        let pl = self.ptr_list_once(&last)?;
         self.k.mix(&self.s, pl, last.len() as u32, orq, self.sc.a.ptr, 1, n as u32)?;
         self.k.rms_norm(&self.s, self.sc.a.ptr, Some(self.w.output_norm.ptr), self.sc.a.ptr, n as u32, 1, hp.eps)?;
         self.gemv(&self.w.output, self.sc.a.ptr, self.sc.logits_raw.ptr)?;
@@ -1408,8 +1525,8 @@ impl Engine {
     fn moe_t(&mut self, ip: usize, nt: usize) -> Result<()> {
         let n = self.hp.n_embd;
         let nu = n as u32;
-        cuda::copy_d2h_async(self.b.host_ids.ptr, self.b.ids.ptr, nt * 8 * 4, &self.s)?;
-        cuda::copy_d2h_async(self.b.host_xn.ptr, self.b.xn.ptr, nt * n * 4, &self.s)?;
+        cuda::copy_d2h_async(self.bh.ids.ptr, self.b.ids.ptr, nt * 8 * 4, &self.s)?;
+        cuda::copy_d2h_async(self.bh.xn.ptr, self.b.xn.ptr, nt * n * 4, &self.s)?;
         let t0 = std::time::Instant::now();
         self.s.sync()?;
         let t1 = std::time::Instant::now();
@@ -1426,7 +1543,7 @@ impl Engine {
             self.stats.pf_stream_s += secs;
             ps.last_bytes = 0;
         }
-        let ids: Vec<u32> = self.b.host_ids.as_slice::<u32>()[..nt * 8].to_vec();
+        let ids: Vec<u32> = self.bh.ids.as_slice::<u32>()[..nt * 8].to_vec();
         let slots: Vec<i32> = ids.iter().map(|&e| self.cache.slot_of[ip][e as usize]).collect();
         let mut groups: Vec<(usize, Vec<(usize, usize)>)> = vec![];
         let mut gi: HashMap<usize, usize> = HashMap::new();
@@ -1451,8 +1568,8 @@ impl Engine {
             }
             streamed = groups.drain(..k).collect::<Vec<_>>();
         }
-        self.b.host_slots.as_mut_slice::<i32>()[..nt * 8].copy_from_slice(&slots);
-        cuda::copy_h2d_async(self.b.slots.ptr, self.b.host_slots.ptr, nt * 8 * 4, &self.s)?;
+        self.bh.slots.as_mut_slice::<i32>()[..nt * 8].copy_from_slice(&slots);
+        cuda::copy_h2d_async(self.b.slots.ptr, self.bh.slots.ptr, nt * 8 * 4, &self.s)?;
         let on_gpu = slots.iter().filter(|&&s| s >= 0).count();
         self.stats.pf_gpu_pairs += on_gpu as u64;
         self.stats.pf_cpu_pairs += (nt * 8 - on_gpu) as u64;
@@ -1472,8 +1589,8 @@ impl Engine {
         let t3 = std::time::Instant::now();
         self.stats.pf_host_s += (t3 - t1).as_secs_f64();
         if !groups.is_empty() {
-            let x = self.b.host_xn.as_slice::<f32>()[..nt * n].to_vec();
-            self.pool.start_batch(crate::cpu_pool::BatchJob { layer: ip, x, misses: groups, out: self.b.cpu_out.ptr as usize });
+            let x = self.bh.xn.as_slice::<f32>()[..nt * n].to_vec();
+            self.pool.start_batch(crate::cpu_pool::BatchJob { layer: ip, x, misses: groups, out: self.bh.cpu_out.ptr as usize });
         }
         // the cached experts with many tokens run grouped, and set b.moe; the others pair by pair, by the slots left
         let pp = self.experts_g(ip, nt, &ids, &slots)?;
@@ -1519,7 +1636,7 @@ impl Engine {
             self.stats.pf_stream_late_s += t.elapsed().as_secs_f64();
         }
         // the CPU's and the stream's pairs (cpu_out), added to the GPU's where a group has some
-        let cpu = self.b.cpu_out.dev;
+        let cpu = self.bh.cpu_out.dev;
         for &(ta, tb, gpu) in &spans {
             let (b, nn) = (&self.b, n * 4);
             self.k.moe_combine_t(&self.s, cpu + (8 * ta * nn) as u64, b.slots.at(4 * 8 * ta), b.wts.at(4 * 8 * ta), b.moe.at(ta * nn), nu, (tb - ta) as u32, false, gpu || grouped)?;
@@ -1537,7 +1654,7 @@ impl Engine {
         let (n, ffu) = (self.hp.n_embd as u32, self.hp.n_ff_exp as u32);
         let f = self.ex.fmt[ip];
         let (gu_b, dn_b) = (self.ex.gu_bytes[f.index()], self.ex.down_bytes[f.index()]);
-        let cap = 8 * T_MAX;
+        let cap = 8 * self.tm;
         let Some(ps) = self.pf_stream.as_mut() else { return Ok(()) };
         let l = ps.lists_h.as_mut_slice::<u32>();
         let mut i = 0;
@@ -1603,7 +1720,7 @@ impl Engine {
                 }
             }
             ps.free[slot].record(&ps.s)?;
-            self.k.copy_rows(&ps.s, ps.x.ptr, None, self.b.cpu_out.dev, Some(pr), n, m)?;
+            self.k.copy_rows(&ps.s, ps.x.ptr, None, self.bh.cpu_out.dev, Some(pr), n, m)?;
             o += pairs.len();
         }
         ps.t1.record(&ps.s)?;
@@ -1909,7 +2026,7 @@ impl Engine {
         // per chunk: its first row, its rows, its first entry, its entries, and its most tokens of an expert
         let mut chunks: Vec<[usize; 5]> = vec![];
         let mut entries: Vec<[u64; 8]> = vec![];
-        let l = b.grp_h.as_mut_slice::<u32>();
+        let l = self.bh.grp.as_mut_slice::<u32>();
         l[rows_at / 4..tab_at / 4].fill(u32::MAX);
         let mut q = 0;
         for (e, ps) in pairs.iter().enumerate().filter(|(_, v)| v.len() >= G_MIN) {
@@ -1939,13 +2056,13 @@ impl Engine {
         for (p, &s) in pp.iter().enumerate() {
             l[8 * nt + p] = s as u32;
         }
-        let t = b.grp_h.as_mut_slice::<u64>();
+        let t = self.bh.grp.as_mut_slice::<u64>();
         let ne_ = entries.len();
         for (i, en) in entries.iter().enumerate() {
             t[tab_at / 8 + 4 * i..][..4].copy_from_slice(&en[..4]);
             t[tab_at / 8 + 4 * (ne_ + i)..][..4].copy_from_slice(&en[4..]);
         }
-        cuda::copy_h2d_async(b.grp.ptr, b.grp_h.ptr, tab_at + 64 * ne_, &self.s)?;
+        cuda::copy_h2d_async(b.grp.ptr, self.bh.grp.ptr, tab_at + 64 * ne_, &self.s)?;
         let ((gu_a, gu_d), (dn_a, dn_d)) = (self.cache.factor_ptrs(ip, 0), self.cache.factor_ptrs(ip, 1));
         let (nu, fu) = (n as u32, ffu as u32);
         for (c, &[q0, m, e0, nz, mm]) in chunks.iter().enumerate() {
@@ -1967,9 +2084,12 @@ impl Engine {
         let hp = self.hp.clone();
         let n = hp.n_embd as u32;
         let reps = 50;
-        // the attention cases read up to n_ctx keys; the prefill cases use the region
+        // the attention cases read up to n_ctx keys; the prefill cases use the region, laid out for as many tokens as
+        // fit beside them
+        self.pf_plan(T_MAX, self.n_ctx)?;
         self.pf_mode(true)?;
         self.plan_kv(self.n_ctx)?;
+        let tm = self.tm;
         let mut res = vec![];
         let ev0 = cuda::Event::new(true)?;
         let ev1 = cuda::Event::new(true)?;
@@ -1995,9 +2115,9 @@ impl Engine {
         time!("gemv_bf16 wo 2304x3072", wo.bytes(), self.gemv(wo, x, self.sc.a.ptr)?);
         let o = &self.w.output;
         time!(format!("gemv_bf16 output {}x2304", o.rows), o.bytes(), self.gemv(o, x, self.sc.logits_raw.ptr)?);
-        // prefill's, on T_MAX tokens: the weights' bytes count once a token, and as a weight is 2 bytes and 2 flops a
-        // token, their GB/s are GFLOP/s
-        let (b, nt) = (&self.b, T_MAX);
+        // prefill's, on a ubatch of tm tokens: the weights' bytes count once a token, and as a weight is 2 bytes and 2
+        // flops a token, their GB/s are GFLOP/s
+        let (b, nt) = (&self.b, tm);
         for (name, m, x, y, ys) in [("wq", wq, b.xn.ptr, b.g0.ptr, l.g0_rows()), ("wk", &l.gk[0], b.xn.ptr, b.gk.ptr, l.gk.iter().map(|m| m.rows).sum::<usize>()), ("wo", wo, b.att2.ptr, b.a.ptr, wo.rows), ("router", &l.router, b.xn.ptr, b.rlog.ptr, l.router.rows)] {
             time!(format!("gemm_bf16 {name}, {nt} tokens"), nt * m.bytes(), self.gemm(m, x, y, nt, ys)?);
         }
@@ -2018,8 +2138,8 @@ impl Engine {
             let (b, ffu, nn) = (&self.b, hp.n_ff_exp as u32, n as usize);
             let ((gu_a, gu_d), (dn_a, dn_d)) = (self.cache.factor_ptrs(6, 0), self.cache.factor_ptrs(6, 1));
             let (gu_b, dn_b) = (bk.gu_bytes as u64, bk.down_bytes as u64);
-            b.slots.upload(&[0i32; T_MAX])?;
-            b.ids.upload(&[0u32; T_MAX])?;
+            b.slots.upload(&vec![0i32; tm])?;
+            b.ids.upload(&vec![0u32; tm])?;
             for m in [24u32, 64, 256] {
                 let flops = 2 * m as usize * 3 * nn * ffu as usize;
                 time!(format!("NvFp4 expert per pair, {m} tokens"), flops, {
@@ -2035,8 +2155,8 @@ impl Engine {
             // 8 cached experts on m tokens each, as a ubatch has them (pair 8t + k on expert k): per pair, and grouped
             // in one launch (experts_g); G_MIN is where grouped gets faster
             if bk.n_slots >= 8 {
-                let sl: Vec<i32> = (0..T_MAX as i32).map(|p| p % 8).collect();
-                let id: Vec<u32> = (0..T_MAX as u32).map(|p| p % 8).collect();
+                let sl: Vec<i32> = (0..tm as i32).map(|p| p % 8).collect();
+                let id: Vec<u32> = (0..tm as u32).map(|p| p % 8).collect();
                 b.slots.upload(&sl)?;
                 b.ids.upload(&id)?;
                 for m in [4u32, 8, 12, 16, 24, 32] {
@@ -2079,18 +2199,18 @@ impl Engine {
                 self.k.attn_reduce(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, self.params.ptr, window, maxs, cs, hp.n_head as u32, 0, u32::MAX)?
             });
         }
-        // prefill's attention on T_MAX tokens: a sliding layer's whole window, a full layer's keys up to each length
+        // prefill's attention on tm tokens: a sliding layer's whole window, a full layer's keys up to each length
         // timed; GB/s here are GFLOP/s of q k and p v (24 heads of 128 dims: 12288 a key and token)
         let nh = hp.n_head * hp.head_dim;
         let sink = self.b.g0.at((2 * nh + hp.n_head * hp.n_rel) * 4);
         let (g0r, nr) = (self.w.layers[6].g0_rows() as u32, (hp.n_head * hp.n_rel) as u32);
         for &(keys, ring, kvi) in &cases {
-            let (p0, window, extent) = if ring != 0 { (4096u32, hp.n_swa as u32, hp.n_swa as u32) } else { (keys - T_MAX as u32, u32::MAX, hp.rel_extent as u32) };
+            let (p0, window, extent) = if ring != 0 { (4096u32, hp.n_swa as u32, hp.n_swa as u32) } else { (keys - tm as u32, u32::MAX, hp.rel_extent as u32) };
             self.params.upload(&[p0, 1f32.to_bits(), 1f32.to_bits(), 0])?;
-            let pairs: u64 = (0..T_MAX as u64).map(|t| (p0 as u64 + t + 1).min(window as u64)).sum();
+            let pairs: u64 = (0..tm as u64).map(|t| (p0 as u64 + t + 1).min(window as u64)).sum();
             let ([kc, vc], rb) = (self.kv(kvi), self.w.layers[kvi].rel_proj.ptr);
             let what = if ring != 0 { "sliding" } else { "full" };
-            let (b, ntu, scale) = (&self.b, T_MAX as u32, 1.0 / (hp.head_dim as f32).sqrt());
+            let (b, ntu, scale) = (&self.b, tm as u32, 1.0 / (hp.head_dim as f32).sqrt());
             time!(format!("attn_prefill {what} to {}", p0 + ntu), pairs * 12288, {
                 self.k.attn_prefill(&self.s, b.q.ptr, b.r.ptr, sink, rb, kc, vc, b.att.ptr, self.params.ptr, ring, window, extent, scale, nh as u32, nr, g0r, ntu, (0, u32::MAX), 0, 0)?
             });

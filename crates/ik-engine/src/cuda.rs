@@ -341,8 +341,10 @@ impl Region {
         self.vm.pages_for(self.used)
     }
 
-    pub fn on(&self) -> bool {
-        self.vm.mapped() > 0
+    /// Forgets the views, to lay them out again; the region must have no memory.
+    pub fn clear(&mut self) {
+        assert_eq!(self.vm.mapped(), 0);
+        self.used = 0;
     }
 
     /// Maps the views' pages (zeroed on `s`) or releases them. The caller makes sure no work in flight uses them.

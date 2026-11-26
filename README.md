@@ -162,7 +162,9 @@ only for the tokens in use, mapped in 2 MiB pages (CUDA virtual memory) as the c
 rest, so a short chat runs with the whole budget whatever `--ctx` is, and each 1024 tokens of context take about 7
 slots back. A new chat that is shorter than the last gives the pages back to the expert cache. Prefill's buffers (a
 ubatch's activations, the expert stream's staging slots) are mapped the same way, only while prefill runs: decode
-gets their pages as expert slots (49 more on an RTX 3050 Laptop), which fill at its first token.
+gets their pages as expert slots (49 more on an RTX 3050 Laptop), which fill at its first token. They are laid out for
+each prompt, for the least power of two from 32 tokens that holds it in one ubatch: a short chat message maps 52 MiB, a
+256-token ubatch 148 MiB.
 
 Decode slows as the context fills, from fewer expert slots and from attention over more keys. The table was measured
 with the int4 caches of before, when full attention took about 0.22 ms per token for each 8k tokens; the f16 caches
