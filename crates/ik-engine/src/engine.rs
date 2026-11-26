@@ -113,13 +113,7 @@ struct Scratch {
     dn: DevBuf,  // [8][n]
     f: DevBuf,
     logits_raw: DevBuf,
-    xq: DevBuf, // q8_1 of the MoE input, for NVFP4 experts: int8 [n]
-    xd: DevBuf, // [n/32]
-    xs: DevBuf, // [n/32]
-    af: DevBuf, // the expert activations [8][n_ff] (f32, for MXFP8 experts)
-    aq: DevBuf, // q8_1 of the expert activations [8][n_ff]
-    ad: DevBuf,
-    asum: DevBuf,
+    af: DevBuf, // the expert activations [8][n_ff]
     rlog: DevBuf, // router logits [n_expert]
     pm: DevBuf,   // attention partials
     pl: DevBuf,
@@ -330,13 +324,7 @@ impl Engine {
             dn: f(8 * n)?,
             f: f(n)?,
             logits_raw: f(hp.n_vocab_padded)?,
-            xq: f(n / 4)?,
-            xd: f(n / 32)?,
-            xs: f(n / 32)?,
             af: f(8 * hp.n_ff_exp)?,
-            aq: f(8 * hp.n_ff_exp / 4)?,
-            ad: f(8 * hp.n_ff_exp / 32)?,
-            asum: f(8 * hp.n_ff_exp / 32)?,
             rlog: f(hp.n_expert)?,
             pm: f(8 * maxs * 3)?,
             pl: f(8 * maxs * 3)?,
@@ -1470,7 +1458,7 @@ impl Engine {
             m = self.sc.ffm2.ptr;
         }
         let l = &self.w.layers[ip];
-        self.k.norm_q8(&self.s, m, l.ffn_norm.ptr, self.sc.xn.ptr, self.sc.xq.ptr, self.sc.xd.ptr, self.sc.xs.ptr, nu, hp.eps, 1, nu)?;
+        self.k.rms_norm(&self.s, m, Some(l.ffn_norm.ptr), self.sc.xn.ptr, nu, 1, hp.eps)?;
         self.probe("ffn_norm_in", il, self.sc.xn.ptr, n)?;
         let l = &self.w.layers[ip];
         self.gemv(&l.router, self.sc.xn.ptr, self.sc.rlog.ptr)?;
@@ -1507,19 +1495,19 @@ impl Engine {
     }
 
     /// The cached experts of `sc.slots` (the 8 of physical layer ip) on the GPU: gate_up, the activation, and down into
-    /// sc.dn. NVFP4 experts read x as q8_1 (sc.xq, from the norm; the activations as aq), MXFP8 ones as f32 (sc.xn, af).
+    /// sc.dn. Both formats read x as f32: the norm's sc.xn, then the activations sc.af.
     fn experts_d(&self, ip: usize) -> Result<()> {
         let (n, ffu) = (self.hp.n_embd as u32, self.hp.n_ff_exp as u32);
         let (sc, f) = (&self.sc, self.ex.fmt[ip]);
         let bk = &self.cache.banks[f.index()];
         let (gu_b, dn_b) = (bk.gu_bytes as u64, bk.down_bytes as u64);
-        let situ = || self.k.situ_q8(&self.s, sc.gu.ptr, sc.slots.ptr, sc.af.ptr, sc.aq.ptr, sc.ad.ptr, sc.asum.ptr, ffu, self.ex.beta, self.ex.lb);
+        let situ = || self.k.situ(&self.s, sc.gu.ptr, sc.slots.ptr, sc.af.ptr, ffu, self.ex.beta, self.ex.lb);
         match f {
             Fmt::NvFp4 => {
                 let ((gu_a, gu_d), (dn_a, dn_d)) = (self.cache.factor_ptrs(ip, 0), self.cache.factor_ptrs(ip, 1));
-                self.k.moe_nvfp4_d(&self.s, bk.gu.ptr, gu_b, sc.slots.ptr, sc.ids.ptr, gu_a, gu_d, sc.xq.ptr, sc.xd.ptr, 0, sc.gu.ptr, 2 * ffu, n)?;
+                self.k.moe_nvfp4_d(&self.s, bk.gu.ptr, gu_b, sc.slots.ptr, sc.ids.ptr, gu_a, gu_d, sc.xn.ptr, 0, sc.gu.ptr, 2 * ffu, n)?;
                 situ()?;
-                self.k.moe_nvfp4_d(&self.s, bk.down.ptr, dn_b, sc.slots.ptr, sc.ids.ptr, dn_a, dn_d, sc.aq.ptr, sc.ad.ptr, ffu, sc.dn.ptr, n, ffu)
+                self.k.moe_nvfp4_d(&self.s, bk.down.ptr, dn_b, sc.slots.ptr, sc.ids.ptr, dn_a, dn_d, sc.af.ptr, ffu, sc.dn.ptr, n, ffu)
             }
             Fmt::MxFp8 => {
                 self.k.moe_mxfp8_d(&self.s, bk.gu.ptr, gu_b, sc.slots.ptr, sc.xn.ptr, 0, sc.gu.ptr, 2 * ffu, n)?;
@@ -1555,8 +1543,6 @@ impl Engine {
             }};
         }
         let x = self.sc.inputs.ptr;
-        self.k.quant_q8_1(&self.s, x, self.sc.xq.ptr, self.sc.xd.ptr, self.sc.xs.ptr, n, 1)?;
-        time!("quant_q8_1 2304", 4 * n as usize, self.k.quant_q8_1(&self.s, x, self.sc.xq.ptr, self.sc.xd.ptr, self.sc.xs.ptr, n, 1)?);
         let l = &self.w.layers[6];
         let (wq, wo) = (&l.g0[0], &l.wo);
         time!("gemv_bf16 wq 3072x2304", wq.bytes(), self.gemv(wq, x, self.sc.g0.ptr)?);

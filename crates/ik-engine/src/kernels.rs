@@ -240,18 +240,19 @@ impl Kernels {
         self.run(s, "gemv_q8d", (rows.div_ceil(16), 1, 1), 256, &[&qs, &dw, &xq, &xd, &y, &rows, &k])
     }
 
+    /// The SITU activation of the cached experts of `slots`: gate_up [8][2 nff] (gate i row 2i, up i row 2i + 1) to
+    /// af [8][nff], f32.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn situ_q8(&self, s: &Stream, gu: P, slots: P, af: P, aq: P, ad: P, asum: P, nff: u32, beta: f32, lb: f32) -> Result<()> {
-        self.run(s, "situ_q8", ((nff / 32).div_ceil(8), 8, 1), 256, &[&gu, &slots, &af, &aq, &ad, &asum, &nff, &beta, &lb])
+    pub fn situ(&self, s: &Stream, gu: P, slots: P, af: P, nff: u32, beta: f32, lb: f32) -> Result<()> {
+        self.run(s, "situ", ((nff / 32).div_ceil(8), 8, 1), 256, &[&gu, &slots, &af, &nff, &beta, &lb])
     }
 
-    /// y = W x for the 8 experts of `slots` on a bank of ModelOpt NVFP4 slots (codes, then scales): x q8_1, expert j's
-    /// factor amax[ids[j]] / denom[0].
+    /// y = W x for the 8 experts of `slots` on a bank of ModelOpt NVFP4 slots (codes, then scales): x f32 (expert j's
+    /// at x + j xstride), expert j's factor amax[ids[j]] / denom[0].
     #[allow(clippy::too_many_arguments)]
-    pub fn moe_nvfp4_d(&self, s: &Stream, bank: P, slot_bytes: u64, slots: P, ids: P, amax: P, denom: P, xq: P, xd: P, xstride: u32, y: P, rows: u32, k: u32) -> Result<()> {
-        assert!(k % 32 == 0, "moe_nvfp4_d: k {k}");
-        self.run(s, "moe_nvfp4_d", (rows.div_ceil(64), 8, 1), 128, &[&bank, &slot_bytes, &slots, &ids, &amax, &denom, &xq, &xd, &xstride, &y, &rows, &k])
+    pub fn moe_nvfp4_d(&self, s: &Stream, bank: P, slot_bytes: u64, slots: P, ids: P, amax: P, denom: P, x: P, xstride: u32, y: P, rows: u32, k: u32) -> Result<()> {
+        assert!(k % 32 == 0 && k <= 2304, "moe_nvfp4_d: k {k}");
+        self.run(s, "moe_nvfp4_d", (rows.div_ceil(64), 8, 1), 128, &[&bank, &slot_bytes, &slots, &ids, &amax, &denom, &x, &xstride, &y, &rows, &k])
     }
 
     /// y = W x for the 8 experts of `slots` on a bank of MXFP8 slots (e4m3 values, then UE8M0 scales): x f32.

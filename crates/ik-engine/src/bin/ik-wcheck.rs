@@ -1,7 +1,7 @@
 //! The GPU kernels that read the checkpoint's weights, on real tensors, against references on the CPU (f64):
 //! `ik-wcheck <checkpoint dir>`. Prints the largest error of each relative to the largest output, and fails past a
-//! bound. The references are scalar Rust in f64, with no SIMD: they take the tensors' bytes from `Checkpoint`, and
-//! decode the stored formats and quantize the activations (q8_ref) themselves.
+//! bound. The references are scalar Rust in f64, with no SIMD: they take the tensors' bytes from `Checkpoint` and
+//! decode the stored formats themselves, and take the same f32 inputs as the kernels.
 use ik_engine::checkpoint::{Checkpoint, Dtype};
 use ik_engine::cpu::dot_row;
 use ik_engine::cuda::{Ctx, DevBuf, Stream};
@@ -92,71 +92,6 @@ fn check(name: &str, err: f64, bound: f64, fails: &mut Vec<String>) {
     }
 }
 
-/// x quantized as the NVFP4 kernels take it, written out plainly (scalar, in f64): per 32 values a scale
-/// d = max|x| / 127, and each value x / d rounded to the nearest integer.
-fn q8_ref(x: &[f32]) -> (Vec<i8>, Vec<f64>) {
-    let mut q = vec![0i8; x.len()];
-    let mut d = vec![0f64; x.len() / 32];
-    for (b, xb) in x.chunks_exact(32).enumerate() {
-        d[b] = xb.iter().fold(0f64, |m, &v| m.max((v as f64).abs())) / 127.0;
-        for (i, &v) in xb.iter().enumerate() {
-            q[32 * b + i] = if d[b] > 0.0 { (v as f64 / d[b]).round() as i8 } else { 0 };
-        }
-    }
-    (q, d)
-}
-
-/// How far v / d is from the nearest half-integer, where rounding may go either way, in steps of d.
-fn from_tie(v: f32, d: f64) -> f64 {
-    if d > 0.0 { ((v as f64 / d).abs().fract() - 0.5).abs() } else { 0.5 }
-}
-
-/// Moves each value of x within 1% of a step from a rounding boundary to a quarter step past the integer below it
-/// (toward zero), so that the kernels' f32 arithmetic has to round it as q8_ref does. The scales stay: no value grows,
-/// and a block's largest is at a whole step (127).
-fn untie(x: &mut [f32]) {
-    let (_, d) = q8_ref(x);
-    for (i, v) in x.iter_mut().enumerate() {
-        let db = d[i / 32];
-        if from_tie(*v, db) < 0.01 {
-            *v = (v.signum() as f64 * ((*v as f64 / db).abs().floor() + 0.25) * db) as f32;
-        }
-    }
-}
-
-/// A kernel's int8 quantization of x (q, d, and s = d * sum(q) per 32 where it writes them) against q8_ref: the scales
-/// to f32 rounding, and every int8 equal, but for one step off at a value within 1e-3 of a step from a rounding
-/// boundary, which f32 arithmetic may round either way.
-fn check_q8(name: &str, x: &[f32], q: &[i8], d: &[f32], s: Option<&[f32]>, fails: &mut Vec<String>) {
-    let (qr, dr) = q8_ref(x);
-    let (mut e_d, mut e_s, mut off, mut ties) = (0f64, 0f64, 0usize, 0usize);
-    for b in 0..dr.len() {
-        e_d = e_d.max((d[b] as f64 - dr[b]).abs() / dr[b].max(1e-30));
-        for i in 32 * b..32 * b + 32 {
-            if q[i] != qr[i] {
-                if (q[i] as i32 - qr[i] as i32).abs() == 1 && from_tie(x[i], dr[b]) < 1e-3 {
-                    ties += 1;
-                } else {
-                    off += 1;
-                }
-            }
-        }
-        if let Some(s) = s {
-            let want = d[b] as f64 * q[32 * b..32 * b + 32].iter().map(|&v| v as f64).sum::<f64>();
-            e_s = e_s.max((s[b] as f64 - want).abs() / (d[b] as f64 * 32.0 * 127.0).max(1e-30));
-        }
-    }
-    check(&format!("{name} scales"), e_d, 1e-6, fails);
-    if s.is_some() {
-        check(&format!("{name} d*sum(q)"), e_s, 1e-6, fails);
-    }
-    let tied = if ties > 0 { format!(" ({ties} one step off at a tie)") } else { String::new() };
-    println!("{:40} {off} off{tied}{}", format!("{name} int8"), if off > 0 { "  FAIL" } else { "" });
-    if off > 0 {
-        fails.push(format!("{name} int8"));
-    }
-}
-
 fn main() -> Result<(), String> {
     let a: Vec<String> = std::env::args().collect();
     let ck = Checkpoint::open(std::path::Path::new(a.get(1).ok_or("usage: ik-wcheck <checkpoint dir>")?))?;
@@ -220,29 +155,19 @@ fn main() -> Result<(), String> {
             let bb = DevBuf::from_slice(&b)?;
             let (_, rows, kk) = expert_ref(&ck, l, w, 0)?;
             let nx = if xstride == 0 { kk } else { 8 * kk };
-            let mut x: Vec<f32> = (0..nx).map(|_| rnd(&mut seed) * 2.0).collect();
-            untie(&mut x);
+            let x: Vec<f32> = (0..nx).map(|_| rnd(&mut seed) * 2.0).collect();
+            let xs: Vec<f64> = x.iter().map(|&v| v as f64).collect();
             let bx = DevBuf::from_slice(&x)?;
             let by = DevBuf::zeroed(8 * rows * 4, &s)?;
             let nvfp4 = ck.tensor(&format!("model.llm.layers.{l}.mlp.experts.{w}_weight"))?.dtype == Dtype::U8;
-            // x as the kernel should see it: for NVFP4 q8_ref's int8 and scales (quant_q8_1's checked against them),
-            // for MXFP8 the f32 values
-            let xs: Vec<f64> = if nvfp4 {
-                let (bq, bd, bs) = (DevBuf::new(nx)?, DevBuf::new(nx / 32 * 4)?, DevBuf::new(nx / 32 * 4)?);
-                k.quant_q8_1(&s, bx.ptr, bq.ptr, bd.ptr, bs.ptr, nx as u32, 1)?;
+            if nvfp4 {
                 let p = |n: &str| format!("model.llm.layers.{l}.mlp.experts.{w}_weight_{n}");
                 let (ba, bn) = (DevBuf::from_slice(&ck.floats(&p("amax"))?)?, DevBuf::from_slice(&ck.floats(&p("outer_scale_denominator"))?)?);
-                k.moe_nvfp4_d(&s, bb.ptr, slot as u64, bslots.ptr, bids.ptr, ba.ptr, bn.ptr, bq.ptr, bd.ptr, xstride as u32, by.ptr, rows as u32, kk as u32)?;
-                s.sync()?;
-                let (q, d, sum): (Vec<i8>, Vec<f32>, Vec<f32>) = (bq.download(nx)?, bd.download(nx / 32)?, bs.download(nx / 32)?);
-                check_q8(&format!("quant_q8_1 layer {l} {w}"), &x, &q, &d, Some(&sum), &mut fails);
-                let (qr, dr) = q8_ref(&x);
-                (0..nx).map(|i| qr[i] as f64 * dr[i / 32]).collect()
+                k.moe_nvfp4_d(&s, bb.ptr, slot as u64, bslots.ptr, bids.ptr, ba.ptr, bn.ptr, bx.ptr, xstride as u32, by.ptr, rows as u32, kk as u32)?;
             } else {
                 k.moe_mxfp8_d(&s, bb.ptr, slot as u64, bslots.ptr, bx.ptr, xstride as u32, by.ptr, rows as u32, kk as u32)?;
-                s.sync()?;
-                x.iter().map(|&v| v as f64).collect()
-            };
+            }
+            s.sync()?;
             let y: Vec<f32> = by.download(8 * rows)?;
             let mut err = 0f64;
             for (j, &e) in es.iter().enumerate() {
@@ -260,6 +185,51 @@ fn main() -> Result<(), String> {
             }
             check(&format!("moe_{}_d layer {l} {w}", if nvfp4 { "nvfp4" } else { "mxfp8" }), err, 1e-5, &mut fails);
         }
+    }
+
+    // NVFP4 on made-up slots, for what the real tensors may hold little of: every code byte in each row, and E4M3
+    // scales of every magnitude, the subnormal ones among them (every 4th row has only those). Each row's error is over
+    // its sum of |w x|, which one value decoded wrong moves by about 1/k.
+    {
+        let (rows, kk) = (64usize, 512usize);
+        let (qb, sb) = (rows * kk / 2, rows * kk / 16);
+        let slot = (qb + sb).next_multiple_of(256);
+        let mut b = vec![0u8; 8 * slot];
+        for e in 0..8 {
+            for r in 0..rows {
+                for i in 0..kk / 2 {
+                    b[e * slot + r * kk / 2 + i] = ((i + 37 * r + 101 * e) % 256) as u8;
+                }
+                for j in 0..kk / 16 {
+                    b[e * slot + qb + r * kk / 16 + j] = if r % 4 == 0 { 1 + (r + j + e) % 7 } else { 1 + (7 * r + 13 * j + e) % 0x7E } as u8;
+                }
+            }
+        }
+        let amax: Vec<f32> = (0..8).map(|e| 0.5 + e as f32).collect();
+        let den = [3.0f32];
+        let x: Vec<f32> = (0..kk).map(|_| rnd(&mut seed) * 2.0).collect();
+        let (all, ids8): (Vec<i32>, Vec<u32>) = ((0..8).collect(), (0..8).collect());
+        let (bb, ba, bn, bx) = (DevBuf::from_slice(&b)?, DevBuf::from_slice(&amax)?, DevBuf::from_slice(&den)?, DevBuf::from_slice(&x)?);
+        let (bs8, bi8, by) = (DevBuf::from_slice(&all)?, DevBuf::from_slice(&ids8)?, DevBuf::zeroed(8 * rows * 4, &s)?);
+        k.moe_nvfp4_d(&s, bb.ptr, slot as u64, bs8.ptr, bi8.ptr, ba.ptr, bn.ptr, bx.ptr, 0, by.ptr, rows as u32, kk as u32)?;
+        s.sync()?;
+        let y: Vec<f32> = by.download(8 * rows)?;
+        let mut err = 0f64;
+        for e in 0..8 {
+            let f = amax[e] as f64 / den[0] as f64;
+            for r in 0..rows {
+                let (mut want, mut l1) = (0f64, 0f64);
+                for c in 0..kk {
+                    let byte = b[e * slot + r * kk / 2 + c / 2];
+                    let code = if c % 2 == 0 { byte & 15 } else { byte >> 4 };
+                    let wx = E2M1[code as usize] * e4m3(b[e * slot + qb + r * kk / 16 + c / 16]) * f * x[c] as f64;
+                    want += wx;
+                    l1 += wx.abs();
+                }
+                err = err.max((y[e * rows + r] as f64 - want).abs() / l1.max(1e-30));
+            }
+        }
+        check("moe_nvfp4_d made up: codes, subnormal scales", err, 1e-5, &mut fails);
     }
 
     // experts on the CPU: every row of two experts' gate_up and down, the matrices views of the checkpoint's bytes
@@ -295,12 +265,18 @@ fn main() -> Result<(), String> {
     let nff = 1152;
     let gu: Vec<f32> = (0..8 * 2 * nff).map(|_| rnd(&mut seed) * 6.0).collect();
     let bgu = DevBuf::from_slice(&gu)?;
-    let (baf, baq, bad, bas) = (DevBuf::zeroed(8 * nff * 4, &s)?, DevBuf::new(8 * nff)?, DevBuf::new(8 * nff / 32 * 4)?, DevBuf::new(8 * nff / 32 * 4)?);
-    k.situ_q8(&s, bgu.ptr, bslots.ptr, baf.ptr, baq.ptr, bad.ptr, bas.ptr, nff as u32, 4.0, 25.0)?;
+    let baf = DevBuf::zeroed(8 * nff * 4, &s)?;
+    k.situ(&s, bgu.ptr, bslots.ptr, baf.ptr, nff as u32, 4.0, 25.0)?;
     s.sync()?;
-    let (af, aq, ad): (Vec<f32>, Vec<i8>, Vec<f32>) = (baf.download(8 * nff)?, baq.download(8 * nff)?, bad.download(8 * nff / 32)?);
-    let (mut e_af, mut e_aq) = (0f64, 0f64);
-    for j in (0..8).filter(|&j| slots[j] >= 0) {
+    let af: Vec<f32> = baf.download(8 * nff)?;
+    let mut e_af = 0f64;
+    for j in 0..8 {
+        if slots[j] < 0 {
+            if af[j * nff..(j + 1) * nff].iter().any(|&v| v != 0.0) {
+                fails.push("situ: an uncached expert's activations were written".into());
+            }
+            continue;
+        }
         let want: Vec<f64> = (0..nff)
             .map(|i| {
                 let (g, u) = (gu[j * 2 * nff + 2 * i] as f64, gu[j * 2 * nff + 2 * i + 1] as f64);
@@ -308,19 +284,10 @@ fn main() -> Result<(), String> {
             })
             .collect();
         e_af = e_af.max(rel_err(&af[j * nff..(j + 1) * nff], &want));
-        let deq: Vec<f32> = (0..nff).map(|i| aq[j * nff + i] as f32 * ad[(j * nff + i) / 32]).collect();
-        e_aq = e_aq.max(rel_err(&deq, &want));
     }
-    check("situ_q8 f32", e_af, 1e-5, &mut fails);
-    check("situ_q8 q8_1 (int8 rounding)", e_aq, 1e-2, &mut fails);
-    // its q8_1 against q8_ref of its f32 output, over the cached experts
-    let cached: Vec<usize> = (0..8).filter(|&j| slots[j] >= 0).collect();
-    let pick = |v: &[f32], w: usize| -> Vec<f32> { cached.iter().flat_map(|&j| v[j * w..(j + 1) * w].to_vec()).collect() };
-    let qc: Vec<i8> = cached.iter().flat_map(|&j| aq[j * nff..(j + 1) * nff].to_vec()).collect();
-    let asum: Vec<f32> = bas.download(8 * nff / 32)?;
-    check_q8("situ_q8 q8_1", &pick(&af, nff), &qc, &pick(&ad, nff / 32), Some(&pick(&asum, nff / 32)), &mut fails);
+    check("situ", e_af, 1e-5, &mut fails);
 
-    // norms with a BF16 gain: rms_norm, and norm_q8 (its f32 output and its q8_1 of it) on two vectors
+    // rms_norm with a BF16 gain, on two vectors
     let w = ck.get("model.llm.layers.3.mlp_norm.weight", Dtype::BF16, &[n])?;
     let x: Vec<f32> = (0..2 * n).map(|_| rnd(&mut seed) * 3.0).collect();
     let (bw, bx, by) = (DevBuf::from_slice(w)?, DevBuf::from_slice(&x)?, DevBuf::zeroed(2 * n * 4, &s)?);
@@ -334,14 +301,6 @@ fn main() -> Result<(), String> {
     k.rms_norm(&s, bx.ptr, Some(bw.ptr), by.ptr, n as u32, 2, 1e-6)?;
     s.sync()?;
     check("rms_norm bf16 gain", rel_err(&by.download::<f32>(2 * n)?, &want), 1e-5, &mut fails);
-    let (bq, bd, bs) = (DevBuf::new(2 * n)?, DevBuf::new(2 * n / 32 * 4)?, DevBuf::new(2 * n / 32 * 4)?);
-    by.memset(0, &s)?;
-    k.norm_q8(&s, bx.ptr, bw.ptr, by.ptr, bq.ptr, bd.ptr, bs.ptr, n as u32, 1e-6, 2, n as u32)?;
-    s.sync()?;
-    let y: Vec<f32> = by.download(2 * n)?;
-    check("norm_q8 bf16 gain", rel_err(&y, &want), 1e-5, &mut fails);
-    let (q, d, sum): (Vec<i8>, Vec<f32>, Vec<f32>) = (bq.download(2 * n)?, bd.download(2 * n / 32)?, bs.download(2 * n / 32)?);
-    check_q8("norm_q8 q8_1", &y, &q, &d, Some(&sum), &mut fails);
 
     // the short convolutions over 5 steps from a zero state: a sliding layer's conv1d [c][1][4] (tap 3 the current
     // token), and a full layer's static taps [4][c] (lag 0 the current token) plus the input-dependent ones [head][lag]

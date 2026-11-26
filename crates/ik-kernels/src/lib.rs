@@ -1887,12 +1887,10 @@ pub mod gpu {
     }
 
     /// The SITU activation of the cached experts' gate_up ([8][2 nff], the checkpoint's rows: gate i is row 2i, up i
-    /// row 2i + 1): beta tanh(g/beta) sigmoid(g) lb tanh(u/lb), as f32 (`af` [8][nff], for MXFP8 experts) and as q8_1
-    /// (aq [8][nff], ad, as [8][nff/32], for NVFP4 ones). A warp per block of 32, grid.y = 8 experts.
+    /// row 2i + 1): beta tanh(g/beta) sigmoid(g) lb tanh(u/lb), f32 (`af` [8][nff]). A warp per block of 32, grid.y = 8
+    /// experts.
     #[maxntid(256)]
-    pub unsafe extern "ptx-kernel" fn situ_q8(
-        gu: *const f32, slots: *const i32, af: *mut f32, aq: *mut u8, ad: *mut f32, asum: *mut f32, nff: u32, beta: f32, lb: f32,
-    ) {
+    pub unsafe extern "ptx-kernel" fn situ(gu: *const f32, slots: *const i32, af: *mut f32, nff: u32, beta: f32, lb: f32) {
         let ke: u32;
         mov.u32(ke, ctaid.y);
         let (sa, slot): (u64, s32);
@@ -1937,14 +1935,6 @@ pub mod gpu {
         mad.lo.u32(ai, ke, nff, i);
         mad.wide.u32(afa, ai, 4, af);
         st.global.f32([afa], a);
-        let (gb, qb): (u32, u32);
-        mad.lo.u32(gb, ke, nb, b);
-        shl.b32(qb, gb, 5);
-        let (qa, da, s2): (u64, u64, u64);
-        mad.wide.u32(qa, qb, 1, aq);
-        mad.wide.u32(da, gb, 4, ad);
-        mad.wide.u32(s2, gb, 4, asum);
-        q8_warp(a, lane, qa, da, s2);
     }
 
     /// The UE4M3 scale byte `b` as f32, halved as ggml decodes it: 2^(e-8) (1 + m/8), or m 2^-10 when e = 0; 0x7F is 0.
@@ -2178,75 +2168,25 @@ pub mod gpu {
         }
     }
 
-    /// The 8 E2M1 codes of w (its nibbles, element 2j of byte j in the low one: ModelOpt's order) as int8 of the doubled
-    /// values, 12 instructions: `a` elements 0..3, `b` elements 4..7. The lookups are fp4x8's.
-    fn fp4x8n(a: u32, b: u32, w: u32, pa: u32, pb: u32, na: u32, nb: u32) {
-        let (m, s, m1, s1, p, n): (u32, u32, u32, u32, u32, u32);
-        and.b32(m, w, 0x7777_7777);
-        shr.u32(s, w, 1);
-        and.b32(s, s, 0x4444_4444);
-        or.b32(s, s, 0x3210_3210);
-        prmt.b32(p, pa, pb, m);
-        prmt.b32(n, na, nb, m);
-        prmt.b32(a, p, n, s);
-        shr.u32(m1, m, 16);
-        shr.u32(s1, s, 16);
-        prmt.b32(p, pa, pb, m1);
-        prmt.b32(n, na, nb, m1);
-        prmt.b32(b, p, n, s1);
-    }
-
-    /// acc += one 16-byte chunk of a ModelOpt NVFP4 row (w0..w3: its elements 0..31 in order) times their q8_1 block
-    /// of x (x0..x7, scale `xs`). `sc` holds the chunk's two E4M3 scale bytes (elements 0..15, 16..31) in its low half:
-    /// (b & 0x7F) << 20 is the f32 2^(e-127) (1 + m/8), or m 2^-129 when e = 0, which `f119` = 2^119 makes the scale
-    /// halved, exactly, for the doubled codes.
-    fn nvfp4_chunk(
-        acc: f32, w0: u32, w1: u32, w2: u32, w3: u32, sc: u32, x0: u32, x1: u32, x2: u32, x3: u32, x4: u32, x5: u32, x6: u32, x7: u32,
-        xs: f32, f119: f32, pa: u32, pb: u32, na: u32, nb: u32,
-    ) {
-        let (a0, b0, a1, b1, a2, b2, a3, b3): (u32, u32, u32, u32, u32, u32, u32, u32);
-        fp4x8n(a0, b0, w0, pa, pb, na, nb);
-        fp4x8n(a1, b1, w1, pa, pb, na, nb);
-        fp4x8n(a2, b2, w2, pa, pb, na, nb);
-        fp4x8n(a3, b3, w3, pa, pb, na, nb);
-        let (d0, d1): (u32, u32);
-        mov.u32(d0, 0);
-        mov.u32(d1, 0);
-        dp4a.s32.s32(d0, a0, x0, d0);
-        dp4a.s32.s32(d0, b0, x1, d0);
-        dp4a.s32.s32(d0, a1, x2, d0);
-        dp4a.s32.s32(d0, b1, x3, d0);
-        dp4a.s32.s32(d1, a2, x4, d1);
-        dp4a.s32.s32(d1, b2, x5, d1);
-        dp4a.s32.s32(d1, a3, x6, d1);
-        dp4a.s32.s32(d1, b3, x7, d1);
-        let (e0, e1): (u32, u32);
-        shl.b32(e0, sc, 20);
-        and.b32(e0, e0, 0x07F0_0000);
-        shl.b32(e1, sc, 12);
-        and.b32(e1, e1, 0x07F0_0000);
-        let (s0, s1, f0, f1): (f32, f32, f32, f32);
-        mov.b32(s0, e0);
-        mov.b32(s1, e1);
-        mul.rn.f32(s0, s0, f119);
-        mul.rn.f32(s1, s1, f119);
-        cvt.rn.f32.s32(f0, d0);
-        cvt.rn.f32.s32(f1, d1);
-        mul.rn.f32(f0, f0, s0);
-        fma.rn.f32(f0, f1, s1, f0);
-        fma.rn.f32(acc, f0, xs, acc);
-    }
-
     /// y = W x for the 8 experts of `slots` (grid.y) on a bank of ModelOpt NVFP4 slots: the expert's codes as the
     /// checkpoint has them ([rows][k/2], element 2j of a row in the low nibble of byte j), then its E4M3 scales
-    /// ([rows][k/16]). The expert's factor is amax[ids[ke]] / denom[0]. x is q8_1 (int8 `xq`, `xd` per 32), the same
-    /// for all experts (xstride 0) or each expert's at xq + ke xstride. 8 lanes per row (16-byte chunks of 32
-    /// elements, one x block each: a warp reads 128 contiguous bytes of each of 4 rows), a thread takes 4 rows
-    /// (r + 16i), 64 rows per block of 128 threads; x through L1. k a multiple of 32.
+    /// ([rows][k/16]). The expert's factor is amax[ids[ke]] / denom[0]. x is f32, the same for all experts (xstride 0)
+    /// or each expert's at x + ke xstride. 8 lanes per row (16-byte chunks of 32 elements, two scale blocks: a warp
+    /// reads 128 contiguous bytes of each of 4 rows), a thread takes 4 rows (r + 16i), 64 rows per block of 128
+    /// threads; x from shared memory. k a multiple of 32, at most 2304.
+    ///
+    /// The values are decoded exactly. Codes k and k + 4 of a word (nibbles at bits 4k, 4k + 16) shift to an f16x2 of
+    /// them times 2^-14: e1 e0 m to bits 11..9 of each half (f16's exponent bias of 15 against E2M1's 1, and with
+    /// e1 e0 = 0 the subnormals of both), the sign from bit 12 to 15. Their f32 are exact, and so is the scale: (b & 0x7F)
+    /// << 20 is the f32 of the E4M3 b times 2^-120 (subnormal ones too), times 2^120. The factor takes the 2^14.
+    ///
+    /// Four blocks an SM, 128 registers a thread: with fewer, ptxas moves the next chunk's loads down to where they are
+    /// used (3 % slower on an RTX 3050).
     #[reqntid(128)]
+    #[minnctapersm(4)]
     pub unsafe extern "ptx-kernel" fn moe_nvfp4_d(
-        bank: *const u8, slot_bytes: u64, slots: *const i32, ids: *const u32, amax: *const f32, denom: *const f32, xq: *const u8,
-        xd: *const f32, xstride: u32, y: *mut f32, rows: u32, kdim: u32,
+        bank: *const u8, slot_bytes: u64, slots: *const i32, ids: *const u32, amax: *const f32, denom: *const f32, x: *const f32,
+        xstride: u32, y: *mut f32, rows: u32, kdim: u32,
     ) {
         let ke: u32;
         mov.u32(ke, ctaid.y);
@@ -2258,18 +2198,43 @@ pub mod gpu {
         if none {
             ret();
         }
-        let (aoff, boff): (u32, u32);
+        let aoff: u32;
         mul.lo.u32(aoff, ke, xstride);
-        shr.u32(boff, aoff, 5);
-        let (xk, dk): (u64, u64);
-        mad.wide.u32(xk, aoff, 1, xq);
-        mad.wide.u32(dk, boff, 4, xd);
+        let xk: u64;
+        mad.wide.u32(xk, aoff, 4, x);
         let (t, lr, bk, row0, last): (u32, u32, u32, u32, u32);
         mov.u32(t, tid.x);
         and.b32(lr, t, 7);
         mov.u32(bk, ctaid.x);
         shr.u32(row0, t, 3);
         mad.lo.u32(row0, bk, 64, row0);
+        // x to shared memory, chunk c's 32 floats at byte 144 c: the 8 lanes of a row, which read 8 chunks at once,
+        // then reach 8 different sets of banks. Float4 i goes to 144 (i / 8) + 16 (i % 8), by all the block's threads
+        // before any leaves.
+        let xs: shared<[f32; 2592], 16>;
+        let (xb, i, n4): (u32, u32, u32);
+        mov.u32(xb, xs);
+        mov.u32(i, t);
+        shr.u32(n4, kdim, 2);
+        label(fill);
+        let filled: pred;
+        setp.ge.u32(filled, i, n4);
+        if filled {
+            bra(staged);
+        }
+        let (ga, so, hi, lo): (u64, u32, u32, u32);
+        let (v0, v1, v2, v3): (f32, f32, f32, f32);
+        mad.wide.u32(ga, i, 16, xk);
+        ld.global.nc.v4.f32((v0, v1, v2, v3), [ga]);
+        shr.u32(hi, i, 3);
+        and.b32(lo, i, 7);
+        mad.lo.u32(so, hi, 144, xb);
+        mad.lo.u32(so, lo, 16, so);
+        st.shared.v4.f32([so], (v0, v1, v2, v3));
+        add.u32(i, i, 128);
+        bra(fill);
+        label(staged);
+        bar.sync(0);
         let past: pred;
         setp.ge.u32(past, row0, rows);
         if past {
@@ -2300,51 +2265,111 @@ pub mod gpu {
             cvt.u64.u32(sa[r], so);
             add.u64(sa[r], sa[r], base);
         }
-        let (xo, xda): (u64, u64);
-        mad.wide.u32(xo, lr, 32, xk);
-        mad.wide.u32(xda, lr, 4, dk);
-        let (pa, pb, na, nbt): (u32, u32, u32, u32);
-        mov.u32(pa, 0x0302_0100);
-        mov.u32(pb, 0x0C08_0604);
-        mov.u32(na, 0xFDFE_FF00);
-        mov.u32(nbt, 0xF4F8_FAFC);
-        let (k119, f119): (u32, f32);
-        mov.u32(k119, 0x7B00_0000);
-        mov.b32(f119, k119);
+        // chunk c's x: elements 32c..32c + 32, at shared 144 c
+        let xo: u32;
+        mad.lo.u32(xo, lr, 144, xb);
+        let (k120, f120): (u32, f32);
+        mov.u32(k120, 0x7B80_0000);
+        mov.b32(f120, k120);
         let acc: [f32; 4];
         for r in 0..4 {
             mov.f32(acc[r], 0.0);
         }
-        label(top);
         let done: pred;
         setp.ge.u32(done, c, nc);
         if done {
             bra(end);
         }
-        let (w0, w1, w2, w3, s16, sc): ([u32; 4], [u32; 4], [u32; 4], [u32; 4], [u16; 4], [u32; 4]);
+        // Chunk c's codes and scales are in half h of w and s16 while half h of the loop sums them, and the next chunk
+        // loads into the other half meanwhile: each load has a chunk's arithmetic to arrive in. Past the last chunk
+        // the addresses stay, and the last half loads its own chunk again, which nothing sums.
+        let (w, s16): ([u32; 32], [u16; 8]);
         for r in 0..4 {
-            ld.global.nc.v4.u32((w0[r], w1[r], w2[r], w3[r]), [qa[r]]);
+            ld.global.nc.v4.u32((w[4 * r], w[4 * r + 1], w[4 * r + 2], w[4 * r + 3]), [qa[r]]);
         }
         for r in 0..4 {
             ld.global.nc.u16(s16[r], [sa[r]]);
         }
-        let (x0, x1, x2, x3, x4, x5, x6, x7): (u32, u32, u32, u32, u32, u32, u32, u32);
-        ld.global.nc.v4.u32((x0, x1, x2, x3), [xo]);
-        ld.global.nc.v4.u32((x4, x5, x6, x7), [xo + 16]);
-        let xs: f32;
-        ld.global.nc.f32(xs, [xda]);
-        for r in 0..4 {
-            cvt.u32.u16(sc[r], s16[r]);
-            nvfp4_chunk(acc[r], w0[r], w1[r], w2[r], w3[r], sc[r], x0, x1, x2, x3, x4, x5, x6, x7, xs, f119, pa, pb, na, nbt);
+        label(top);
+        for h in 0..2 {
+            let (cn, more, sq, ss): (u32, pred, u64, u64);
+            add.u32(cn, c, 8);
+            setp.lt.u32(more, cn, nc);
+            selp.b64(sq, 128, 0, more);
+            selp.b64(ss, 16, 0, more);
+            for r in 0..4 {
+                add.u64(qa[r], qa[r], sq);
+                add.u64(sa[r], sa[r], ss);
+            }
+            for r in 0..4 {
+                ld.global.nc.v4.u32(
+                    (w[16 - 16 * h + 4 * r], w[16 - 16 * h + 4 * r + 1], w[16 - 16 * h + 4 * r + 2], w[16 - 16 * h + 4 * r + 3]),
+                    [qa[r]],
+                );
+            }
+            for r in 0..4 {
+                ld.global.nc.u16(s16[4 - 4 * h + r], [sa[r]]);
+            }
+            let xv: [f32; 32];
+            for q in 0..8 {
+                ld.shared.v4.f32((xv[4 * q], xv[4 * q + 1], xv[4 * q + 2], xv[4 * q + 3]), [xo + (q * 16)]);
+            }
+            for r in 0..4 {
+                // the sums of the chunk's two blocks: words 0, 1 are elements 0..15, words 2, 3 elements 16..31
+                let part: [f32; 2];
+                mov.f32(part[0], 0.0);
+                mov.f32(part[1], 0.0);
+                for j in 0..4 {
+                    for k in 0..4 {
+                        // word j's codes k, k + 4 (elements 8j + k, 8j + k + 4): e1 e0 m to bits 9..11 (and 25..27)
+                        let (sh, a, sg, hv): (u32, u32, u32, u32);
+                        let (h0, h1): (f16, f16);
+                        let (f0, f1): (f32, f32);
+                        if k == 3 {
+                            shr.u32(sh, w[16 * h + 4 * r + j], 3);
+                        } else {
+                            shl.b32(sh, w[16 * h + 4 * r + j], 9 - 4 * k);
+                        }
+                        // the sign then at bit 12: hv = a + 7 sg moves it to 15
+                        and.b32(a, sh, 0x1E00_1E00);
+                        and.b32(sg, sh, 0x1000_1000);
+                        mad.lo.u32(hv, sg, 7, a);
+                        mov.b32((h0, h1), hv);
+                        cvt.f32.f16(f0, h0);
+                        cvt.f32.f16(f1, h1);
+                        fma.rn.f32(part[j / 2], f0, xv[8 * j + k], part[j / 2]);
+                        fma.rn.f32(part[j / 2], f1, xv[8 * j + k + 4], part[j / 2]);
+                    }
+                }
+                let (sc, e0, e1): (u32, u32, u32);
+                let (s0, s1): (f32, f32);
+                cvt.u32.u16(sc, s16[4 * h + r]);
+                shl.b32(e0, sc, 20);
+                and.b32(e0, e0, 0x07F0_0000);
+                shl.b32(e1, sc, 12);
+                and.b32(e1, e1, 0x07F0_0000);
+                mov.b32(s0, e0);
+                mov.b32(s1, e1);
+                mul.rn.f32(s0, s0, f120);
+                mul.rn.f32(s1, s1, f120);
+                fma.rn.f32(acc[r], part[0], s0, acc[r]);
+                fma.rn.f32(acc[r], part[1], s1, acc[r]);
+            }
+            add.u32(xo, xo, 1152);
+            mov.u32(c, cn);
+            if h == 0 {
+                let last: pred;
+                setp.ge.u32(last, c, nc);
+                if last {
+                    bra(end);
+                }
+            }
+            if h == 1 {
+                if more {
+                    bra(top);
+                }
+            }
         }
-        add.u32(c, c, 8);
-        for r in 0..4 {
-            add.u64(qa[r], qa[r], 128);
-            add.u64(sa[r], sa[r], 16);
-        }
-        add.u64(xo, xo, 256);
-        add.u64(xda, xda, 32);
-        bra(top);
         label(end);
         for sh in [4, 2, 1] {
             for r in 0..4 {
@@ -2353,7 +2378,7 @@ pub mod gpu {
                 add.rn.f32(acc[r], acc[r], o);
             }
         }
-        // the expert's factor, as the checkpoint gives it: amax / outer_scale_denominator
+        // the expert's factor, as the checkpoint gives it (amax / outer_scale_denominator), times the values' 2^14
         let (ia, aa, e): (u64, u64, u32);
         let (am, den, es): (f32, f32, f32);
         mad.wide.u32(ia, ke, 4, ids);
@@ -2362,6 +2387,7 @@ pub mod gpu {
         ld.global.nc.f32(am, [aa]);
         ld.global.nc.f32(den, [denom]);
         div.rn.f32(es, am, den);
+        mul.rn.f32(es, es, 16384.0);
         let first: pred;
         setp.eq.u32(first, lr, 0);
         for r in 0..4 {

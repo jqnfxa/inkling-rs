@@ -135,11 +135,12 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
 - Decode attention splits the keys into chunks of 256, a block per (kv head, chunk): the query quantized to int8 per 32
   for dp4a scores, the values converted without `cvt` (each byte into the low byte of 2^23), 16-byte loads in the V
   pass. Full attention over 131k keys takes 507 us per layer pass with int4 caches, 746 with int8 (831 before).
-- The GPU expert kernels decode E2M1 by table lookups in `prmt` (8 values in 13 instructions) for dp4a. In decode a
-  warp reads 128 contiguous bytes of each of 4 rows, a thread keeps 4 rows, and x comes through L1 (no shared-memory
-  staging, no barrier): the gate_up of 8 NVFP4 experts (2304 x 2304) takes 62 us (388 GB/s), the down 34 us.
+- The GPU expert kernels decode E2M1 exactly, two values at a time into an f16 pair by shifts and masks, and multiply
+  in f32. In decode a warp reads 128 contiguous bytes of each of 4 rows and a thread keeps 4 rows; x is staged in
+  shared memory, padded so that the 8 lanes of a row read different banks, and each chunk's codes load while the one
+  before is summed. On an RTX 3050 Laptop the gate_up, activation and down of 8 NVFP4 experts take 218 us (165 GB/s).
 - Kernels follow Marlin where it applies at these batch sizes: 16-byte loads and one pass over each weight byte. Here
-  they read the weights in the checkpoint's own layouts, with int8 activations for the NVFP4 experts' dp4a.
+  they read the weights in the checkpoint's own layouts.
 - Serving follows mini-SGLang: HTTP front end, chat template and tokenizer, a scheduler thread that owns the engine, an
   incremental detokenizer and a reply parser (thinking, text, tool calls), SSE.
 
