@@ -166,10 +166,14 @@ struct PfStream {
     x: DevBuf,
     gu_out: DevBuf,
     af: DevBuf,
-    /// the streamed pairs in expert order, [4][8 T_MAX] u32: staging slot, expert, token, pair (8 t + k); and the host
-    /// copy they are written to
+    /// the streamed pairs in expert order, [3][8 T_MAX] u32: staging slot, token, pair (8 t + k); and the host copy
+    /// they are written to
     lists: DevBuf,
     lists_h: HostBuf,
+    /// moe_nvfp4_g's entries of each streamed expert, [2 n_expert][4] u64: its gate_up, then its down; and the host
+    /// copy they are written to
+    tab: DevBuf,
+    tab_h: HostBuf,
     s: Stream,
     /// per staging slot: its upload is done; its last reader is done
     up: Vec<cuda::Event>,
@@ -199,8 +203,10 @@ impl PfStream {
             x: DevBuf::new(T_MAX * n * 4)?,
             gu_out: DevBuf::new(T_MAX * 2 * nff * 4)?,
             af: DevBuf::new(T_MAX * nff * 4)?,
-            lists: DevBuf::new(4 * cap * 4)?,
-            lists_h: HostBuf::new(4 * cap * 4)?,
+            lists: DevBuf::new(3 * cap * 4)?,
+            lists_h: HostBuf::new(3 * cap * 4)?,
+            tab: DevBuf::new(2 * hp.n_expert * 32)?,
+            tab_h: HostBuf::new(2 * hp.n_expert * 32)?,
             s: Stream::new_nonblocking()?,
             up: events()?,
             free: events()?,
@@ -1451,7 +1457,8 @@ impl Engine {
 
     /// Queues the pairs of `streamed` (expert, its (token, pair)s) on the expert stream: the copy stream uploads each
     /// expert to a staging slot once the slot's last reader is done, and the stream gathers its tokens' x, runs gate_up,
-    /// SITU and down, and puts the outputs in cpu_out's rows of their pairs, as the CPU team does. self.s waits for it.
+    /// SITU and down (an NVFP4 expert's by moe_nvfp4_g, which decodes each weight once for 32 tokens), and puts the
+    /// outputs in cpu_out's rows of their pairs, as the CPU team does. self.s waits for it.
     /// The experts go through the bounce slots: the host copies each to one once the slot's last upload is done, so
     /// this returns about when the last upload starts.
     fn stream_experts(&mut self, ip: usize, streamed: &[(usize, Vec<(usize, usize)>)]) -> Result<()> {
@@ -1462,13 +1469,22 @@ impl Engine {
         let Some(ps) = self.pf_stream.as_mut() else { return Ok(()) };
         let l = ps.lists_h.as_mut_slice::<u32>();
         let mut i = 0;
-        for (j, (e, pairs)) in streamed.iter().enumerate() {
+        for (j, (_, pairs)) in streamed.iter().enumerate() {
             for &(t, p) in pairs {
-                (l[i], l[cap + i], l[2 * cap + i], l[3 * cap + i]) = ((j % STREAM_SLOTS) as u32, *e as u32, t as u32, p as u32);
+                (l[i], l[cap + i], l[2 * cap + i]) = ((j % STREAM_SLOTS) as u32, t as u32, p as u32);
                 i += 1;
             }
         }
-        cuda::copy_h2d_async(ps.lists.ptr, ps.lists_h.ptr, 4 * cap * 4, &ps.s)?;
+        cuda::copy_h2d_async(ps.lists.ptr, ps.lists_h.ptr, 3 * cap * 4, &ps.s)?;
+        // an NVFP4 expert's gate_up reads its staging slot and the gathered x, its down the activations
+        if matches!(f, Fmt::NvFp4) {
+            let tab = ps.tab_h.as_mut_slice::<u64>();
+            for (j, (e, pairs)) in streamed.iter().enumerate() {
+                let (slot, me) = (j % STREAM_SLOTS, pairs.len() as u64 | (*e as u64) << 32);
+                tab[8 * j..8 * j + 8].copy_from_slice(&[ps.gu.at(slot * gu_b), ps.x.ptr, ps.gu_out.ptr, me, ps.dn.at(slot * dn_b), ps.af.ptr, ps.x.ptr, me]);
+            }
+            cuda::copy_h2d_async(ps.tab.ptr, ps.tab_h.ptr, 64 * streamed.len(), &ps.s)?;
+        }
         ps.t0.record(&self.copy_s)?;
         let mut o = 0;
         for (j, (e, pairs)) in streamed.iter().enumerate() {
@@ -1499,14 +1515,14 @@ impl Engine {
             ps.s.wait(&ps.up[slot])?;
             let m = pairs.len() as u32;
             let at = |k: usize| ps.lists.at(4 * (k * cap + o));
-            let (sl, id, tk, pr) = (at(0), at(1), at(2), at(3));
+            let (sl, tk, pr) = (at(0), at(1), at(2));
             self.k.copy_rows(&ps.s, self.b.xn.ptr, Some(tk), ps.x.ptr, None, n, m)?;
             match f {
                 Fmt::NvFp4 => {
                     let ((gu_a, gu_d), (dn_a, dn_d)) = (self.cache.factor_ptrs(ip, 0), self.cache.factor_ptrs(ip, 1));
-                    self.k.moe_nvfp4_d(&ps.s, ps.gu.ptr, gu_b as u64, sl, id, gu_a, gu_d, ps.x.ptr, n, 0, ps.gu_out.ptr, 2 * ffu, n, m)?;
+                    self.k.moe_nvfp4_g(&ps.s, ps.tab.at(64 * j), gu_a, gu_d, 2 * ffu, n, m, 1)?;
                     self.k.situ(&ps.s, ps.gu_out.ptr, sl, ps.af.ptr, ffu, self.ex.beta, self.ex.lb, m)?;
-                    self.k.moe_nvfp4_d(&ps.s, ps.dn.ptr, dn_b as u64, sl, id, dn_a, dn_d, ps.af.ptr, ffu, 0, ps.x.ptr, n, ffu, m)?;
+                    self.k.moe_nvfp4_g(&ps.s, ps.tab.at(64 * j + 32), dn_a, dn_d, n, ffu, m, 1)?;
                 }
                 Fmt::MxFp8 => {
                     self.k.moe_mxfp8_d(&ps.s, ps.gu.ptr, gu_b as u64, sl, ps.x.ptr, n, 0, ps.gu_out.ptr, 2 * ffu, n, m)?;
@@ -1839,6 +1855,28 @@ impl Engine {
             let bk = &self.cache.banks[f.index()];
             if bk.n_slots >= 8 {
                 time!(format!("experts {f:?} x8: gate_up, act, down"), 8 * (bk.gu_bytes + bk.down_bytes), self.experts_d(ip)?);
+            }
+        }
+        // prefill's gate_up and down of one NVFP4 expert on m tokens, per pair (as the stream runs them) and grouped;
+        // GB/s here are GFLOP/s (2 flops a weight and token)
+        let bk = &self.cache.banks[Fmt::NvFp4.index()];
+        if bk.n_slots >= 1 && matches!(self.ex.fmt[6], Fmt::NvFp4) {
+            let (b, ffu, nn) = (&self.b, hp.n_ff_exp as u32, n as usize);
+            let ((gu_a, gu_d), (dn_a, dn_d)) = (self.cache.factor_ptrs(6, 0), self.cache.factor_ptrs(6, 1));
+            let (gu_b, dn_b) = (bk.gu_bytes as u64, bk.down_bytes as u64);
+            b.slots.upload(&[0i32; T_MAX])?;
+            b.ids.upload(&[0u32; T_MAX])?;
+            for m in [24u32, 64, 256] {
+                let flops = 2 * m as usize * 3 * nn * ffu as usize;
+                time!(format!("NvFp4 expert per pair, {m} tokens"), flops, {
+                    self.k.moe_nvfp4_d(&self.s, bk.gu.ptr, gu_b, b.slots.ptr, b.ids.ptr, gu_a, gu_d, b.xn.ptr, n, 0, b.pf_gu.ptr, 2 * ffu, n, m)?;
+                    self.k.moe_nvfp4_d(&self.s, bk.down.ptr, dn_b, b.slots.ptr, b.ids.ptr, dn_a, dn_d, b.pf_af.ptr, ffu, 0, b.pf_dn.ptr, n, ffu, m)?
+                });
+                let tab = DevBuf::from_slice(&[bk.gu.ptr, b.xn.ptr, b.pf_gu.ptr, m as u64, bk.down.ptr, b.pf_af.ptr, b.pf_dn.ptr, m as u64])?;
+                time!(format!("NvFp4 expert grouped, {m} tokens"), flops, {
+                    self.k.moe_nvfp4_g(&self.s, tab.ptr, gu_a, gu_d, 2 * ffu, n, m, 1)?;
+                    self.k.moe_nvfp4_g(&self.s, tab.at(32), dn_a, dn_d, n, ffu, m, 1)?
+                });
             }
         }
         let maxs = self.maxs as u32;

@@ -308,6 +308,45 @@ fn main() -> Result<(), String> {
         check(&format!("moe_{}_d layer {l} w13, 2 tokens", if nvfp4 { "nvfp4" } else { "mxfp8" }), err, 1e-5, &mut fails);
     }
 
+    // experts, grouped: gate_up and down of 3 NVFP4 experts in one launch, on 1, 33 and 70 tokens of their own (a
+    // tile of tokens and 1 of the next, 2 tiles and 6 of the third); each expert's y has 1 token more, which must stay
+    // 0 (its own seed: the checks after it keep their inputs)
+    {
+        let mut seed = 0x06e0_fa11u64;
+        let (l, es3, ms) = (0usize, [17usize, 64, 127], [1usize, 33, 70]);
+        for w in ["w13", "w2"] {
+            let (b, slot) = bank(&ck, l, w, &es3)?;
+            let bb = DevBuf::from_slice(&b)?;
+            let (_, rows, kk) = expert_ref(&ck, l, w, 0)?;
+            let p = |n: &str| format!("model.llm.layers.{l}.mlp.experts.{w}_weight_{n}");
+            let (ba, bn) = (DevBuf::from_slice(&ck.floats(&p("amax"))?)?, DevBuf::from_slice(&ck.floats(&p("outer_scale_denominator"))?)?);
+            let xs: Vec<Vec<f32>> = ms.iter().map(|&m| (0..m * kk).map(|_| rnd(&mut seed) * 2.0).collect()).collect();
+            let (mut bufs, mut tab) = (vec![], vec![]);
+            for (i, x) in xs.iter().enumerate() {
+                let (bx, by) = (DevBuf::from_slice(x)?, DevBuf::zeroed((ms[i] + 1) * rows * 4, &s)?);
+                tab.extend([bb.at(i * slot), bx.ptr, by.ptr, ms[i] as u64 | (es3[i] as u64) << 32]);
+                bufs.push((bx, by));
+            }
+            let bt = DevBuf::from_slice(&tab)?;
+            k.moe_nvfp4_g(&s, bt.ptr, ba.ptr, bn.ptr, rows as u32, kk as u32, 70, 3)?;
+            s.sync()?;
+            let mut err = 0f64;
+            for (i, (_, by)) in bufs.iter().enumerate() {
+                let y: Vec<f32> = by.download((ms[i] + 1) * rows)?;
+                let (wr, _, _) = expert_ref(&ck, l, w, es3[i])?;
+                for t in 0..ms[i] {
+                    let xt = &xs[i][t * kk..][..kk];
+                    let want: Vec<f64> = (0..rows).map(|r| (0..kk).map(|c| wr[r * kk + c] * xt[c] as f64).sum()).collect();
+                    err = err.max(rel_err(&y[t * rows..][..rows], &want));
+                }
+                if y[ms[i] * rows..].iter().any(|&v| v != 0.0) {
+                    fails.push(format!("moe_nvfp4_g layer {l} {w}: wrote past expert {i}'s tokens"));
+                }
+            }
+            check(&format!("moe_nvfp4_g layer {l} {w}, 1, 33, 70 tokens"), err, 1e-5, &mut fails);
+        }
+    }
+
     // the prefill combine of 3 tokens: the GPU's pairs, then the CPU's added
     {
         let (nt, nn) = (3usize, 2304usize);
@@ -399,6 +438,39 @@ fn main() -> Result<(), String> {
             }
         }
         check("moe_nvfp4_d made up: codes, subnormal scales", err, 1e-5, &mut fails);
+        // the same slots grouped: experts 2 and 5 on 3 and 40 tokens of their own. A tile's rows past the 64 read the
+        // last one. (Its own seed: the checks after it keep their inputs.)
+        let mut seed = 0x0005_eed6u64;
+        let (eg, ms) = ([2usize, 5], [3usize, 40]);
+        let xg: Vec<Vec<f32>> = ms.iter().map(|&m| (0..m * kk).map(|_| rnd(&mut seed) * 2.0).collect()).collect();
+        let (mut bufs, mut tab) = (vec![], vec![]);
+        for (i, x) in xg.iter().enumerate() {
+            let (bx, by) = (DevBuf::from_slice(x)?, DevBuf::zeroed(ms[i] * rows * 4, &s)?);
+            tab.extend([bb.at(eg[i] * slot), bx.ptr, by.ptr, ms[i] as u64 | (eg[i] as u64) << 32]);
+            bufs.push((bx, by));
+        }
+        let bt = DevBuf::from_slice(&tab)?;
+        k.moe_nvfp4_g(&s, bt.ptr, ba.ptr, bn.ptr, rows as u32, kk as u32, 40, 2)?;
+        s.sync()?;
+        let mut err = 0f64;
+        for (i, (_, by)) in bufs.iter().enumerate() {
+            let (e, y): (usize, Vec<f32>) = (eg[i], by.download(ms[i] * rows)?);
+            let f = amax[e] as f64 / den[0] as f64;
+            for t in 0..ms[i] {
+                for r in 0..rows {
+                    let (mut want, mut l1) = (0f64, 0f64);
+                    for c in 0..kk {
+                        let byte = b[e * slot + r * kk / 2 + c / 2];
+                        let code = if c % 2 == 0 { byte & 15 } else { byte >> 4 };
+                        let wx = E2M1[code as usize] * e4m3(b[e * slot + qb + r * kk / 16 + c / 16]) * f * xg[i][t * kk + c] as f64;
+                        want += wx;
+                        l1 += wx.abs();
+                    }
+                    err = err.max((y[t * rows + r] as f64 - want).abs() / l1.max(1e-30));
+                }
+            }
+        }
+        check("moe_nvfp4_g made up: codes, subnormal scales", err, 1e-5, &mut fails);
     }
 
     // experts on the CPU: every row of two experts' gate_up and down, the matrices views of the checkpoint's bytes

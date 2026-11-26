@@ -1713,6 +1713,207 @@ pub mod gpu {
         }
     }
 
+    /// y[t] = W x[t] for the m tokens of an NVFP4 expert, one expert per tab entry (grid.z). tab[4 z ..] holds w, x, y,
+    /// then m and the expert e as two u32s. w is the expert's slot, read as moe_nvfp4_d reads one: the codes
+    /// [rows][k/2], then the E4M3 scales [rows][k/16]. x is [m][k] f32 and y is [m][rows], and the factor is
+    /// amax[e] / denom[0]. A block takes 128 rows by 32 tokens, so that each weight is decoded once for 32 tokens.
+    /// c goes by 32: W's [128][32], decoded to f32 times their scales (exactly), and x's [32][32] wait in shared memory
+    /// as [32][128] and [32][32]. Thread t, lane l of warp w, sums rows 4 g .. 4 g + 4 and 64 + 4 g .. for tokens
+    /// 4 h .. 4 h + 4 (g = l % 8 + 8 (w % 2), h = l / 8 + 4 (w / 2)), each over c in order. A warp then reads 128
+    /// contiguous bytes of W's tile and 64 of x's. Rows past `rows` and tokens past m read the last one and are not
+    /// stored. Blocks past an expert's tokens return at once: the grid is sized for the largest m. k is a multiple
+    /// of 32, rows a multiple of 4.
+    #[reqntid(128)]
+    pub unsafe extern "ptx-kernel" fn moe_nvfp4_g(tab: *const u64, amax: *const f32, denom: *const f32, rows: u32, k: u32) {
+        let ws: shared<[f32; 4096], 16>;
+        let xs: shared<[f32; 1024], 16>;
+        let (z, zi, t0, m, e): (u32, u32, u32, u32, u32);
+        let ta: u64;
+        mov.u32(z, ctaid.z);
+        shl.b32(zi, z, 2);
+        mad.wide.u32(ta, zi, 8, tab);
+        ld.global.u32(m, [ta + 24]);
+        ld.global.u32(e, [ta + 28]);
+        mov.u32(t0, ctaid.y);
+        shl.b32(t0, t0, 5);
+        let idle: pred;
+        setp.ge.u32(idle, t0, m);
+        if idle {
+            ret();
+        }
+        let (wz, xz, yz): (u64, u64, u64);
+        ld.global.u64(wz, [ta]);
+        ld.global.u64(xz, [ta + 8]);
+        ld.global.u64(yz, [ta + 16]);
+        let (t, tl, tw, r0, lim): (u32, u32, u32, u32, u32);
+        mov.u32(t, tid.x);
+        and.b32(tl, t, 31);
+        shr.u32(tw, t, 5);
+        mov.u32(r0, ctaid.x);
+        shl.b32(r0, r0, 7);
+        // the tiles' loads: thread t brings the 32 codes (16 bytes) and 2 scales of row t, and 8 floats of token t % 32
+        // (8 (t / 32) ..)
+        let (wr, xt, xc, half, qbytes, sk, o): (u32, u32, u32, u32, u32, u32, u32);
+        add.u32(wr, r0, t);
+        sub.u32(lim, rows, 1);
+        min.u32(wr, wr, lim);
+        add.u32(xt, t0, tl);
+        sub.u32(lim, m, 1);
+        min.u32(xt, xt, lim);
+        shl.b32(xc, tw, 3);
+        shr.u32(half, k, 1);
+        mul.lo.u32(qbytes, rows, half);
+        shr.u32(sk, k, 4);
+        let (qa, sa, xa): (u64, u64, u64);
+        mad.wide.u32(qa, wr, half, wz);
+        mad.lo.u32(o, wr, sk, qbytes);
+        cvt.u64.u32(sa, o);
+        add.u64(sa, sa, wz);
+        mad.lo.u32(o, xt, k, xc);
+        mad.wide.u32(xa, o, 4, xz);
+        // row t's value c goes to [c][t] of W's tile, at wst + 512 c; value j of token t % 32 to [8 (t / 32) + j][t % 32]
+        // of x's, at xst + 128 j: a warp's 32 stores reach 32 banks
+        let (wsb, xsb, wst, xst): (u32, u32, u32, u32);
+        mov.u32(wsb, ws);
+        mov.u32(xsb, xs);
+        mad.lo.u32(wst, t, 4, wsb);
+        mad.lo.u32(xst, tl, 4, xsb);
+        mad.lo.u32(xst, tw, 1024, xst);
+        // the thread reads [c][4 g ..] and [c][64 + 4 g ..] of W's tile, and [c][4 h ..] of x's
+        let (g, h, q, ard, brd): (u32, u32, u32, u32, u32);
+        and.b32(g, tl, 7);
+        and.b32(q, tw, 1);
+        mad.lo.u32(g, q, 8, g);
+        shr.u32(h, tl, 3);
+        shr.u32(q, tw, 1);
+        mad.lo.u32(h, q, 4, h);
+        mad.lo.u32(ard, g, 16, wsb);
+        mad.lo.u32(brd, h, 16, xsb);
+        let (k120, f120): (u32, f32);
+        mov.u32(k120, 0x7B80_0000);
+        mov.b32(f120, k120);
+        let acc: [f32; 32];
+        for i in 0..32 {
+            mov.f32(acc[i], 0.0);
+        }
+        let (wv, s16, xv): ([u32; 4], u16, [f32; 8]);
+        ld.global.nc.v4.u32((wv[0], wv[1], wv[2], wv[3]), [qa]);
+        ld.global.nc.u16(s16, [sa]);
+        ld.global.nc.v4.f32((xv[0], xv[1], xv[2], xv[3]), [xa]);
+        ld.global.nc.v4.f32((xv[4], xv[5], xv[6], xv[7]), [xa + 16]);
+        // A step waits until every warp has read the tiles, fills them from the registers, waits again, loads the next
+        // step's codes and x into the registers and sums the tiles meanwhile.
+        let k0: u32;
+        mov.u32(k0, 0);
+        label(top);
+        bar.sync(0);
+        // the scales of values 0..15 and 16..31, as moe_nvfp4_d decodes them
+        let (sc, e0, e1): (u32, u32, u32);
+        let (s0, s1): (f32, f32);
+        cvt.u32.u16(sc, s16);
+        shl.b32(e0, sc, 20);
+        and.b32(e0, e0, 0x07F0_0000);
+        shl.b32(e1, sc, 12);
+        and.b32(e1, e1, 0x07F0_0000);
+        mov.b32(s0, e0);
+        mov.b32(s1, e1);
+        mul.rn.f32(s0, s0, f120);
+        mul.rn.f32(s1, s1, f120);
+        for j in 0..4 {
+            for kk in 0..4 {
+                // word j's codes kk, kk + 4 (values 8 j + kk, 8 j + kk + 4) times 2^-14, as moe_nvfp4_d decodes them,
+                // times their scale: the products are exact
+                let (sh, a, sg, hv): (u32, u32, u32, u32);
+                let (h0, h1): (f16, f16);
+                let (f0, f1): (f32, f32);
+                if kk == 3 {
+                    shr.u32(sh, wv[j], 3);
+                } else {
+                    shl.b32(sh, wv[j], 9 - 4 * kk);
+                }
+                and.b32(a, sh, 0x1E00_1E00);
+                and.b32(sg, sh, 0x1000_1000);
+                mad.lo.u32(hv, sg, 7, a);
+                mov.b32((h0, h1), hv);
+                cvt.f32.f16(f0, h0);
+                cvt.f32.f16(f1, h1);
+                if j < 2 {
+                    mul.rn.f32(f0, f0, s0);
+                    mul.rn.f32(f1, f1, s0);
+                } else {
+                    mul.rn.f32(f0, f0, s1);
+                    mul.rn.f32(f1, f1, s1);
+                }
+                st.shared.f32([wst + (512 * (8 * j + kk))], f0);
+                st.shared.f32([wst + (512 * (8 * j + kk + 4))], f1);
+            }
+        }
+        for j in 0..8 {
+            st.shared.f32([xst + (128 * j)], xv[j]);
+        }
+        bar.sync(0);
+        let more: pred;
+        add.u32(k0, k0, 32);
+        setp.lt.u32(more, k0, k);
+        if more {
+            add.u64(qa, qa, 16);
+            add.u64(sa, sa, 2);
+            add.u64(xa, xa, 128);
+            ld.global.nc.v4.u32((wv[0], wv[1], wv[2], wv[3]), [qa]);
+            ld.global.nc.u16(s16, [sa]);
+            ld.global.nc.v4.f32((xv[0], xv[1], xv[2], xv[3]), [xa]);
+            ld.global.nc.v4.f32((xv[4], xv[5], xv[6], xv[7]), [xa + 16]);
+        }
+        for c in 0..32 {
+            let a: [f32; 8];
+            let b: [f32; 4];
+            ld.shared.v4.f32((a[0], a[1], a[2], a[3]), [ard + (512 * c)]);
+            ld.shared.v4.f32((a[4], a[5], a[6], a[7]), [ard + (512 * c + 256)]);
+            ld.shared.v4.f32((b[0], b[1], b[2], b[3]), [brd + (128 * c)]);
+            for i in 0..8 {
+                for j in 0..4 {
+                    fma.rn.f32(acc[4 * i + j], a[i], b[j], acc[4 * i + j]);
+                }
+            }
+        }
+        if more {
+            bra(top);
+        }
+        // the expert's factor, as moe_nvfp4_d's: amax / outer_scale_denominator, times the values' 2^14
+        let (aa, am, den, es): (u64, f32, f32, f32);
+        mad.wide.u32(aa, e, 4, amax);
+        ld.global.nc.f32(am, [aa]);
+        ld.global.nc.f32(den, [denom]);
+        div.rn.f32(es, am, den);
+        mul.rn.f32(es, es, 16384.0);
+        // y[t0 + 4 h + j][r0 + 4 g + 64 p + i] for i in 0..4: one store of 4 rows
+        let (rb, tb): (u32, u32);
+        mad.lo.u32(rb, g, 4, r0);
+        mad.lo.u32(tb, h, 4, t0);
+        for p in 0..2 {
+            let r: u32;
+            let rin: pred;
+            add.u32(r, rb, 64 * p);
+            setp.lt.u32(rin, r, rows);
+            for j in 0..4 {
+                let (tk, yo): (u32, u32);
+                let ya: u64;
+                let ok: pred;
+                let v: [f32; 4];
+                add.u32(tk, tb, j);
+                setp.lt.and.u32(ok, tk, m, rin);
+                mad.lo.u32(yo, tk, rows, r);
+                mad.wide.u32(ya, yo, 4, yz);
+                for i in 0..4 {
+                    mul.rn.f32(v[i], acc[4 * (4 * p + i) + j], es);
+                }
+                if ok {
+                    st.global.v4.f32([ya], (v[0], v[1], v[2], v[3]));
+                }
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- split-K decode attention
 
     /// One chunk of 2^cs keys (cs at most 8) of one kv head, for its 3 query heads: scores (scale q.k + relative bias -

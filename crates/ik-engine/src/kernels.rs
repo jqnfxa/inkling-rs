@@ -238,6 +238,15 @@ impl Kernels {
         self.run(s, "moe_nvfp4_d", (pairs, rows.div_ceil(64), 1), 128, &[&bank, &slot_bytes, &slots, &ids, &amax, &denom, &x, &xstride, &xshift, &y, &rows, &k])
     }
 
+    /// y = W x for the tokens of `nz` NVFP4 experts in one launch, each weight decoded once for 32 tokens. tab[4 z ..]
+    /// holds the expert's slot (codes, then scales), x [m][k] f32 and y [m][rows], then m and the expert e as two u32s;
+    /// the factor is amax[e] / denom[0]. `max_m` is the largest m.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_nvfp4_g(&self, s: &Stream, tab: P, amax: P, denom: P, rows: u32, k: u32, max_m: u32, nz: u32) -> Result<()> {
+        assert!(k.is_multiple_of(32) && rows.is_multiple_of(4) && max_m > 0, "moe_nvfp4_g: rows {rows}, k {k}, m {max_m}");
+        self.run(s, "moe_nvfp4_g", (rows.div_ceil(128), max_m.div_ceil(32), nz), 128, &[&tab, &amax, &denom, &rows, &k])
+    }
+
     /// y = W x for the `pairs` slots on a bank of MXFP8 slots (e4m3 values, then UE8M0 scales): x f32, as moe_nvfp4_d.
     #[allow(clippy::too_many_arguments)]
     pub fn moe_mxfp8_d(&self, s: &Stream, bank: P, slot_bytes: u64, slots: P, x: P, xstride: u32, xshift: u32, y: P, rows: u32, k: u32, pairs: u32) -> Result<()> {
