@@ -2,8 +2,8 @@
 # Download Inkling-2-Mini as Thinking Machines publish it: huggingface.co/thinkingmachines/Inkling-2-Mini at a pinned
 # revision (the weights in safetensors, the MTP head, the tokenizer and configs: 20.2 GB). It checks the free space
 # before it starts, resumes after a dropped connection (and when run again), and gives a file its name only once it
-# matches the hash the Hub lists for it (sha256 for LFS files, the git blob id for the rest). inkling-rs does not read
-# this checkpoint: it runs the unsloth GGUF (see the README).
+# matches the hash the Hub lists for it (sha256 for LFS files, the git blob id for the rest). inkling-rs runs this
+# checkpoint as it is (run-inkling-rs.sh reads it from the default dir).
 #
 # Usage:  tools/fetch-safetensors.sh [dir [glob...]]
 #           dir   where the files go: ~/models/thinkingmachines/Inkling-2-Mini by default

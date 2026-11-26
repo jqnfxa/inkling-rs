@@ -1,5 +1,5 @@
-//! The routed experts: the checkpoint's expert tensors where it is mapped, CPU compute of the misses, and the GPU cache
-//! of hot experts. The cache is keyed by physical layer, so the passes of the loop share it.
+//! The routed experts: a host copy of the checkpoint's expert tensors, CPU compute of the misses, and the GPU cache of
+//! hot experts. The cache is keyed by physical layer, so the passes of the loop share it.
 //!
 //! The checkpoint holds each layer's experts as two matrices, w13 (gate and up, their rows interleaved: gate i is row
 //! 2i, up i row 2i + 1) [E][2 n_ff][n_embd] and w2 (down) [E][n_embd][n_ff], in one of two formats:
@@ -8,9 +8,13 @@
 //!   `weight_amax` F32 [E] over `weight_outer_scale_denominator` F32 [1].
 //! - MXFP8 (layers 20-23): `weight` F8_E4M3 [E][rows][k]; `weight_scale` U8 [E][rows][k/32], 2^(s - 127) each.
 //!
-//! The matrices are views of the mapped files; their pages are read in and page-locked there (no copy), so that cache
-//! uploads are DMA. A GPU cache slot holds one expert's matrix: its part of the codes tensor, then its part of the
-//! scales tensor, copied as they are.
+//! The host copy holds each tensor's bytes as the file has them, on huge pages (the CPU kernels stream them). The
+//! file's pages go from the page cache as they are copied, so the experts are in memory once. Cache uploads copy from
+//! it between tokens. IK_PIN=1 page-locks it, so that uploads are DMA on a copy stream and run during prefill too; an
+//! IOMMU that maps the 15 GB page by page can make that take minutes. IK_MAP_EXPERTS=1 reads the experts where the
+//! file is mapped instead, with no copy: the least memory (the page cache holds them, and may drop them under a memory
+//! limit), but slower CPU experts. A GPU cache slot holds one expert's matrix: its part of the codes tensor, then its
+//! part of the scales tensor, copied as they are.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -121,10 +125,11 @@ impl<'a> Mat<'a> {
     }
 }
 
-/// The experts of one physical layer: where the checkpoint holds their tensors, [E][rows][..], and their factors.
+/// The experts of one physical layer: where their tensors are, [E][rows][..], and their factors.
 pub struct HostExperts {
     pub fmt: Fmt,
-    /// w13's codes and scales: (file, byte offset) of each tensor in the checkpoint
+    /// w13's codes and scales: (file, byte offset) of each tensor in the mapped checkpoint, or (unused, byte offset) in
+    /// the copy
     pub gu: [(usize, usize); 2],
     /// w2's codes and scales
     pub dn: [(usize, usize); 2],
@@ -153,6 +158,48 @@ fn page_ranges(ck: &Checkpoint, mut spans: Vec<(usize, Range<usize>)>) -> Vec<(u
     merged.into_iter().map(|(f, r)| (ck.file(f).as_ptr() as usize + r.start, r.len())).collect()
 }
 
+/// Drops the pages of the mapped file that lie wholly in `b` from the page cache (MADV_PAGEOUT, Linux 5.4; it takes
+/// those no other process maps): the copy holds their bytes now.
+fn page_out(b: &[u8]) {
+    const MADV_PAGEOUT: libc::c_int = 21;
+    let (s, e) = ((b.as_ptr() as usize).next_multiple_of(4096), (b.as_ptr() as usize + b.len()) / 4096 * 4096);
+    if e > s {
+        // SAFETY: whole pages of a read-only file mapping that the checkpoint holds; a later read faults them back in
+        unsafe { libc::madvise(s as *mut libc::c_void, e - s, MADV_PAGEOUT) };
+    }
+}
+
+/// Anonymous memory backed by transparent huge pages (unless IK_NO_HUGE), holding the copy of the experts.
+pub struct HugeMem {
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+unsafe impl Send for HugeMem {}
+unsafe impl Sync for HugeMem {}
+
+impl HugeMem {
+    pub fn new(len: usize) -> Result<HugeMem> {
+        // SAFETY: a fresh private anonymous mapping
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+        if p == libc::MAP_FAILED {
+            return Err(format!("mmap of {len} bytes failed"));
+        }
+        if std::env::var("IK_NO_HUGE").is_err() {
+            unsafe { libc::madvise(p, len, libc::MADV_HUGEPAGE) };
+        }
+        Ok(HugeMem { ptr: p as *mut u8, len })
+    }
+    pub fn slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for HugeMem {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len) };
+    }
+}
+
 /// Reads the mapped range (address, length) in from the file where it is not cached: MADV_POPULATE_READ (Linux 5.14),
 /// else a read of each page.
 fn populate(p: usize, len: usize) {
@@ -169,10 +216,12 @@ fn populate(p: usize, len: usize) {
 }
 
 pub struct Experts {
-    /// the checkpoint, whose mapped expert tensors the matrices view
+    /// the checkpoint, whose mapped expert tensors the matrices view with IK_MAP_EXPERTS
     ck: Arc<Checkpoint>,
-    /// the page-locked ranges of the mapped files that hold the expert tensors (address, length), so that cache uploads
-    /// are DMA and run asynchronously; empty if they could not be locked
+    /// the copy of the expert tensors, which the offsets of `layers` index; None with IK_MAP_EXPERTS
+    copy: Option<HugeMem>,
+    /// the page-locked ranges (address, length), so that cache uploads are DMA and run asynchronously; empty if they
+    /// could not be locked
     locked: Vec<(usize, usize)>,
     pub pinned: bool,
     pub layers: Vec<HostExperts>,
@@ -188,8 +237,9 @@ pub struct Experts {
 }
 
 impl Experts {
-    /// The experts of the checkpoint, read where it is mapped: their tensors are read in from the file and page-locked
-    /// there (unless IK_NO_PIN), not copied.
+    /// The experts of the checkpoint: their tensors copied to huge pages, the copy page-locked with IK_PIN. With
+    /// IK_MAP_EXPERTS, the tensors where the file is mapped, read in (and page-locked there with IK_PIN, if the driver
+    /// can lock read-only memory).
     pub fn new(ck: Arc<Checkpoint>, hp: &Hp) -> Result<Experts> {
         let (n, nff, ne) = (hp.n_embd, hp.n_ff_exp, hp.n_expert);
         // each layer's tensors, checked: (format, [(codes, scales)] of w13 and w2, factors)
@@ -232,36 +282,80 @@ impl Experts {
         let fmt: Vec<Fmt> = layers.iter().map(|l| l.fmt).collect();
         let gu_bytes = [Fmt::NvFp4.bytes(2 * nff, n), Fmt::MxFp8.bytes(2 * nff, n)];
         let down_bytes = [Fmt::NvFp4.bytes(n, nff), Fmt::MxFp8.bytes(n, nff)];
-        let ranges = page_ranges(&ck, spans);
+        let pin = std::env::var("IK_PIN").is_ok();
         let mut locked = vec![];
-        if std::env::var("IK_NO_PIN").is_err() {
+        let mut copy = None;
+        if std::env::var("IK_MAP_EXPERTS").is_ok() {
+            let ranges = page_ranges(&ck, spans);
             let total: usize = ranges.iter().map(|r| r.1).sum();
             let t = std::time::Instant::now();
             ranges.par_iter().for_each(|&(p, len)| populate(p, len));
             eprintln!("experts read in {:.1}s ({} MiB, not copied)", t.elapsed().as_secs_f64(), total >> 20);
-            let t = std::time::Instant::now();
-            for &(p, len) in &ranges {
-                if let Err(e) = crate::cuda::register_host_ro(p as *const u8, len) {
-                    eprintln!("experts not page-locked ({e}): cache uploads stay synchronous");
-                    unlock(&locked);
-                    locked.clear();
-                    break;
+            if pin {
+                let t = std::time::Instant::now();
+                for &(p, len) in &ranges {
+                    if let Err(e) = crate::cuda::register_host_ro(p as *const u8, len) {
+                        eprintln!("experts not page-locked ({e}): cache uploads stay synchronous");
+                        unlock(&locked);
+                        locked.clear();
+                        break;
+                    }
+                    locked.push((p, len));
                 }
-                locked.push((p, len));
+                if !locked.is_empty() {
+                    eprintln!("experts page-locked in {:.1}s", t.elapsed().as_secs_f64());
+                }
             }
-            if !locked.is_empty() {
-                eprintln!("experts page-locked in {:.1}s", t.elapsed().as_secs_f64());
+        } else {
+            // each tensor at a page of its own in the copy; the copy in pieces of 16 MiB for the threads
+            let mut len = 0usize;
+            let mut jobs = vec![];
+            for (i, h) in layers.iter_mut().enumerate() {
+                for (m, at) in [&mut h.gu, &mut h.dn].into_iter().enumerate() {
+                    for (j, at) in at.iter_mut().enumerate() {
+                        let (f, r) = &spans[4 * i + 2 * m + j];
+                        for (c, piece) in ck.file(*f)[r.clone()].chunks(16 << 20).enumerate() {
+                            jobs.push((piece, len + c * (16 << 20)));
+                        }
+                        *at = (0, len);
+                        len = (len + r.len()).next_multiple_of(4096);
+                    }
+                }
             }
+            let mem = HugeMem::new(len)?;
+            let t = std::time::Instant::now();
+            let dst = mem.ptr as usize;
+            jobs.par_iter().for_each(|&(piece, off)| {
+                // SAFETY: disjoint ranges of the fresh mapping
+                let out = unsafe { std::slice::from_raw_parts_mut((dst as *mut u8).add(off), piece.len()) };
+                out.copy_from_slice(piece);
+                page_out(piece);
+            });
+            eprintln!("experts copied in {:.1}s ({} MiB; their pages of the file dropped)", t.elapsed().as_secs_f64(), len >> 20);
+            if pin {
+                let t = std::time::Instant::now();
+                match crate::cuda::register_host(mem.ptr, mem.len) {
+                    Ok(()) => {
+                        locked.push((mem.ptr as usize, mem.len));
+                        eprintln!("experts page-locked in {:.1}s", t.elapsed().as_secs_f64());
+                    }
+                    Err(e) => eprintln!("experts not page-locked ({e}): cache uploads stay synchronous"),
+                }
+            }
+            copy = Some(mem);
         }
         let pinned = !locked.is_empty();
-        Ok(Experts { ck, locked, pinned, layers, fmt, gu_bytes, down_bytes, n_embd: n, n_ff: nff, beta: hp.situ_beta, lb: hp.situ_lb })
+        Ok(Experts { ck, copy, locked, pinned, layers, fmt, gu_bytes, down_bytes, n_embd: n, n_ff: nff, beta: hp.situ_beta, lb: hp.situ_lb })
     }
 
     fn mat(&self, layer: usize, which: [(usize, usize); 2], f: &[f32], e: usize, rows: usize, k: usize) -> Mat<'_> {
         let fmt = self.fmt[layer];
         let (qb, sb) = fmt.parts(rows, k);
-        let [(qf, qo), (sf, so)] = which;
-        Mat { fmt, q: &self.ck.file(qf)[qo + e * qb..][..qb], s: &self.ck.file(sf)[so + e * sb..][..sb], factor: f[e], rows, k }
+        let at = |(file, off): (usize, usize), len: usize| match &self.copy {
+            Some(m) => &m.slice()[off..][..len],
+            None => &self.ck.file(file)[off..][..len],
+        };
+        Mat { fmt, q: at((which[0].0, which[0].1 + e * qb), qb), s: at((which[1].0, which[1].1 + e * sb), sb), factor: f[e], rows, k }
     }
 
     /// Expert e's gate_up of `layer`: 2 n_ff rows of n_embd, gate i in row 2i and up i in row 2i + 1.
@@ -279,7 +373,7 @@ impl Experts {
 
 impl Drop for Experts {
     fn drop(&mut self) {
-        // before the checkpoint (a field) unmaps the files
+        // before the fields (the copy, the checkpoint's mapped files) go
         unlock(&self.locked);
     }
 }

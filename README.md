@@ -1,35 +1,39 @@
 # inkling-rs
 
-An inference engine for [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), as the official
-GGUF ([unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)) holds it, on one laptop:
-RTX 3070 Ti Laptop (8 GB) + i7-12700H + 64 GB DDR4-3200. Written from scratch in Rust; the GPU kernels are written in
+An inference engine for [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) that runs the
+checkpoint as Thinking Machines publish it, from its original weights, on one laptop: RTX 3070 Ti Laptop (8 GB) +
+i7-12700H + 64 GB DDR4-3200. Written from scratch in Rust; the GPU kernels are written in
 [kernite](https://github.com/fxeqxmulfx/kernite). It serves an OpenAI-compatible API and llama.cpp's chat UI.
 
-The model is a mixture of experts (128 experts, 8 per token) whose middle layers run three times per token; at
-UD-Q4_K_XL it is 17.6 GB, so it does not fit in 8 GB of VRAM. The speeds below were measured before the engine moved
-to the official GGUF and are to be measured again.
+The model is a mixture of experts (128 experts, 8 per token) whose middle layers run three times per token; its
+checkpoint is 19 GB, so it does not fit in 8 GB of VRAM. The speeds below were measured before the engine moved to the
+original checkpoint and are to be measured again.
 
 ## Requirements
 
 - Linux on x86-64 with AVX2, FMA and F16C.
 - An NVIDIA GPU with 8 GB and a driver for CUDA 12 (tested: sm_86, driver 550). The kernels are PTX for sm_70 and
   later, built with the crate; no CUDA toolkit is needed.
-- 32 GB of RAM or more: the experts (15.8 GB) stay in page-locked host memory.
+- RAM for the experts. Their copy takes 14.6 GiB, and the whole engine runs within a 20 GB memory limit (tested on
+  30 GB). `IK_MAP_EXPERTS=1` needs less: it leaves the experts in the page cache, but the CPU experts run slower.
 - Rust through rustup: `rust-toolchain.toml` pins 1.100.0, which kernite needs.
-- The model file `Inkling-2-Mini-UD-Q4_K_XL.gguf` (17.6 GB) from unsloth's `Mainline_Support` folder: NVFP4 experts
-  with a scale each in layers 0-19, Q8_0 experts in 20-23, Q8_0 and float small matrices. Other quantizations are not
-  supported.
+- The checkpoint [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini): the
+  safetensors weights (BF16 and F32 dense tensors, ModelOpt NVFP4 experts in layers 0-19, MXFP8 experts in 20-23),
+  `config.json`, `tokenizer.json` and `chat_template.jinja`. The engine reads the tensors as the files store them;
+  nothing is converted at load.
 
 ## Run
 
 ```sh
-tools/fetch-model.sh     # the model, into ~/models/unsloth/ (resumes after a dropped connection)
-tools/fetch-ui.sh        # llama.cpp's chat UI, into ./ui (optional)
-./run-inkling-rs.sh      # builds, then serves on http://127.0.0.1:8080
+tools/fetch-safetensors.sh  # the checkpoint, into ~/models/thinkingmachines/Inkling-2-Mini (resumes, checks hashes)
+tools/fetch-ui.sh           # llama.cpp's chat UI, into ./ui (optional)
+./run-inkling-rs.sh         # builds, then serves on http://127.0.0.1:8080
 ```
 
-Open http://127.0.0.1:8080 to chat. `run-inkling-rs.sh` reads `MODEL`, `CTX` (131072), `PORT`, `HOST` and `IK_THREADS`
-(the CPU expert threads: a count, or a list of CPUs to pin).
+Open http://127.0.0.1:8080 to chat. `run-inkling-rs.sh` reads `MODEL` (the checkpoint's directory), `CTX` (131072),
+`PORT`, `HOST`, `IK_THREADS` (the CPU expert threads: a count, or a list of CPUs to pin) and `MEM_MAX` (20G). The
+server runs in a systemd scope of its own, with that memory limit and no swap. If memory runs out, the server stops,
+not the terminal it was started from (systemd-oomd stops a whole cgroup). `MEM_MAX=` turns the limit off.
 
 ## API
 
@@ -42,7 +46,7 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
 - Sampling: a request's `temperature`, `top_k` (0 = all), `top_p`, `min_p`, `repeat_penalty`, `presence_penalty`,
   `frequency_penalty`, `repeat_last_n`, `seed`; otherwise the server's, set by `--temp`, `--top-k`, `--top-p`, `--min-p`,
   `--repeat-penalty`, `--presence-penalty`, `--frequency-penalty`, `--repeat-last-n` (llama-server's defaults: 1.0,
-  40, 0.95, 0.05, 1.0, 0, 0, 64). Unsloth recommends `--temp 1.0 --top-k 0 --top-p 1.0 --min-p 0` for this model.
+  40, 0.95, 0.05, 1.0, 0, 0, 64). The checkpoint's `generation_config.json` sets temperature 1.0 and no other sampler.
 - The server ends a thinking block (it writes the tokens that close it, then the model answers) at
   `thinking_budget_tokens`, when a finite `max_tokens` has a quarter (at most 1024) left for the answer, or on
   `POST /v1/chat/completions/control {"action": "reasoning_end", "id": <completion id>}`.
@@ -101,21 +105,29 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
 
 ## Design
 
-- Attention, router and output head stay on the GPU. The 3072 routed experts live in host RAM (huge pages,
-  page-locked), repacked at load into the layout the GPU kernels read, which the CPU kernels read too: NVFP4 as rows
-  of E2M1 nibbles (value j of each 64 in the low nibble of byte j, 32 + j in the high one), the UE4M3 scales and the
-  expert's scale; Q8_0 as int8 rows and f16 scales. A VRAM cache holds the hot experts, a bank of slots per format
-  (the Q8_0 bank takes `IK_Q8_SHARE`, 0.15, of it), keyed by physical layer so the three loop passes share them,
-  with LFU admission and uploads (one copy each) on a copy stream.
-- The small BF16 and F32 matrices (projections, loop gates) are quantized to Q8_0 at load, to join the Q8_0 GEMVs
-  they are stacked with.
+- Attention, router and output head stay on the GPU. The 3072 routed experts live in host RAM, on huge pages.
+  - They are copied at load from the checkpoint as it stores them, and the file's pages are dropped from the page
+    cache as they are copied.
+  - The GPU and CPU kernels read the stored formats:
+    - ModelOpt NVFP4: E2M1 pairs (element 2j in the low nibble of byte j), an E4M3 scale per 16, and a factor per
+      expert (`weight_amax` over the denominator).
+    - MXFP8: E4M3 values with a UE8M0 scale per 32.
+  - A VRAM cache holds the hot experts, with LFU admission.
+    - It has a bank of slots per format; the MXFP8 bank takes `IK_MX_SHARE` (0.15) of the VRAM.
+    - It is keyed by physical layer, so the three loop passes share it.
+    - A slot holds an expert's codes, then its scales, copied as they are.
+  - Uploads copy between tokens. `IK_PIN=1` page-locks the copy, so that uploads run on a copy stream, during prefill
+    too. On a Ryzen 5 5600H laptop with its AMD IOMMU on, locking 15 GB took minutes; the plain copy decodes as fast.
+- The dense weights stay as the checkpoint stores them: BF16, and F32 for the residual-mix queries and the router
+  bias. The GEMVs read BF16. The embedding stays in the mapped file; a token's row is converted on the host.
 - Decode is one CUDA graph per token. At each MoE layer the GPU posts the routing to the CPU through pinned memory
   (`router_dispatch`), computes the cached experts while the CPU threads compute the misses (AVX2, int8), and waits on
   a flag (`moe_wait`). No host round trip per layer.
 - The CPU threads take work from shared counters with no barrier; each gate/up chunk also applies the activation and
   quantizes its block for the down projection.
-- Prefill runs ubatches of 256 tokens: dp4a GEMMs, flash-style attention, and experts grouped so each is read once per
-  ubatch (grouped GEMMs on the GPU, batched int8 kernels on the CPU).
+- Prefill runs ubatches of up to 256 tokens. The BF16 GEMVs over the ubatch's tokens and flash-style attention run
+  on the GPU. The experts run on the CPU, grouped so each is read once per ubatch. Prefill is slow until tensor-core
+  BF16 GEMMs and grouped NVFP4/MXFP8 GEMMs move it to the GPU.
 - The KV caches: the sliding-window passes' are int8 with an f16 scale per 32 values, as q8_0 (1088 bytes per position
   and layer pass); the full-attention passes' are int4 (symmetric, stored plus 8, the same scales: 576 bytes).
   Perplexity over 16k tokens of the model's own reasoning: 1.6984 with int8 full-attention caches (`IK_KV=8`), 1.7058
@@ -126,8 +138,8 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
 - The GPU expert kernels decode E2M1 by table lookups in `prmt` (8 values in 13 instructions) for dp4a. In decode a
   warp reads 128 contiguous bytes of each of 4 rows, a thread keeps 4 rows, and x comes through L1 (no shared-memory
   staging, no barrier): the gate_up of 8 NVFP4 experts (2304 x 2304) takes 62 us (388 GB/s), the down 34 us.
-- Kernels follow Marlin where it applies at these batch sizes: weights repacked into aligned layouts, 16-byte loads,
-  int8 activations, one pass over each weight byte.
+- Kernels follow Marlin where it applies at these batch sizes: 16-byte loads and one pass over each weight byte. Here
+  they read the weights in the checkpoint's own layouts, with int8 activations for the NVFP4 experts' dp4a.
 - Serving follows mini-SGLang: HTTP front end, chat template and tokenizer, a scheduler thread that owns the engine, an
   incremental detokenizer and a reply parser (thinking, text, tool calls), SSE.
 
@@ -167,7 +179,7 @@ the average up to it; the hit rate changes with the text, and runs vary 10-20% w
 | `ik-branch <model> [tokens]` | a branch taken at a checkpoint and dropped, against no branch |
 | `ik-kbench`, `ik-kcmp` | GPU kernel timings; new kernels against the ones they replace |
 | `ik-cpubench <model>` | CPU expert kernels on real rows, one token and batched |
-| `ik-moecheck` | the GPU expert kernels (decode and prefill) against the CPU ones, on random banks |
+| `ik-wcheck <model>` | the GPU kernels that read the checkpoint's weights, on its real tensors, against f64 references on the CPU |
 | `ik-attnmass <model> <text> <n>` | how much of the context full attention needs at depth n |
 
 `tools/agentic-check.py [--url U] [--until 90000]` drives one long tool-using turn against a running server and
