@@ -204,26 +204,29 @@ impl Kernels {
         self.run(s, "moe_wait", (1, 1, 1), 32, &[&ack, &params, &step, &err, &timeout_ns])
     }
 
-    /// The SITU activation of the cached experts of `slots`: gate_up [8][2 nff] (gate i row 2i, up i row 2i + 1) to
-    /// af [8][nff], f32.
+    /// The SITU activation of the cached experts of the `pairs` slots: gate_up [pair][2 nff] (gate i row 2i, up i row
+    /// 2i + 1) to af [pair][nff], f32.
     #[allow(clippy::too_many_arguments)]
-    pub fn situ(&self, s: &Stream, gu: P, slots: P, af: P, nff: u32, beta: f32, lb: f32) -> Result<()> {
-        self.run(s, "situ", ((nff / 32).div_ceil(8), 8, 1), 256, &[&gu, &slots, &af, &nff, &beta, &lb])
+    pub fn situ(&self, s: &Stream, gu: P, slots: P, af: P, nff: u32, beta: f32, lb: f32, pairs: u32) -> Result<()> {
+        self.run(s, "situ", ((nff / 32).div_ceil(8), pairs, 1), 256, &[&gu, &slots, &af, &nff, &beta, &lb])
     }
 
-    /// y = W x for the 8 experts of `slots` on a bank of ModelOpt NVFP4 slots (codes, then scales): x f32 (expert j's
-    /// at x + j xstride), expert j's factor amax[ids[j]] / denom[0].
+    /// y = W x for the `pairs` slots (a token's 8, or 8 a token of several) on a bank of ModelOpt NVFP4 slots (codes,
+    /// then scales): x f32 (pair j's at x + (j >> xshift) xstride), pair j's factor amax[ids[j]] / denom[0].
     #[allow(clippy::too_many_arguments)]
-    pub fn moe_nvfp4_d(&self, s: &Stream, bank: P, slot_bytes: u64, slots: P, ids: P, amax: P, denom: P, x: P, xstride: u32, y: P, rows: u32, k: u32) -> Result<()> {
+    pub fn moe_nvfp4_d(
+        &self, s: &Stream, bank: P, slot_bytes: u64, slots: P, ids: P, amax: P, denom: P, x: P, xstride: u32, xshift: u32, y: P, rows: u32, k: u32,
+        pairs: u32,
+    ) -> Result<()> {
         assert!(k % 32 == 0 && k <= 2304, "moe_nvfp4_d: k {k}");
-        self.run(s, "moe_nvfp4_d", (rows.div_ceil(64), 8, 1), 128, &[&bank, &slot_bytes, &slots, &ids, &amax, &denom, &x, &xstride, &y, &rows, &k])
+        self.run(s, "moe_nvfp4_d", (rows.div_ceil(64), pairs, 1), 128, &[&bank, &slot_bytes, &slots, &ids, &amax, &denom, &x, &xstride, &xshift, &y, &rows, &k])
     }
 
-    /// y = W x for the 8 experts of `slots` on a bank of MXFP8 slots (e4m3 values, then UE8M0 scales): x f32.
+    /// y = W x for the `pairs` slots on a bank of MXFP8 slots (e4m3 values, then UE8M0 scales): x f32, as moe_nvfp4_d.
     #[allow(clippy::too_many_arguments)]
-    pub fn moe_mxfp8_d(&self, s: &Stream, bank: P, slot_bytes: u64, slots: P, x: P, xstride: u32, y: P, rows: u32, k: u32) -> Result<()> {
+    pub fn moe_mxfp8_d(&self, s: &Stream, bank: P, slot_bytes: u64, slots: P, x: P, xstride: u32, xshift: u32, y: P, rows: u32, k: u32, pairs: u32) -> Result<()> {
         assert!(k % 128 == 0, "moe_mxfp8_d: k {k}");
-        self.run(s, "moe_mxfp8_d", (rows.div_ceil(64), 8, 1), 128, &[&bank, &slot_bytes, &slots, &x, &xstride, &y, &rows, &k])
+        self.run(s, "moe_mxfp8_d", (rows.div_ceil(64), pairs, 1), 128, &[&bank, &slot_bytes, &slots, &x, &xstride, &xshift, &y, &rows, &k])
     }
 
     pub fn router_topk(&self, s: &Stream, logits: P, bias: P, ids: P, wts: P, scale: f32) -> Result<()> {
@@ -296,9 +299,11 @@ impl Kernels {
         )
     }
 
+    /// out = (add ? out : 0) + the weighted sum of the GPU's pairs (gpu) or of the others (src [pair][n]).
     #[allow(clippy::too_many_arguments)]
-    pub fn moe_combine_t(&self, s: &Stream, gpu: P, cpu: P, slots: P, wts: P, out: P, n: u32, ntok: u32) -> Result<()> {
-        self.run(s, "moe_combine_t", (n.div_ceil(256), ntok, 1), 256, &[&gpu, &cpu, &slots, &wts, &out, &n])
+    pub fn moe_combine_t(&self, s: &Stream, src: P, slots: P, wts: P, out: P, n: u32, ntok: u32, gpu: bool, add: bool) -> Result<()> {
+        let (g, a) = (gpu as u32, add as u32);
+        self.run(s, "moe_combine_t", (n.div_ceil(256), ntok, 1), 256, &[&src, &slots, &wts, &out, &n, &g, &a])
     }
 
     // ---------------------------------------------------------------- fused decode

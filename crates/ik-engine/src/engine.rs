@@ -48,6 +48,8 @@ const HOST_MARGIN: usize = 1 << 30;
 const STAGE_ROWS: usize = 4096;
 /// floats of attn_prefill's state between passes, per token and kv head: m[3], l[3], acc[3][128]
 const PF_STATE: usize = 390;
+/// Prefill runs the pairs of cached experts on the GPU this many tokens at a time.
+const PF_GROUP: usize = 32;
 
 /// Decode attention: keys per chunk of attn_part, log2, of the sliding-window layers (16 chunks of the window) and of
 /// the full ones.
@@ -144,6 +146,11 @@ struct BatchBufs {
     host_xn: HostBuf,
     host_slots: HostBuf,
     cpu_out: HostBuf,
+    /// the GPU's pairs of PF_GROUP tokens: gate_up [8 PF_GROUP][2 n_ff], activations [8 PF_GROUP][n_ff], down
+    /// [8 PF_GROUP][n]
+    pf_gu: DevBuf,
+    pf_af: DevBuf,
+    pf_dn: DevBuf,
 }
 
 /// Storage of the depth blocks and loop banks.
@@ -392,6 +399,9 @@ impl Engine {
             host_xn: HostBuf::new(4 * tm * n)?,
             host_slots: HostBuf::new(4 * tm * 8)?,
             cpu_out: HostBuf::new(4 * tm * 8 * n)?,
+            pf_gu: f(8 * PF_GROUP * 2 * hp.n_ff_exp)?,
+            pf_af: f(8 * PF_GROUP * hp.n_ff_exp)?,
+            pf_dn: f(8 * PF_GROUP * n)?,
         };
         // the expert cache and the full-attention KV rows share what is free once the rest exists, less a margin for
         // the CUDA graph and the driver (IK_VRAM_MARGIN_MIB, default 160); the KV rows take memory as the context grows
@@ -1282,8 +1292,9 @@ impl Engine {
         Ok(())
     }
 
-    /// The experts of a ubatch: the host groups the (token, expert) pairs by expert, and the CPU team computes them all
-    /// (the GPU has no grouped kernels for NVFP4 and MXFP8 experts yet).
+    /// The experts of a ubatch. The (token, expert) pairs of cached experts run on the GPU, PF_GROUP tokens at a time,
+    /// while the host groups the others by expert and the CPU team computes them; their outputs are added to the GPU's
+    /// once the team is done.
     fn moe_t(&mut self, ip: usize, nt: usize) -> Result<()> {
         let n = self.hp.n_embd;
         let nu = n as u32;
@@ -1294,30 +1305,62 @@ impl Engine {
         let t1 = std::time::Instant::now();
         self.stats.pf_gpu_s += (t1 - t0).as_secs_f64();
         let ids: Vec<u32> = self.b.host_ids.as_slice::<u32>()[..nt * 8].to_vec();
+        let slots: Vec<i32> = ids.iter().map(|&e| self.cache.slot_of[ip][e as usize]).collect();
         let mut groups: Vec<(usize, Vec<(usize, usize)>)> = vec![];
         let mut gi: HashMap<usize, usize> = HashMap::new();
-        for (p, &e) in ids.iter().enumerate() {
+        for (p, &e) in ids.iter().enumerate().filter(|&(p, _)| slots[p] < 0) {
             let g = *gi.entry(e as usize).or_insert_with(|| {
                 groups.push((e as usize, vec![]));
                 groups.len() - 1
             });
             groups[g].1.push((p / 8, p));
         }
-        // no pair on a GPU slot
-        self.b.host_slots.as_mut_slice::<i32>()[..nt * 8].fill(-1);
+        self.b.host_slots.as_mut_slice::<i32>()[..nt * 8].copy_from_slice(&slots);
         cuda::copy_h2d_async(self.b.slots.ptr, self.b.host_slots.ptr, nt * 8 * 4, &self.s)?;
-        self.stats.pf_cpu_pairs += (nt * 8) as u64;
+        let on_gpu = slots.iter().filter(|&&s| s >= 0).count();
+        self.stats.pf_gpu_pairs += on_gpu as u64;
+        self.stats.pf_cpu_pairs += (nt * 8 - on_gpu) as u64;
+        // the CPU team counts the uses of its pairs; these are the GPU's
+        if on_gpu > 0 {
+            let mut u = self.pool.usage.lock().unwrap();
+            for (&e, _) in ids.iter().zip(&slots).filter(|&(_, &s)| s >= 0) {
+                u.freq[ip][e as usize] += 1.0;
+            }
+        }
+        let spans: Vec<(usize, usize, bool)> = (0..nt)
+            .step_by(PF_GROUP)
+            .map(|ta| {
+                let tb = (ta + PF_GROUP).min(nt);
+                (ta, tb, slots[8 * ta..8 * tb].iter().any(|&s| s >= 0))
+            })
+            .collect();
+        for &(ta, tb, gpu) in &spans {
+            if gpu {
+                self.experts_pf(ip, ta, tb)?;
+            }
+        }
         let x = self.b.host_xn.as_slice::<f32>()[..nt * n].to_vec();
         let t3 = std::time::Instant::now();
-        self.pool.run_batch(crate::cpu_pool::BatchJob { layer: ip, x, misses: groups, out: self.b.cpu_out.ptr as usize });
+        if !groups.is_empty() {
+            self.pool.run_batch(crate::cpu_pool::BatchJob { layer: ip, x, misses: groups, out: self.b.cpu_out.ptr as usize });
+        }
         let t4 = std::time::Instant::now();
         self.stats.pf_host_s += (t3 - t1).as_secs_f64();
         self.stats.pf_cpu_s += (t4 - t3).as_secs_f64();
-        // the slots are all -1: the combine reads only the CPU's outputs
+        // the CPU's pairs, added to the GPU's where a group has some
         let cpu = self.b.cpu_out.dev;
-        self.k.moe_combine_t(&self.s, cpu, cpu, self.b.slots.ptr, self.b.wts.ptr, self.b.moe.ptr, nu, nt as u32)?;
-        // the cache keeps up during long prompts: uploads run on the copy stream meanwhile
+        for &(ta, tb, gpu) in &spans {
+            let (b, nn) = (&self.b, n * 4);
+            self.k.moe_combine_t(&self.s, cpu + (8 * ta * nn) as u64, b.slots.at(4 * 8 * ta), b.wts.at(4 * 8 * ta), b.moe.at(ta * nn), nu, (tb - ta) as u32, false, gpu)?;
+        }
+        // the cache keeps up during long prompts: uploads run on the copy stream meanwhile, after the GPU's pairs have
+        // read the slots they may take
         if self.ex.pinned {
+            if on_gpu > 0 {
+                let ev = cuda::Event::new(false)?;
+                ev.record(&self.s)?;
+                self.copy_s.wait(&ev)?;
+            }
             self.admit_d(false)?;
         }
         Ok(())
@@ -1549,20 +1592,45 @@ impl Engine {
         let (sc, f) = (&self.sc, self.ex.fmt[ip]);
         let bk = &self.cache.banks[f.index()];
         let (gu_b, dn_b) = (bk.gu_bytes as u64, bk.down_bytes as u64);
-        let situ = || self.k.situ(&self.s, sc.gu.ptr, sc.slots.ptr, sc.af.ptr, ffu, self.ex.beta, self.ex.lb);
+        let situ = || self.k.situ(&self.s, sc.gu.ptr, sc.slots.ptr, sc.af.ptr, ffu, self.ex.beta, self.ex.lb, 8);
         match f {
             Fmt::NvFp4 => {
                 let ((gu_a, gu_d), (dn_a, dn_d)) = (self.cache.factor_ptrs(ip, 0), self.cache.factor_ptrs(ip, 1));
-                self.k.moe_nvfp4_d(&self.s, bk.gu.ptr, gu_b, sc.slots.ptr, sc.ids.ptr, gu_a, gu_d, sc.xn.ptr, 0, sc.gu.ptr, 2 * ffu, n)?;
+                self.k.moe_nvfp4_d(&self.s, bk.gu.ptr, gu_b, sc.slots.ptr, sc.ids.ptr, gu_a, gu_d, sc.xn.ptr, 0, 0, sc.gu.ptr, 2 * ffu, n, 8)?;
                 situ()?;
-                self.k.moe_nvfp4_d(&self.s, bk.down.ptr, dn_b, sc.slots.ptr, sc.ids.ptr, dn_a, dn_d, sc.af.ptr, ffu, sc.dn.ptr, n, ffu)
+                self.k.moe_nvfp4_d(&self.s, bk.down.ptr, dn_b, sc.slots.ptr, sc.ids.ptr, dn_a, dn_d, sc.af.ptr, ffu, 0, sc.dn.ptr, n, ffu, 8)
             }
             Fmt::MxFp8 => {
-                self.k.moe_mxfp8_d(&self.s, bk.gu.ptr, gu_b, sc.slots.ptr, sc.xn.ptr, 0, sc.gu.ptr, 2 * ffu, n)?;
+                self.k.moe_mxfp8_d(&self.s, bk.gu.ptr, gu_b, sc.slots.ptr, sc.xn.ptr, 0, 0, sc.gu.ptr, 2 * ffu, n, 8)?;
                 situ()?;
-                self.k.moe_mxfp8_d(&self.s, bk.down.ptr, dn_b, sc.slots.ptr, sc.af.ptr, ffu, sc.dn.ptr, n, ffu)
+                self.k.moe_mxfp8_d(&self.s, bk.down.ptr, dn_b, sc.slots.ptr, sc.af.ptr, ffu, 0, sc.dn.ptr, n, ffu, 8)
             }
         }
+    }
+
+    /// The pairs of tokens ta..tb on cached experts (b.slots), on the GPU: gate_up, SITU and down of each, and their
+    /// weighted sum into those tokens' rows of b.moe.
+    fn experts_pf(&self, ip: usize, ta: usize, tb: usize) -> Result<()> {
+        let (n, ffu) = (self.hp.n_embd as u32, self.hp.n_ff_exp as u32);
+        let (b, f) = (&self.b, self.ex.fmt[ip]);
+        let bk = &self.cache.banks[f.index()];
+        let (gu_b, dn_b) = (bk.gu_bytes as u64, bk.down_bytes as u64);
+        let pairs = 8 * (tb - ta) as u32;
+        let (slots, ids, x) = (b.slots.at(4 * 8 * ta), b.ids.at(4 * 8 * ta), b.xn.at(4 * n as usize * ta));
+        match f {
+            Fmt::NvFp4 => {
+                let ((gu_a, gu_d), (dn_a, dn_d)) = (self.cache.factor_ptrs(ip, 0), self.cache.factor_ptrs(ip, 1));
+                self.k.moe_nvfp4_d(&self.s, bk.gu.ptr, gu_b, slots, ids, gu_a, gu_d, x, n, 3, b.pf_gu.ptr, 2 * ffu, n, pairs)?;
+                self.k.situ(&self.s, b.pf_gu.ptr, slots, b.pf_af.ptr, ffu, self.ex.beta, self.ex.lb, pairs)?;
+                self.k.moe_nvfp4_d(&self.s, bk.down.ptr, dn_b, slots, ids, dn_a, dn_d, b.pf_af.ptr, ffu, 0, b.pf_dn.ptr, n, ffu, pairs)?;
+            }
+            Fmt::MxFp8 => {
+                self.k.moe_mxfp8_d(&self.s, bk.gu.ptr, gu_b, slots, x, n, 3, b.pf_gu.ptr, 2 * ffu, n, pairs)?;
+                self.k.situ(&self.s, b.pf_gu.ptr, slots, b.pf_af.ptr, ffu, self.ex.beta, self.ex.lb, pairs)?;
+                self.k.moe_mxfp8_d(&self.s, bk.down.ptr, dn_b, slots, b.pf_af.ptr, ffu, 0, b.pf_dn.ptr, n, ffu, pairs)?;
+            }
+        }
+        self.k.moe_combine_t(&self.s, b.pf_dn.ptr, slots, b.wts.at(4 * 8 * ta), b.moe.at(4 * n as usize * ta), n, (tb - ta) as u32, true, false)
     }
 
     /// Times each kernel kind on layer 6's buffers: (name, microseconds per call, bytes read per call).

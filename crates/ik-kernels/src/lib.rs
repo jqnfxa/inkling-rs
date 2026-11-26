@@ -1090,9 +1090,9 @@ pub mod gpu {
 
     // ---------------------------------------------------------------- MoE experts on the GPU
 
-    /// The SITU activation of the cached experts' gate_up ([8][2 nff], the checkpoint's rows: gate i is row 2i, up i
-    /// row 2i + 1): beta tanh(g/beta) sigmoid(g) lb tanh(u/lb), f32 (`af` [8][nff]). A warp per block of 32, grid.y = 8
-    /// experts.
+    /// The SITU activation of the cached experts' gate_up ([pair][2 nff], the checkpoint's rows: gate i is row 2i, up i
+    /// row 2i + 1): beta tanh(g/beta) sigmoid(g) lb tanh(u/lb), f32 (`af` [pair][nff]). A warp per block of 32, grid.y =
+    /// the pairs, as in moe_nvfp4_d.
     #[maxntid(256)]
     pub unsafe extern "ptx-kernel" fn situ(gu: *const f32, slots: *const i32, af: *mut f32, nff: u32, beta: f32, lb: f32) {
         let ke: u32;
@@ -1141,10 +1141,11 @@ pub mod gpu {
         st.global.f32([afa], a);
     }
 
-    /// y = W x for the 8 experts of `slots` (grid.y) on a bank of ModelOpt NVFP4 slots: the expert's codes as the
-    /// checkpoint has them ([rows][k/2], element 2j of a row in the low nibble of byte j), then its E4M3 scales
-    /// ([rows][k/16]). The expert's factor is amax[ids[ke]] / denom[0]. x is f32, the same for all experts (xstride 0)
-    /// or each expert's at x + ke xstride. 8 lanes per row (16-byte chunks of 32 elements, two scale blocks: a warp
+    /// y = W x for the pairs of `slots` (grid.y: a token's 8 experts, or in prefill 8 pairs a token of several tokens) on
+    /// a bank of ModelOpt NVFP4 slots: the expert's codes as the checkpoint has them ([rows][k/2], element 2j of a row in
+    /// the low nibble of byte j), then its E4M3 scales ([rows][k/16]). The expert's factor is amax[ids[ke]] / denom[0].
+    /// x is f32, the same for all pairs (xstride 0) or pair ke's at x + (ke >> xshift) xstride: shift 3 for each token's
+    /// own x. 8 lanes per row (16-byte chunks of 32 elements, two scale blocks: a warp
     /// reads 128 contiguous bytes of each of 4 rows), a thread takes 4 rows (r + 16i), 64 rows per block of 128
     /// threads; x from shared memory. k a multiple of 32, at most 2304.
     ///
@@ -1159,7 +1160,7 @@ pub mod gpu {
     #[minnctapersm(4)]
     pub unsafe extern "ptx-kernel" fn moe_nvfp4_d(
         bank: *const u8, slot_bytes: u64, slots: *const i32, ids: *const u32, amax: *const f32, denom: *const f32, x: *const f32,
-        xstride: u32, y: *mut f32, rows: u32, kdim: u32,
+        xstride: u32, xshift: u32, y: *mut f32, rows: u32, kdim: u32,
     ) {
         let ke: u32;
         mov.u32(ke, ctaid.y);
@@ -1172,7 +1173,8 @@ pub mod gpu {
             ret();
         }
         let aoff: u32;
-        mul.lo.u32(aoff, ke, xstride);
+        shr.u32(aoff, ke, xshift);
+        mul.lo.u32(aoff, aoff, xstride);
         let xk: u64;
         mad.wide.u32(xk, aoff, 4, x);
         let (t, lr, bk, row0, last): (u32, u32, u32, u32, u32);
@@ -1407,14 +1409,15 @@ pub mod gpu {
         }
     }
 
-    /// y = W x for the 8 experts of `slots` (grid.y) on a bank of MXFP8 slots: the expert's e4m3 values as the
-    /// checkpoint has them ([rows][k]), then its UE8M0 scales ([rows][k/32], 2^(s-127) each). x is f32, the same for all
-    /// experts (xstride 0) or each expert's at x + ke xstride. 8 lanes per row (16-byte chunks of 16 values: a warp reads
+    /// y = W x for the pairs of `slots` (grid.y, as in moe_nvfp4_d) on a bank of MXFP8 slots: the expert's e4m3 values as
+    /// the checkpoint has them ([rows][k]), then its UE8M0 scales ([rows][k/32], 2^(s-127) each). x is f32, the same for
+    /// all pairs (xstride 0) or pair ke's at x + (ke >> xshift) xstride. 8 lanes per row (16-byte chunks of 16 values: a warp reads
     /// 128 contiguous bytes of each of 4 rows), a thread takes 4 rows (r + 16i), 64 rows per block of 128 threads; x
     /// through L1. k a multiple of 128.
     #[reqntid(128)]
     pub unsafe extern "ptx-kernel" fn moe_mxfp8_d(
-        bank: *const u8, slot_bytes: u64, slots: *const i32, x: *const f32, xstride: u32, y: *mut f32, rows: u32, kdim: u32,
+        bank: *const u8, slot_bytes: u64, slots: *const i32, x: *const f32, xstride: u32, xshift: u32, y: *mut f32, rows: u32,
+        kdim: u32,
     ) {
         let ke: u32;
         mov.u32(ke, ctaid.y);
@@ -1427,7 +1430,8 @@ pub mod gpu {
             ret();
         }
         let aoff: u32;
-        mul.lo.u32(aoff, ke, xstride);
+        shr.u32(aoff, ke, xshift);
+        mul.lo.u32(aoff, aoff, xstride);
         let xk: u64;
         mad.wide.u32(xk, aoff, 4, x);
         let (t, lr, bk, row0, last): (u32, u32, u32, u32, u32);
@@ -2530,9 +2534,11 @@ pub mod gpu {
 
     // ---------------------------------------------------------------- grouped experts (prefill)
 
-    /// out[t][c] = sum_k wts[t][k] * (slots[t][k] >= 0 ? gpu[8t + k][c] : cpu[8t + k][c]); grid.y = token.
+    /// out[t][c] = (add ? out[t][c] : 0) + sum_k wts[t][k] src[8t + k][c] over the pairs on the GPU (slots[t][k] >= 0)
+    /// if gpu is set, else over the others, in k order: the GPU's pairs when they are done, then the CPU's added to them.
+    /// grid.y = token.
     #[maxntid(256)]
-    pub unsafe extern "ptx-kernel" fn moe_combine_t(gpu: *const f32, cpu: *const f32, slots: *const i32, wts: *const f32, out: *mut f32, n: u32) {
+    pub unsafe extern "ptx-kernel" fn moe_combine_t(src: *const f32, slots: *const i32, wts: *const f32, out: *mut f32, n: u32, gpu: u32, add: u32) {
         let (b, nt, t, c, tk): (u32, u32, u32, u32, u32);
         mov.u32(b, ctaid.x);
         mov.u32(nt, ntid.x);
@@ -2544,8 +2550,17 @@ pub mod gpu {
         if past {
             ret();
         }
+        let (oi, oa): (u32, u64);
+        mad.lo.u32(oi, tk, n, c);
+        mad.wide.u32(oa, oi, 4, out);
         let acc: f32;
         mov.f32(acc, 0.0);
+        let (adding, want): (pred, pred);
+        setp.ne.u32(adding, add, 0);
+        if adding {
+            ld.global.f32(acc, [oa]);
+        }
+        setp.ne.u32(want, gpu, 0);
         for k in 0..8 {
             let s: s32;
             let wv: f32;
@@ -2556,23 +2571,18 @@ pub mod gpu {
             mad.wide.u32(wa, pi, 4, wts);
             ld.global.s32(s, [sa]);
             ld.global.f32(wv, [wa]);
-            let on_gpu: pred;
+            let (on_gpu, other): (pred, pred);
             setp.ge.s32(on_gpu, s, 0);
-            let (o, ga, ca): (u32, u64, u64);
+            xor.pred(other, on_gpu, want);
+            let (o, ga): (u32, u64);
             let v: f32;
             mad.lo.u32(o, pi, n, c);
-            mad.wide.u32(ga, o, 4, gpu);
-            mad.wide.u32(ca, o, 4, cpu);
-            if on_gpu {
+            mad.wide.u32(ga, o, 4, src);
+            if !other {
                 ld.global.f32(v, [ga]);
-            } else {
-                ld.global.f32(v, [ca]);
+                fma.rn.f32(acc, wv, v, acc);
             }
-            fma.rn.f32(acc, wv, v, acc);
         }
-        let (oi, oa): (u32, u64);
-        mad.lo.u32(oi, tk, n, c);
-        mad.wide.u32(oa, oi, 4, out);
         st.global.f32([oa], acc);
     }
 

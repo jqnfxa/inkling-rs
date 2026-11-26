@@ -44,6 +44,7 @@ unsafe extern "C" {
     fn cuStreamCreate(s: *mut CUstream, flags: c_uint) -> CUresult;
     fn cuStreamDestroy_v2(s: CUstream) -> CUresult;
     fn cuStreamSynchronize(s: CUstream) -> CUresult;
+    fn cuStreamWaitEvent(s: CUstream, e: CUevent, flags: c_uint) -> CUresult;
     fn cuEventCreate(e: *mut CUevent, flags: c_uint) -> CUresult;
     fn cuEventDestroy_v2(e: CUevent) -> CUresult;
     fn cuEventRecord(e: CUevent, s: CUstream) -> CUresult;
@@ -170,6 +171,10 @@ impl Stream {
     }
     pub fn sync(&self) -> Result<()> {
         ck!(cuStreamSynchronize(self.0))
+    }
+    /// The work queued on the stream from now on waits for the work the event was recorded after.
+    pub fn wait(&self, e: &Event) -> Result<()> {
+        ck!(cuStreamWaitEvent(self.0, e.0, 0))
     }
     pub fn begin_capture(&self) -> Result<()> {
         ck!(cuStreamBeginCapture_v2(self.0, 2)) // relaxed

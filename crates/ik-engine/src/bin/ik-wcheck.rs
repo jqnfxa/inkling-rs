@@ -223,9 +223,9 @@ fn main() -> Result<(), String> {
             if nvfp4 {
                 let p = |n: &str| format!("model.llm.layers.{l}.mlp.experts.{w}_weight_{n}");
                 let (ba, bn) = (DevBuf::from_slice(&ck.floats(&p("amax"))?)?, DevBuf::from_slice(&ck.floats(&p("outer_scale_denominator"))?)?);
-                k.moe_nvfp4_d(&s, bb.ptr, slot as u64, bslots.ptr, bids.ptr, ba.ptr, bn.ptr, bx.ptr, xstride as u32, by.ptr, rows as u32, kk as u32)?;
+                k.moe_nvfp4_d(&s, bb.ptr, slot as u64, bslots.ptr, bids.ptr, ba.ptr, bn.ptr, bx.ptr, xstride as u32, 0, by.ptr, rows as u32, kk as u32, 8)?;
             } else {
-                k.moe_mxfp8_d(&s, bb.ptr, slot as u64, bslots.ptr, bx.ptr, xstride as u32, by.ptr, rows as u32, kk as u32)?;
+                k.moe_mxfp8_d(&s, bb.ptr, slot as u64, bslots.ptr, bx.ptr, xstride as u32, 0, by.ptr, rows as u32, kk as u32, 8)?;
             }
             s.sync()?;
             let y: Vec<f32> = by.download(8 * rows)?;
@@ -245,6 +245,67 @@ fn main() -> Result<(), String> {
             }
             check(&format!("moe_{}_d layer {l} {w}", if nvfp4 { "nvfp4" } else { "mxfp8" }), err, 1e-5, &mut fails);
         }
+    }
+
+    // experts, prefill: gate_up of the 16 pairs of 2 tokens, each token's x its own (x + (pair >> 3) k), the second
+    // token's slots in reverse; pairs 3 and 12 not cached
+    let sl16: Vec<i32> = (0..16).map(|j| if j == 3 || j == 12 { -1 } else if j < 8 { j } else { 15 - j }).collect();
+    let id16: Vec<u32> = sl16.iter().map(|&s| es[s.max(0) as usize] as u32).collect();
+    let (bsl16, bid16) = (DevBuf::from_slice(&sl16)?, DevBuf::from_slice(&id16)?);
+    for l in [0usize, 21] {
+        let (b, slot) = bank(&ck, l, "w13", &es)?;
+        let bb = DevBuf::from_slice(&b)?;
+        let (_, rows, kk) = expert_ref(&ck, l, "w13", 0)?;
+        let x: Vec<f32> = (0..2 * kk).map(|_| rnd(&mut seed) * 2.0).collect();
+        let (bx, by) = (DevBuf::from_slice(&x)?, DevBuf::zeroed(16 * rows * 4, &s)?);
+        let nvfp4 = ck.tensor(&format!("model.llm.layers.{l}.mlp.experts.w13_weight"))?.dtype == Dtype::U8;
+        if nvfp4 {
+            let p = |n: &str| format!("model.llm.layers.{l}.mlp.experts.w13_weight_{n}");
+            let (ba, bn) = (DevBuf::from_slice(&ck.floats(&p("amax"))?)?, DevBuf::from_slice(&ck.floats(&p("outer_scale_denominator"))?)?);
+            k.moe_nvfp4_d(&s, bb.ptr, slot as u64, bsl16.ptr, bid16.ptr, ba.ptr, bn.ptr, bx.ptr, kk as u32, 3, by.ptr, rows as u32, kk as u32, 16)?;
+        } else {
+            k.moe_mxfp8_d(&s, bb.ptr, slot as u64, bsl16.ptr, bx.ptr, kk as u32, 3, by.ptr, rows as u32, kk as u32, 16)?;
+        }
+        s.sync()?;
+        let y: Vec<f32> = by.download(16 * rows)?;
+        let mut err = 0f64;
+        for (j, &sj) in sl16.iter().enumerate() {
+            let out = &y[j * rows..(j + 1) * rows];
+            if sj < 0 {
+                if out.iter().any(|&v| v != 0.0) {
+                    fails.push(format!("layer {l} w13, 2 tokens: an uncached pair's outputs were written"));
+                }
+                continue;
+            }
+            let (wr, _, _) = expert_ref(&ck, l, "w13", es[sj as usize])?;
+            let xe = &x[j / 8 * kk..][..kk];
+            let want: Vec<f64> = (0..rows).map(|r| (0..kk).map(|c| wr[r * kk + c] * xe[c] as f64).sum()).collect();
+            err = err.max(rel_err(out, &want));
+        }
+        check(&format!("moe_{}_d layer {l} w13, 2 tokens", if nvfp4 { "nvfp4" } else { "mxfp8" }), err, 1e-5, &mut fails);
+    }
+
+    // the prefill combine of 3 tokens: the GPU's pairs, then the CPU's added
+    {
+        let (nt, nn) = (3usize, 2304usize);
+        let sl: Vec<i32> = (0..8 * nt as i32).map(|p| if p % 3 == 0 { -1 } else { p % 5 }).collect();
+        let w: Vec<f32> = (0..8 * nt).map(|_| rnd(&mut seed).abs()).collect();
+        let g: Vec<f32> = (0..8 * nt * nn).map(|_| rnd(&mut seed)).collect();
+        let c: Vec<f32> = (0..8 * nt * nn).map(|_| rnd(&mut seed)).collect();
+        let (bsl, bw, bg, bc) = (DevBuf::from_slice(&sl)?, DevBuf::from_slice(&w)?, DevBuf::from_slice(&g)?, DevBuf::from_slice(&c)?);
+        let bo = DevBuf::zeroed(nt * nn * 4, &s)?;
+        k.moe_combine_t(&s, bg.ptr, bsl.ptr, bw.ptr, bo.ptr, nn as u32, nt as u32, true, false)?;
+        k.moe_combine_t(&s, bc.ptr, bsl.ptr, bw.ptr, bo.ptr, nn as u32, nt as u32, false, true)?;
+        s.sync()?;
+        let out: Vec<f32> = bo.download(nt * nn)?;
+        let mut err = 0f64;
+        for t in 0..nt {
+            let want: Vec<f64> = (0..nn)
+                .map(|i| (8 * t..8 * t + 8).map(|p| w[p] as f64 * if sl[p] >= 0 { g[p * nn + i] } else { c[p * nn + i] } as f64).sum())
+                .collect();
+            err = err.max(rel_err(&out[t * nn..(t + 1) * nn], &want));
+        }
+        check("moe_combine_t, the GPU's pairs then the CPU's", err, 1e-6, &mut fails);
     }
 
     // NVFP4 on made-up slots, for what the real tensors may hold little of: every code byte in each row, and E4M3
@@ -271,7 +332,7 @@ fn main() -> Result<(), String> {
         let (all, ids8): (Vec<i32>, Vec<u32>) = ((0..8).collect(), (0..8).collect());
         let (bb, ba, bn, bx) = (DevBuf::from_slice(&b)?, DevBuf::from_slice(&amax)?, DevBuf::from_slice(&den)?, DevBuf::from_slice(&x)?);
         let (bs8, bi8, by) = (DevBuf::from_slice(&all)?, DevBuf::from_slice(&ids8)?, DevBuf::zeroed(8 * rows * 4, &s)?);
-        k.moe_nvfp4_d(&s, bb.ptr, slot as u64, bs8.ptr, bi8.ptr, ba.ptr, bn.ptr, bx.ptr, 0, by.ptr, rows as u32, kk as u32)?;
+        k.moe_nvfp4_d(&s, bb.ptr, slot as u64, bs8.ptr, bi8.ptr, ba.ptr, bn.ptr, bx.ptr, 0, 0, by.ptr, rows as u32, kk as u32, 8)?;
         s.sync()?;
         let y: Vec<f32> = by.download(8 * rows)?;
         let mut err = 0f64;
@@ -328,7 +389,7 @@ fn main() -> Result<(), String> {
     let gu: Vec<f32> = (0..8 * 2 * nff).map(|_| rnd(&mut seed) * 6.0).collect();
     let bgu = DevBuf::from_slice(&gu)?;
     let baf = DevBuf::zeroed(8 * nff * 4, &s)?;
-    k.situ(&s, bgu.ptr, bslots.ptr, baf.ptr, nff as u32, 4.0, 25.0)?;
+    k.situ(&s, bgu.ptr, bslots.ptr, baf.ptr, nff as u32, 4.0, 25.0, 8)?;
     s.sync()?;
     let af: Vec<f32> = baf.download(8 * nff)?;
     let mut e_af = 0f64;
