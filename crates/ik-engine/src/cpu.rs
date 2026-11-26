@@ -14,7 +14,26 @@ pub(crate) fn simd() -> bool {
     false
 }
 
-/// Row r of `m` . x (k values), the expert's factor left out (the caller applies m.scale()).
+/// Where element i of the activations goes in the order that [`dot_row`] takes them for rows of `fmt`. NVFP4: in each
+/// block of 16 its 8 even elements, then its 8 odd ones, as the kernel decodes the low and the high nibbles of a
+/// block's bytes into vectors of their own. MXFP8: as they are.
+#[inline]
+pub fn x_pos(fmt: Fmt, i: usize) -> usize {
+    match fmt {
+        Fmt::NvFp4 => (i & !15) | ((i & 1) << 3) | ((i & 15) >> 1),
+        Fmt::MxFp8 => i,
+    }
+}
+
+/// `x` in the order that [`dot_row`] takes it for rows of `fmt` (see [`x_pos`]), into out[..x.len()].
+pub fn order_x(fmt: Fmt, x: &[f32], out: &mut [f32]) {
+    for (i, &v) in x.iter().enumerate() {
+        out[x_pos(fmt, i)] = v;
+    }
+}
+
+/// Row r of `m` . x (k values), the expert's factor left out (the caller applies m.scale()). x is in the order of
+/// [`order_x`].
 pub fn dot_row(m: &Mat, r: usize, x: &[f32]) -> f32 {
     assert!(x.len() >= m.k, "x of {} values for rows of {}", x.len(), m.k);
     #[cfg(target_arch = "x86_64")]
@@ -27,7 +46,8 @@ pub fn dot_row(m: &Mat, r: usize, x: &[f32]) -> f32 {
             }
         };
     }
-    dot_row_scalar(m, r, x)
+    let xn: Vec<f32> = (0..m.k).map(|i| x[x_pos(m.fmt, i)]).collect();
+    dot_row_scalar(m, r, &xn)
 }
 
 /// The scalar reference of [`dot_row`].
@@ -115,22 +135,77 @@ pub(crate) unsafe fn e2m1x64(q: *const u8, lut: __m256i) -> [__m256; 8] {
     }
 }
 
-/// NVFP4 row . x (k a multiple of 64): 64 values a step, each block of 16 summed before its scale, the 4 blocks of a
-/// step in sums of their own.
+/// The bf16 of each E2M1 code (sign c & 8, magnitude c & 7), which is its value exactly: 0, 0.5, 1, 1.5, 2, 3, 4, 6.
+const E2M1_BF16: [u16; 16] = {
+    const MAG: [u16; 8] = [0x0000, 0x3F00, 0x3F80, 0x3FC0, 0x4000, 0x4040, 0x4080, 0x40C0];
+    let mut t = [0u16; 16];
+    let mut c = 0;
+    while c < 16 {
+        t[c] = MAG[c & 7] | if c & 8 != 0 { 0x8000 } else { 0 };
+        c += 1;
+    }
+    t
+};
+
+/// For pshufb, in both 128-bit lanes: the low (`hi` false) or the high byte of E2M1_BF16 of each code.
+const fn e2m1_bf16_bytes(hi: bool) -> [u8; 32] {
+    let mut t = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        let v = E2M1_BF16[i & 15];
+        t[i] = if hi { (v >> 8) as u8 } else { v as u8 };
+        i += 1;
+    }
+    t
+}
+const E2M1_LO: [u8; 32] = e2m1_bf16_bytes(false);
+const E2M1_HI: [u8; 32] = e2m1_bf16_bytes(true);
+
+/// An NVFP4 scale byte's magnitude (sign ignored, as e4m3_abs): normal ones the f32 of exponent e - 7 over their 3
+/// mantissa bits, subnormal ones m 2^-9.
+pub(crate) const E4M3_ABS: [f32; 128] = {
+    let mut t = [0f32; 128];
+    let mut v = 0;
+    while v < 128 {
+        t[v] = if v < 8 { v as f32 / 512.0 } else { f32::from_bits(((v as u32) << 20) + (120 << 23)) };
+        v += 1;
+    }
+    t
+};
+
+/// NVFP4 row . x (k a multiple of 64, x in the order of x_pos): 64 values a step, each block of 16 summed before its
+/// scale, the 4 blocks of a step in sums of their own. The codes go to the bf16 of their values by two table lookups
+/// (pshufb) and to f32 by putting the bf16 in the high half of a lane; the step's dwords are first permuted so that
+/// each vector of 8 holds the even or the odd elements of one block.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma,f16c")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn dot_nvfp4_avx2(q: &[u8], s: &[u8], x: &[f32]) -> f32 {
     unsafe {
-        let lut = e2m1_lut();
+        let (lo_t, hi_t) = (_mm256_loadu_si256(E2M1_LO.as_ptr() as *const __m256i), _mm256_loadu_si256(E2M1_HI.as_ptr() as *const __m256i));
+        let (z, m4) = (_mm256_setzero_si256(), _mm256_set1_epi8(0xF));
+        // dwords [0 2 4 6 | 1 3 5 7]: each lane holds one half of every block (a block is 2 dwords)
+        let perm = _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);
         let mut acc = [_mm256_setzero_ps(); 4];
         let (qp, sp, xp) = (q.as_ptr(), s.as_ptr(), x.as_ptr());
         for c in 0..q.len() / 32 {
-            let w = e2m1x64(qp.add(32 * c), lut);
+            let r = _mm256_permutevar8x32_epi32(_mm256_loadu_si256(qp.add(32 * c) as *const __m256i), perm);
+            let (ev, od) = (_mm256_and_si256(r, m4), _mm256_and_si256(_mm256_srli_epi16(r, 4), m4));
+            let (el, eh) = (_mm256_shuffle_epi8(lo_t, ev), _mm256_shuffle_epi8(hi_t, ev));
+            let (ol, oh) = (_mm256_shuffle_epi8(lo_t, od), _mm256_shuffle_epi8(hi_t, od));
+            // bf16 of the even (odd) elements: e01 holds blocks 0 and 1, e23 blocks 2 and 3
+            let (e01, e23) = (_mm256_unpacklo_epi8(el, eh), _mm256_unpackhi_epi8(el, eh));
+            let (o01, o23) = (_mm256_unpacklo_epi8(ol, oh), _mm256_unpackhi_epi8(ol, oh));
+            let w = [
+                (_mm256_unpacklo_epi16(z, e01), _mm256_unpacklo_epi16(z, o01)),
+                (_mm256_unpackhi_epi16(z, e01), _mm256_unpackhi_epi16(z, o01)),
+                (_mm256_unpacklo_epi16(z, e23), _mm256_unpacklo_epi16(z, o23)),
+                (_mm256_unpackhi_epi16(z, e23), _mm256_unpackhi_epi16(z, o23)),
+            ];
             let xb = xp.add(64 * c);
             for (b, a) in acc.iter_mut().enumerate() {
-                let p = _mm256_mul_ps(w[2 * b], _mm256_loadu_ps(xb.add(16 * b)));
-                let p = _mm256_fmadd_ps(w[2 * b + 1], _mm256_loadu_ps(xb.add(16 * b + 8)), p);
-                *a = _mm256_fmadd_ps(p, _mm256_set1_ps(E4M3_X2_14[(*sp.add(4 * c + b) & 0x7F) as usize]), *a);
+                let p = _mm256_mul_ps(_mm256_castsi256_ps(w[b].0), _mm256_loadu_ps(xb.add(16 * b)));
+                let p = _mm256_fmadd_ps(_mm256_castsi256_ps(w[b].1), _mm256_loadu_ps(xb.add(16 * b + 8)), p);
+                *a = _mm256_fmadd_ps(p, _mm256_set1_ps(E4M3_ABS[(*sp.add(4 * c + b) & 0x7F) as usize]), *a);
             }
         }
         hsum(_mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3])))
@@ -261,6 +336,26 @@ pub(crate) mod tests {
     fn scale_table() {
         for v in 0..128u8 {
             assert_eq!(E4M3_X2_14[v as usize].to_bits(), (e4m3_abs(v) * 16384.0).to_bits(), "{v:#x}");
+            assert_eq!(E4M3_ABS[v as usize].to_bits(), e4m3_abs(v).to_bits(), "{v:#x}");
+        }
+    }
+
+    #[test]
+    fn e2m1_bf16_table() {
+        for c in 0..16 {
+            assert_eq!(f32::from_bits((E2M1_BF16[c] as u32) << 16), FP4X2[c] as f32 * 0.5, "code {c}");
+        }
+    }
+
+    #[test]
+    fn x_order() {
+        for fmt in [Fmt::NvFp4, Fmt::MxFp8] {
+            let mut seen = vec![false; 2304];
+            for i in 0..2304 {
+                let p = x_pos(fmt, i);
+                assert!(p / 16 == i / 16 && !seen[p], "{fmt:?} {i} -> {p}");
+                seen[p] = true;
+            }
         }
     }
 
@@ -311,9 +406,11 @@ pub(crate) mod tests {
                 let (q, s) = random_mat(fmt, 3, k, odd, &mut seed);
                 let m = Mat { fmt, q: &q, s: &s, factor: 1.0, rows: 3, k };
                 let x = random_x(k, &mut seed);
+                let mut xo = vec![0f32; k];
+                order_x(fmt, &x, &mut xo);
                 for r in 0..3 {
                     let (want, l1) = dot_f64(&m, r, &x);
-                    for (name, got) in [("dot_row", dot_row(&m, r, &x)), ("scalar", dot_row_scalar(&m, r, &x))] {
+                    for (name, got) in [("dot_row", dot_row(&m, r, &xo)), ("scalar", dot_row_scalar(&m, r, &x))] {
                         assert!((got as f64 - want).abs() <= 1e-5 * l1, "{fmt:?} k {k} row {r} {name}: {got} vs f64 {want} (sum of |w x| {l1})");
                     }
                 }

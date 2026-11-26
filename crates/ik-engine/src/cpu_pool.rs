@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
-use crate::cpu::dot_row;
+use crate::cpu::{dot_row, order_x, x_pos};
 use crate::cpu_batch::dot_tokens;
 use crate::cuda::HostBuf;
 use crate::experts::Experts;
@@ -282,17 +282,16 @@ fn run_decode(sh: &Shared, cx: &Ctx, t: usize, epoch: u32) {
                 let (m, blk) = (c / (nff / ACT), c % (nff / ACT));
                 let gu = ex.gate_up(w.layer, w.misses[m].1);
                 let sg = gu.scale();
-                let mut act = [0f32; ACT];
-                for (i, a) in act.iter_mut().enumerate() {
+                let acts = w.acts[m].as_ptr() as *mut f32;
+                for i in blk * ACT..(blk + 1) * ACT {
                     // gate i in row 2i, up i in row 2i + 1
-                    let r = 2 * (blk * ACT + i);
-                    let gv = dot_row(&gu, r, &w.x) * sg;
-                    let uv = dot_row(&gu, r + 1, &w.x) * sg;
+                    let gv = dot_row(&gu, 2 * i, &w.x) * sg;
+                    let uv = dot_row(&gu, 2 * i + 1, &w.x) * sg;
                     let s = ex.beta * (gv / ex.beta).tanh() / (1.0 + (-gv).exp());
-                    *a = s * ex.lb * (uv / ex.lb).tanh();
+                    // SAFETY: the activations of block `blk` of miss m (ACT a multiple of 16, so their places in the
+                    // order of the down rows too) are written by this chunk alone, and read only after all are done
+                    unsafe { *acts.add(x_pos(gu.fmt, i)) = s * ex.lb * (uv / ex.lb).tanh() };
                 }
-                // SAFETY: block `blk` of miss m is written by this chunk alone, and read only after all are done
-                unsafe { std::ptr::copy_nonoverlapping(act.as_ptr(), (w.acts[m].as_ptr() as *mut f32).add(blk * ACT), ACT) };
                 sh.gu_done.fetch_add(1, Ordering::Release);
             }
         }
@@ -476,8 +475,8 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
             w.misses.extend((0..8).filter(|&k| slots[k] < 0).map(|k| (k, ids[k])));
             // SAFETY: host-mapped memory the GPU wrote before seq
             let x = unsafe { std::slice::from_raw_parts(job.add(JOB_X) as *const f32, n) };
-            w.x.clear();
-            w.x.extend_from_slice(x);
+            w.x.resize(n, 0.0);
+            order_x(cx.ex.fmt[layer], x, &mut w.x);
             if w.acts.len() < n_miss {
                 w.acts.resize_with(n_miss, || vec![0.0; nff]);
             }

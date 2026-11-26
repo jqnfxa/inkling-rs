@@ -3,7 +3,7 @@
 //! bound. The references are scalar Rust in f64, with no SIMD: they take the tensors' bytes from `Checkpoint` and
 //! decode the stored formats themselves, and take the same f32 inputs as the kernels.
 use ik_engine::checkpoint::{Checkpoint, Dtype};
-use ik_engine::cpu::dot_row;
+use ik_engine::cpu::{dot_row, order_x};
 use ik_engine::cuda::{Ctx, DevBuf, Stream};
 use ik_engine::experts::{Fmt, Mat as XMat};
 use ik_engine::kernels::Kernels;
@@ -312,7 +312,9 @@ fn main() -> Result<(), String> {
             let mut err = 0f64;
             for e in [3usize, 127] {
                 let m = XMat { fmt, q: &ck.bytes(t)[e * qb..][..qb], s: &ck.bytes(st)[e * sb..][..sb], factor: factors[e], rows, k: kk };
-                let got: Vec<f32> = (0..rows).map(|r| dot_row(&m, r, &x) * m.scale()).collect();
+                let mut xo = vec![0f32; kk];
+                order_x(fmt, &x, &mut xo);
+                let got: Vec<f32> = (0..rows).map(|r| dot_row(&m, r, &xo) * m.scale()).collect();
                 let (wr, _, _) = expert_ref(&ck, l, w, e)?;
                 let want: Vec<f64> = (0..rows).map(|r| (0..kk).map(|c| wr[r * kk + c] * xs[c]).sum()).collect();
                 err = err.max(rel_err(&got, &want));

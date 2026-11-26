@@ -1,7 +1,7 @@
 //! CPU expert kernels on real rows: single-token dots vs the batched kernel, one thread: `ik-cpubench <checkpoint dir>`.
 //! Layer 3 (NVFP4) and the first MXFP8 layer, 8 experts each, read once per pass.
 use ik_engine::checkpoint::Checkpoint;
-use ik_engine::cpu::dot_row;
+use ik_engine::cpu::{dot_row, order_x};
 use ik_engine::cpu_batch::dot_tokens;
 use ik_engine::experts::{Experts, Fmt, Mat};
 use ik_engine::hp::Hp;
@@ -19,6 +19,11 @@ fn main() -> Result<(), String> {
     let x: Vec<f32> = (0..hp.n_embd).map(|i| ((i * 7919 % 1000) as f32 / 500.0) - 1.0).collect();
     let layers = [Some(3), ex.fmt.iter().position(|&f| f == Fmt::MxFp8)];
     for layer in layers.into_iter().flatten() {
+        // dot_row takes the activations in its order, the batched kernel as they are
+        let mut xo = vec![0f32; hp.n_embd];
+        order_x(ex.fmt[layer], &x, &mut xo);
+        let mut ao = vec![0f32; hp.n_ff_exp];
+        order_x(ex.fmt[layer], &x[..hp.n_ff_exp], &mut ao);
         let (xq, aq) = (&x[..], &x[..hp.n_ff_exp]);
         for nt in [1usize, 4, 8] {
             let xs: Vec<&[f32]> = (0..nt).map(|_| xq).collect();
@@ -29,7 +34,7 @@ fn main() -> Result<(), String> {
             for e in 0..8 {
                 let gu = ex.gate_up(layer, e);
                 for r in 0..gu.rows {
-                    if nt == 1 { s += dot_row(&gu, r, xq) } else { dot_tokens(&gu, r, &xs, &mut out); s += out[0] }
+                    if nt == 1 { s += dot_row(&gu, r, &xo) } else { dot_tokens(&gu, r, &xs, &mut out); s += out[0] }
                 }
                 bytes += self::bytes(&gu);
             }
@@ -38,7 +43,7 @@ fn main() -> Result<(), String> {
             for e in 8..16 {
                 let dn = ex.down(layer, e);
                 for r in 0..dn.rows {
-                    if nt == 1 { s += dot_row(&dn, r, aq) } else { dot_tokens(&dn, r, &as_, &mut out); s += out[0] }
+                    if nt == 1 { s += dot_row(&dn, r, &ao) } else { dot_tokens(&dn, r, &as_, &mut out); s += out[0] }
                 }
                 bytes2 += self::bytes(&dn);
             }
@@ -50,12 +55,12 @@ fn main() -> Result<(), String> {
             let gu = ex.gate_up(layer, 40);
             let mut s = 0f32;
             for r in 0..gu.rows {
-                s += dot_row(&gu, r, &xq);
+                s += dot_row(&gu, r, &xo);
             }
             let (t0, mut bytes) = (std::time::Instant::now(), 0usize);
             while t0.elapsed().as_secs_f64() < 1.0 {
                 for r in 0..gu.rows {
-                    s += dot_row(&gu, r, &xq);
+                    s += dot_row(&gu, r, &xo);
                 }
                 bytes += self::bytes(&gu);
             }
@@ -69,7 +74,7 @@ fn main() -> Result<(), String> {
             for pass in v.iter_mut() {
                 let t0 = std::time::Instant::now();
                 for r in 0..gu.rows {
-                    s += dot_row(&gu, r, &xq);
+                    s += dot_row(&gu, r, &xo);
                 }
                 *pass = bytes(&gu) as f64 / t0.elapsed().as_secs_f64() / 1e9;
             }
@@ -79,10 +84,12 @@ fn main() -> Result<(), String> {
     // the pool's ceiling: n threads, each through its own NVFP4 experts for a second, either the same 2 again and again
     // (from the caches) or a new one each time (from RAM)
     let layer = 3;
+    let mut xo = vec![0f32; hp.n_embd];
+    order_x(ex.fmt[layer], &x, &mut xo);
     for warm in [true, false] {
         for nt in [1usize, 4, 8, 12] {
             let ex = &ex;
-            let xq = &x[..];
+            let xq = &xo[..];
             let stop = std::sync::atomic::AtomicBool::new(false);
             let bytes = std::sync::atomic::AtomicU64::new(0);
             let t0 = std::time::Instant::now();
