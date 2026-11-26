@@ -33,8 +33,6 @@ unsafe extern "C" {
     fn cuMemHostAlloc(p: *mut *mut c_void, n: usize, flags: c_uint) -> CUresult;
     fn cuMemFreeHost(p: *mut c_void) -> CUresult;
     fn cuMemHostGetDevicePointer_v2(d: *mut CUdeviceptr, p: *mut c_void, flags: c_uint) -> CUresult;
-    fn cuMemHostRegister_v2(p: *mut c_void, n: usize, flags: c_uint) -> CUresult;
-    fn cuMemHostUnregister(p: *mut c_void) -> CUresult;
     fn cuMemcpyHtoD_v2(dst: CUdeviceptr, src: *const c_void, n: usize) -> CUresult;
     fn cuMemcpyDtoH_v2(dst: *mut c_void, src: CUdeviceptr, n: usize) -> CUresult;
     fn cuMemcpyHtoDAsync_v2(dst: CUdeviceptr, src: *const c_void, n: usize, s: CUstream) -> CUresult;
@@ -476,20 +474,6 @@ impl Drop for HostBuf {
     fn drop(&mut self) {
         unsafe { cuMemFreeHost(self.ptr as *mut c_void) };
     }
-}
-
-/// Page-locks an existing host range so that uploads from it run as DMA.
-pub fn register_host(p: *const u8, len: usize) -> Result<()> {
-    ck!(cuMemHostRegister_v2(p as *mut c_void, len, 0x01)) // PORTABLE
-}
-
-/// Page-locks a read-only host range (a mapped file; page-aligned), which the GPU only reads.
-pub fn register_host_ro(p: *const u8, len: usize) -> Result<()> {
-    ck!(cuMemHostRegister_v2(p as *mut c_void, len, 0x01 | 0x08)) // PORTABLE | READ_ONLY
-}
-
-pub fn unregister_host(p: *const u8) -> Result<()> {
-    ck!(cuMemHostUnregister(p as *mut c_void))
 }
 
 pub struct Module(CUmodule);

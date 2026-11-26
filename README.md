@@ -116,8 +116,8 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
     - It has a bank of slots per format; the MXFP8 bank takes `IK_MX_SHARE` (0.15) of the VRAM.
     - It is keyed by physical layer, so the three loop passes share it.
     - A slot holds an expert's codes, then its scales, copied as they are.
-  - Uploads copy between tokens. `IK_PIN=1` page-locks the copy, so that uploads run on a copy stream, during prefill
-    too. On a Ryzen 5 5600H laptop with its AMD IOMMU on, locking 15 GB took minutes; the plain copy decodes as fast.
+  - Uploads copy between tokens. The copy is never page-locked: on a Ryzen 5 5600H laptop, locking its 15 GB stalled
+    the kernel in reclaim for minutes, until systemd-oomd killed the terminal.
 - The dense weights stay as the checkpoint stores them: BF16, and F32 for the residual-mix queries and the router
   bias. The GEMVs read BF16. The embedding stays in the mapped file; a token's row is converted on the host.
 - Decode is one CUDA graph per token. At each MoE layer the GPU posts the routing to the CPU through pinned memory
@@ -128,9 +128,9 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
 - Prefill runs ubatches of up to 256 tokens. The dense matrices run as a tiled BF16 GEMM and attention by tiles of 16
   tokens and 32 keys, on the GPU, and so do the pairs of the cached experts. The other experts are grouped by expert,
   each read once per ubatch for all its tokens. The CPU threads take most of them; an expert stream takes those with
-  the most tokens, as many as it can upload in the time the CPU takes for the rest. The copy stream uploads each to a
-  staging slot (through a page-locked slot on the host, which the host copies the expert to, unless `IK_PIN=1`), and
-  the GPU runs its pairs. `IK_PF_STREAM=0` turns the stream off.
+  the most tokens, as many as it can upload in the time the CPU takes for the rest. The host copies each to a small
+  page-locked slot, the copy stream uploads it from there to a staging slot in VRAM, and the GPU runs its pairs.
+  `IK_PF_STREAM=0` turns the stream off.
 - Activations stay f32; the engine adds no quantization. The KV caches hold K and V in f16, as the reference code keeps
   them in BF16: the f32 values the kernels compute, rounded once (2048 bytes each per position and layer pass). The
   sliding-window passes' caches are rings of 1280 positions (the window and a ubatch). Perplexity over the first 2048

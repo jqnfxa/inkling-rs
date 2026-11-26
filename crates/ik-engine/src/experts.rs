@@ -10,10 +10,10 @@
 //!
 //! The host copy holds each tensor's bytes as the file has them, on huge pages (the CPU kernels stream them). The
 //! file's pages go from the page cache as they are copied, so the experts are in memory once. Cache uploads copy from
-//! it between tokens. IK_PIN=1 page-locks it, so that uploads are DMA on a copy stream and run during prefill too; an
-//! IOMMU that maps the 15 GB page by page can make that take minutes. IK_MAP_EXPERTS=1 reads the experts where the
-//! file is mapped instead, with no copy: the least memory (the page cache holds them, and may drop them under a memory
-//! limit), but slower CPU experts. A GPU cache slot holds one expert's matrix: its part of the codes tensor, then its
+//! it between tokens. The copy is never page-locked: locking its 15 GB stalled the kernel in reclaim for minutes, until
+//! systemd-oomd killed the session. Prefill's expert stream copies what it uploads to small page-locked slots instead.
+//! IK_MAP_EXPERTS=1 reads the experts where the file is mapped instead, with no copy: the least memory (the page cache
+//! holds them, and may drop them under a memory limit), but slower CPU experts. A GPU cache slot holds one expert's matrix: its part of the codes tensor, then its
 //! part of the scales tensor, copied as they are.
 
 use std::ops::Range;
@@ -220,10 +220,6 @@ pub struct Experts {
     ck: Arc<Checkpoint>,
     /// the copy of the expert tensors, which the offsets of `layers` index; None with IK_MAP_EXPERTS
     copy: Option<HugeMem>,
-    /// the page-locked ranges (address, length), so that cache uploads are DMA and run asynchronously; empty if they
-    /// could not be locked
-    locked: Vec<(usize, usize)>,
-    pub pinned: bool,
     pub layers: Vec<HostExperts>,
     /// the format of each physical layer's experts
     pub fmt: Vec<Fmt>,
@@ -237,9 +233,8 @@ pub struct Experts {
 }
 
 impl Experts {
-    /// The experts of the checkpoint: their tensors copied to huge pages, the copy page-locked with IK_PIN. With
-    /// IK_MAP_EXPERTS, the tensors where the file is mapped, read in (and page-locked there with IK_PIN, if the driver
-    /// can lock read-only memory).
+    /// The experts of the checkpoint: their tensors copied to huge pages. With IK_MAP_EXPERTS, the tensors where the
+    /// file is mapped, read in.
     pub fn new(ck: Arc<Checkpoint>, hp: &Hp) -> Result<Experts> {
         let (n, nff, ne) = (hp.n_embd, hp.n_ff_exp, hp.n_expert);
         // each layer's tensors, checked: (format, [(codes, scales)] of w13 and w2, factors)
@@ -282,8 +277,6 @@ impl Experts {
         let fmt: Vec<Fmt> = layers.iter().map(|l| l.fmt).collect();
         let gu_bytes = [Fmt::NvFp4.bytes(2 * nff, n), Fmt::MxFp8.bytes(2 * nff, n)];
         let down_bytes = [Fmt::NvFp4.bytes(n, nff), Fmt::MxFp8.bytes(n, nff)];
-        let pin = std::env::var("IK_PIN").is_ok();
-        let mut locked = vec![];
         let mut copy = None;
         if std::env::var("IK_MAP_EXPERTS").is_ok() {
             let ranges = page_ranges(&ck, spans);
@@ -291,21 +284,6 @@ impl Experts {
             let t = std::time::Instant::now();
             ranges.par_iter().for_each(|&(p, len)| populate(p, len));
             eprintln!("experts read in {:.1}s ({} MiB, not copied)", t.elapsed().as_secs_f64(), total >> 20);
-            if pin {
-                let t = std::time::Instant::now();
-                for &(p, len) in &ranges {
-                    if let Err(e) = crate::cuda::register_host_ro(p as *const u8, len) {
-                        eprintln!("experts not page-locked ({e}): cache uploads stay synchronous");
-                        unlock(&locked);
-                        locked.clear();
-                        break;
-                    }
-                    locked.push((p, len));
-                }
-                if !locked.is_empty() {
-                    eprintln!("experts page-locked in {:.1}s", t.elapsed().as_secs_f64());
-                }
-            }
         } else {
             // each tensor at a page of its own in the copy; the copy in pieces of 16 MiB for the threads
             let mut len = 0usize;
@@ -332,20 +310,9 @@ impl Experts {
                 page_out(piece);
             });
             eprintln!("experts copied in {:.1}s ({} MiB; their pages of the file dropped)", t.elapsed().as_secs_f64(), len >> 20);
-            if pin {
-                let t = std::time::Instant::now();
-                match crate::cuda::register_host(mem.ptr, mem.len) {
-                    Ok(()) => {
-                        locked.push((mem.ptr as usize, mem.len));
-                        eprintln!("experts page-locked in {:.1}s", t.elapsed().as_secs_f64());
-                    }
-                    Err(e) => eprintln!("experts not page-locked ({e}): cache uploads stay synchronous"),
-                }
-            }
             copy = Some(mem);
         }
-        let pinned = !locked.is_empty();
-        Ok(Experts { ck, copy, locked, pinned, layers, fmt, gu_bytes, down_bytes, n_embd: n, n_ff: nff, beta: hp.situ_beta, lb: hp.situ_lb })
+        Ok(Experts { ck, copy, layers, fmt, gu_bytes, down_bytes, n_embd: n, n_ff: nff, beta: hp.situ_beta, lb: hp.situ_lb })
     }
 
     fn mat(&self, layer: usize, which: [(usize, usize); 2], f: &[f32], e: usize, rows: usize, k: usize) -> Mat<'_> {
@@ -371,27 +338,6 @@ impl Experts {
     }
 }
 
-impl Drop for Experts {
-    fn drop(&mut self) {
-        // before the fields (the copy, the checkpoint's mapped files) go
-        unlock(&self.locked);
-    }
-}
-
-/// Unlocks the page-locked ranges (address, length).
-fn unlock(ranges: &[(usize, usize)]) {
-    for &(p, _) in ranges {
-        let _ = crate::cuda::unregister_host(p as *const u8);
-    }
-}
-
-/// Copies matrix `m` into the cache slot at `dst` (codes, then scales), on stream `s` (asynchronous if the experts are
-/// page-locked).
-pub fn upload_slot(dst: crate::cuda::CUdeviceptr, m: &Mat, s: &Stream) -> Result<()> {
-    crate::cuda::copy_h2d_async(dst, m.q.as_ptr(), m.q.len(), s)?;
-    crate::cuda::copy_h2d_async(dst + m.q.len() as u64, m.s.as_ptr(), m.s.len(), s)
-}
-
 /// The slots of one format: two banks (gate_up, down) with addresses for `max_slots` and memory for the first
 /// `n_slots`, which change as the KV cache takes VRAM or gives it back.
 pub struct Bank {
@@ -403,8 +349,6 @@ pub struct Bank {
     pub max_slots: usize,
     /// [slot] -> (layer, expert), usize::MAX if free
     pub owner: Vec<(usize, usize)>,
-    /// slots being filled by an async upload: not cached yet, and no victims
-    pub busy: Vec<bool>,
 }
 
 impl Bank {
@@ -412,13 +356,10 @@ impl Bank {
         self.gu.pages_for(n * self.gu_bytes) + self.down.pages_for(n * self.down_bytes)
     }
 
-    /// The least used slot, free slots first; None if all are being filled.
+    /// The least used slot, free slots first; None if the bank has no slots.
     fn victim(&self, uses: &[Vec<f32>]) -> Option<usize> {
         let mut best = (f32::INFINITY, usize::MAX);
         for (s, &(l, e)) in self.owner[..self.n_slots].iter().enumerate() {
-            if self.busy[s] {
-                continue;
-            }
             if l == usize::MAX {
                 return Some(s);
             }
@@ -445,16 +386,6 @@ pub struct ExpertCache {
     pub hits: u64,
     pub misses: u64,
     pub uploads: u64,
-    pub pending: Vec<Pending>,
-}
-
-/// An async upload of expert e of `layer` into `slot` of bank `bank`.
-pub struct Pending {
-    pub bank: usize,
-    pub slot: usize,
-    pub layer: usize,
-    pub e: usize,
-    pub ev: crate::cuda::Event,
 }
 
 impl ExpertCache {
@@ -464,7 +395,7 @@ impl ExpertCache {
         let bank = |f: Fmt| -> Result<Bank> {
             let m = if has(f) { max_slots } else { 0 };
             let (gb, db) = (ex.gu_bytes[f.index()], ex.down_bytes[f.index()]);
-            Ok(Bank { gu: VmBuf::reserve(gb * m.max(1), dev)?, down: VmBuf::reserve(db * m.max(1), dev)?, gu_bytes: gb, down_bytes: db, n_slots: 0, max_slots: m, owner: vec![(usize::MAX, usize::MAX); m], busy: vec![false; m] })
+            Ok(Bank { gu: VmBuf::reserve(gb * m.max(1), dev)?, down: VmBuf::reserve(db * m.max(1), dev)?, gu_bytes: gb, down_bytes: db, n_slots: 0, max_slots: m, owner: vec![(usize::MAX, usize::MAX); m] })
         };
         let q8_share = if has(Fmt::NvFp4) && has(Fmt::MxFp8) { std::env::var("IK_MX_SHARE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.15) } else if has(Fmt::MxFp8) { 1.0 } else { 0.0 };
         let ne = hp.n_expert;
@@ -488,7 +419,6 @@ impl ExpertCache {
             hits: 0,
             misses: 0,
             uploads: 0,
-            pending: vec![],
         })
     }
 
@@ -523,12 +453,11 @@ impl ExpertCache {
     }
 
     /// Sets the number of usable slots of each bank: the experts in the slots that go are dropped, and new slots start
-    /// free. No upload may be pending into a slot that goes, and no work in flight may read it.
+    /// free. No work in flight may read a slot that goes.
     pub fn set_slots(&mut self, n: [usize; 2], s: &Stream) -> Result<()> {
         for (b, &n) in self.banks.iter_mut().zip(&n) {
             let n = n.min(b.max_slots);
             for v in n..b.n_slots {
-                assert!(!b.busy[v], "slot {v} is being filled");
                 let (l, e) = b.owner[v];
                 if l != usize::MAX {
                     self.slot_of[l][e] = -1;

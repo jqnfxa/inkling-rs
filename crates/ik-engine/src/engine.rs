@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::checkpoint::{Checkpoint, Dtype};
 use crate::cpu_pool::{ATTN_JOB, ATTN_OUT, ATTN_STEP, AttnCtx, Pool};
 use crate::cuda::{self, Ctx, DevBuf, Graph, HostBuf, Result, Stream, VmBuf};
-use crate::experts::{ExpertCache, Experts, Fmt, upload_slot};
+use crate::experts::{ExpertCache, Experts, Fmt};
 use crate::hp::{Hp, Step};
 use crate::kernels::{Kernels, P};
 use crate::weights::{Mat, Weights};
@@ -20,9 +20,6 @@ pub fn threads_from_env() -> Vec<Option<usize>> {
         Err(_) => vec![None; 8],
     }
 }
-
-/// Async cache uploads in flight, at most.
-const STAGES: usize = 24;
 
 /// The GPU computes the cached experts (else all experts run on the CPU, and the cache has no slots).
 const GPU_EXPERTS: bool = true;
@@ -185,9 +182,9 @@ struct PfStream {
     cpu_pair_s: f64,
     /// bytes of the layer in flight, measured once its events are done
     last_bytes: usize,
-    /// when the experts are not page-locked: page-locked slots that the host copies each expert to for its upload
-    /// ([STREAM_SLOTS] of gate_up then down), and per slot the copy stream past its last upload from it
-    bounce: Option<HostBuf>,
+    /// page-locked slots that the host copies each expert to for its upload ([STREAM_SLOTS] of gate_up then down),
+    /// and per slot the copy stream past its last upload from it
+    bounce: HostBuf,
     bounced: Vec<cuda::Event>,
 }
 
@@ -212,7 +209,7 @@ impl PfStream {
             bw: 6.0e9,
             cpu_pair_s: 55e-6,
             last_bytes: 0,
-            bounce: if ex.pinned { None } else { Some(HostBuf::new(STREAM_SLOTS * slot)?) },
+            bounce: HostBuf::new(STREAM_SLOTS * slot)?,
             bounced: events()?,
         })
     }
@@ -639,7 +636,6 @@ impl Engine {
         // nothing in flight may touch the pages that go: finish the token's work and the uploads
         self.s.sync()?;
         self.copy_s.sync()?;
-        self.join_uploads();
         let resize = |e: &mut Engine, rows: usize| -> Result<()> {
             for v in e.kv_vm.iter_mut().flatten().flatten() {
                 v.resize(rows * KV_ROW, &e.s)?;
@@ -667,24 +663,6 @@ impl Engine {
         self.s.sync()?;
         let flat: Vec<i32> = self.cache.slot_of.iter().flatten().copied().collect();
         self.map.upload(&flat)
-    }
-
-    /// Finished async uploads join the cache; returns whether any did.
-    fn join_uploads(&mut self) -> bool {
-        let mut changed = false;
-        let mut k = 0;
-        while k < self.cache.pending.len() {
-            if self.cache.pending[k].ev.done() {
-                let p = self.cache.pending.swap_remove(k);
-                self.cache.slot_of[p.layer][p.e] = p.slot as i32;
-                self.cache.banks[p.bank].owner[p.slot] = (p.layer, p.e);
-                self.cache.banks[p.bank].busy[p.slot] = false;
-                changed = true;
-            } else {
-                k += 1;
-            }
-        }
-        changed
     }
 
     pub fn phys(hp: &Hp, il: usize) -> usize {
@@ -1024,7 +1002,6 @@ impl Engine {
     }
 
     /// Between tokens: uploads experts that miss often to the GPU cache, in place of experts used less.
-    /// With page-locked experts the uploads are async (copy stream); a slot is mapped once its upload is done.
     fn admit(&mut self) -> Result<()> {
         self.admit_d(true)
     }
@@ -1042,8 +1019,7 @@ impl Engine {
         if self.cache.n_slots() == 0 {
             return Ok(());
         }
-        // finished uploads join the cache
-        let mut changed = self.join_uploads();
+        let mut changed = false;
         let mut cands = vec![];
         {
             let mut u = self.pool.usage.lock().unwrap();
@@ -1071,7 +1047,7 @@ impl Engine {
         cands.sort_by(|a, b| b.0.total_cmp(&a.0));
         let mut uploads = 0;
         for (f, l, e) in cands {
-            if self.cache.slot_of[l][e] >= 0 || self.cache.pending.iter().any(|p| p.layer == l && p.e == e) {
+            if self.cache.slot_of[l][e] >= 0 {
                 continue;
             }
             let bank = self.ex.fmt[l].index();
@@ -1084,29 +1060,8 @@ impl Engine {
                 }
                 uploads += 1;
             }
-            if self.ex.pinned {
-                if self.cache.pending.len() >= STAGES {
-                    break;
-                }
-                // unmap the victim now; the next token's graph reads the new map
-                if !free {
-                    self.cache.slot_of[ol][oe] = -1;
-                    changed = true;
-                }
-                let b = &mut self.cache.banks[bank];
-                b.owner[v] = (usize::MAX, usize::MAX);
-                b.busy[v] = true;
-                // a slot holds the expert's tensors as the checkpoint has them: a copy of each part
-                upload_slot(b.gu.at(v * b.gu_bytes), &self.ex.gate_up(l, e), &self.copy_s)?;
-                upload_slot(b.down.at(v * b.down_bytes), &self.ex.down(l, e), &self.copy_s)?;
-                let ev = cuda::Event::new(false)?;
-                ev.record(&self.copy_s)?;
-                self.cache.pending.push(crate::experts::Pending { bank, slot: v, layer: l, e, ev });
-                self.cache.uploads += 1;
-            } else {
-                self.cache.fill(&self.ex, v, l, e)?;
-                changed = true;
-            }
+            self.cache.fill(&self.ex, v, l, e)?;
+            changed = true;
         }
         if changed {
             let flat: Vec<i32> = self.cache.slot_of.iter().flatten().copied().collect();
@@ -1487,24 +1442,14 @@ impl Engine {
             let (b, nn) = (&self.b, n * 4);
             self.k.moe_combine_t(&self.s, cpu + (8 * ta * nn) as u64, b.slots.at(4 * 8 * ta), b.wts.at(4 * 8 * ta), b.moe.at(ta * nn), nu, (tb - ta) as u32, false, gpu)?;
         }
-        // the cache keeps up during long prompts: uploads run on the copy stream meanwhile, after the GPU's pairs have
-        // read the slots they may take
-        if self.ex.pinned {
-            if on_gpu > 0 {
-                let ev = cuda::Event::new(false)?;
-                ev.record(&self.s)?;
-                self.copy_s.wait(&ev)?;
-            }
-            self.admit_d(false)?;
-        }
         Ok(())
     }
 
     /// Queues the pairs of `streamed` (expert, its (token, pair)s) on the expert stream: the copy stream uploads each
     /// expert to a staging slot once the slot's last reader is done, and the stream gathers its tokens' x, runs gate_up,
     /// SITU and down, and puts the outputs in cpu_out's rows of their pairs, as the CPU team does. self.s waits for it.
-    /// Experts that are not page-locked go through the bounce slots: the host copies each there once its last upload
-    /// is done, so this returns about when the last upload starts.
+    /// The experts go through the bounce slots: the host copies each to one once the slot's last upload is done, so
+    /// this returns about when the last upload starts.
     fn stream_experts(&mut self, ip: usize, streamed: &[(usize, Vec<(usize, usize)>)]) -> Result<()> {
         let (n, ffu) = (self.hp.n_embd as u32, self.hp.n_ff_exp as u32);
         let f = self.ex.fmt[ip];
@@ -1526,26 +1471,21 @@ impl Engine {
             let slot = j % STREAM_SLOTS;
             self.copy_s.wait(&ps.free[slot])?;
             let (gu, dn) = (self.ex.gate_up(ip, *e), self.ex.down(ip, *e));
-            if let Some(bb) = &ps.bounce {
-                while !ps.bounced[slot].done() {
-                    std::thread::yield_now();
-                }
-                let sb = bb.len / STREAM_SLOTS;
-                let dst = &mut bb.as_mut_slice::<u8>()[slot * sb..(slot + 1) * sb];
-                let mut at = 0;
-                for part in [gu.q, gu.s, dn.q, dn.s] {
-                    dst[at..at + part.len()].copy_from_slice(part);
-                    at += part.len();
-                }
-                assert_eq!(at, gu_b + dn_b, "an expert's parts fill its slots");
-                let src = dst.as_ptr();
-                cuda::copy_h2d_async(ps.gu.at(slot * gu_b), src, gu_b, &self.copy_s)?;
-                cuda::copy_h2d_async(ps.dn.at(slot * dn_b), src.wrapping_add(gu_b), dn_b, &self.copy_s)?;
-                ps.bounced[slot].record(&self.copy_s)?;
-            } else {
-                upload_slot(ps.gu.at(slot * gu_b), &gu, &self.copy_s)?;
-                upload_slot(ps.dn.at(slot * dn_b), &dn, &self.copy_s)?;
+            while !ps.bounced[slot].done() {
+                std::thread::yield_now();
             }
+            let sb = ps.bounce.len / STREAM_SLOTS;
+            let dst = &mut ps.bounce.as_mut_slice::<u8>()[slot * sb..(slot + 1) * sb];
+            let mut at = 0;
+            for part in [gu.q, gu.s, dn.q, dn.s] {
+                dst[at..at + part.len()].copy_from_slice(part);
+                at += part.len();
+            }
+            assert_eq!(at, gu_b + dn_b, "an expert's parts fill its slots");
+            let src = dst.as_ptr();
+            cuda::copy_h2d_async(ps.gu.at(slot * gu_b), src, gu_b, &self.copy_s)?;
+            cuda::copy_h2d_async(ps.dn.at(slot * dn_b), src.wrapping_add(gu_b), dn_b, &self.copy_s)?;
+            ps.bounced[slot].record(&self.copy_s)?;
             ps.up[slot].record(&self.copy_s)?;
             ps.s.wait(&ps.up[slot])?;
             let m = pairs.len() as u32;
