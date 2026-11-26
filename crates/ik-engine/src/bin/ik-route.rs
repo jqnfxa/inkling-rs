@@ -1,10 +1,9 @@
-//! How well a layer's experts can be told before its attention: `ik-route <model.gguf> <text file> [n_tokens] [skip]`.
+//! How well a layer's experts can be told before its attention: `ik-route <checkpoint dir> <text file> [n_tokens] [skip]`.
 //! Decodes the text a token at a time (eager, with probes) and, at each MoE layer pass, compares the experts the router
 //! picks with those picked from earlier states: the layer's input (before attention), the attention output (before the
 //! residual mix), the same layer pass of the previous token, and the previous loop pass of the same layer. Prints the
 //! share of the 8 experts each predictor gets right, per layer pass and overall.
 use ik_engine::engine::{Engine, Options, threads_from_env};
-use ik_engine::tokenizer::Tokenizer;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -36,7 +35,7 @@ fn main() -> Result<(), String> {
     let n_tok: usize = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(300);
     let skip: usize = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(32);
     let mut e = Engine::new(std::path::Path::new(&a[1]), Options { n_ctx: n_tok + 8, cache_slots: usize::MAX, threads: threads_from_env(), graph: false, upload_budget: 4 })?;
-    let tok = Tokenizer::from_gguf(&e.g)?;
+    let tok = e.ck.tokenizer()?;
     let hp = e.hp.clone();
     let n_phys = hp.n_phys;
     let sched = hp.schedule();
@@ -44,9 +43,9 @@ fn main() -> Result<(), String> {
     let mut bias = vec![];
     let mut fnorm = vec![];
     for l in 0..n_phys {
-        router.push(e.g.f32s(&format!("blk.{l}.ffn_gate_inp.weight"))?);
-        bias.push(e.g.f32s(&format!("blk.{l}.exp_probs_b.bias"))?);
-        fnorm.push(e.g.f32s(&format!("blk.{l}.ffn_norm.weight"))?);
+        router.push(e.ck.floats(&format!("model.llm.layers.{l}.mlp.gate.weight"))?);
+        bias.push(e.ck.floats(&format!("model.llm.layers.{l}.mlp.gate.bias"))?);
+        fnorm.push(e.ck.floats(&format!("model.llm.layers.{l}.mlp_norm.weight"))?);
     }
     let text = std::fs::read_to_string(&a[2]).map_err(|x| x.to_string())?;
     let ids = tok.encode(&text, false);

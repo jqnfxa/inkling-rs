@@ -1,4 +1,4 @@
-//! How concentrated full attention is at depth: `ik-attnmass <model.gguf> <text file> <n_tokens> [decode steps, 4]`.
+//! How concentrated full attention is at depth: `ik-attnmass <checkpoint dir> <text file> <n_tokens> [decode steps, 4]`.
 //! Prefills n_tokens of the text, decodes a few tokens, and for each full-attention pass tells the share of 128-key
 //! chunks a KV head needs (over its 3 query heads) to keep all but eps of the softmax mass.
 use std::cell::RefCell;
@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use ik_engine::engine::{Engine, Options, threads_from_env};
-use ik_engine::tokenizer::Tokenizer;
 
 const EPS: [f64; 3] = [1e-3, 1e-4, 1e-5];
 
@@ -15,7 +14,7 @@ fn main() -> Result<(), String> {
     let n: usize = a[3].parse().map_err(|_| "n_tokens")?;
     let steps: usize = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(4);
     let mut e = Engine::new(std::path::Path::new(&a[1]), Options { n_ctx: n + 64, cache_slots: usize::MAX, threads: threads_from_env(), graph: true, upload_budget: 4 })?;
-    let tok = Tokenizer::from_gguf(&e.g)?;
+    let tok = e.ck.tokenizer()?;
     let text = std::fs::read_to_string(&a[2]).map_err(|x| x.to_string())?;
     let ids = tok.encode(&text, false);
     if ids.len() < n + steps {

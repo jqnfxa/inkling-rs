@@ -457,9 +457,14 @@ impl Drop for HostBuf {
     }
 }
 
-/// Page-locks an existing host range (the mapped model file) so that uploads from it run as DMA.
+/// Page-locks an existing host range so that uploads from it run as DMA.
 pub fn register_host(p: *const u8, len: usize) -> Result<()> {
     ck!(cuMemHostRegister_v2(p as *mut c_void, len, 0x01)) // PORTABLE
+}
+
+/// Page-locks a read-only host range (a mapped file; page-aligned), which the GPU only reads.
+pub fn register_host_ro(p: *const u8, len: usize) -> Result<()> {
+    ck!(cuMemHostRegister_v2(p as *mut c_void, len, 0x01 | 0x08)) // PORTABLE | READ_ONLY
 }
 
 pub fn unregister_host(p: *const u8) -> Result<()> {

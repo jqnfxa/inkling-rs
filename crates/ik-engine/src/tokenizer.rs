@@ -50,12 +50,60 @@ impl Tokenizer {
             Some(Value::Arr(a)) => a.iter().map(|v| v.as_u64().map_or(1, |x| x as i32)).collect(),
             _ => vec![1; pieces.len()],
         };
-        let vocab: HashMap<String, u32> = pieces.iter().enumerate().map(|(i, p)| (p.clone(), i as u32)).collect();
+        let merges = g.arr("tokenizer.ggml.merges")?.iter().filter_map(|m| m.as_str()?.split_once(' ')).map(|(a, b)| (a.to_string(), b.to_string()));
+        let mut eos = vec![];
+        for k in ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"] {
+            if let Ok(id) = g.u64(k) {
+                if !eos.contains(&(id as u32)) {
+                    eos.push(id as u32);
+                }
+            }
+        }
+        Tokenizer::build(pieces, types, merges, eos)
+    }
+
+    /// The tokenizer of a Hugging Face tokenizer.json (`json`, its text): the BPE vocabulary and merges, and the added
+    /// tokens (special ones are control tokens). `eos`: the ids that end a reply.
+    pub fn from_hf(json: &str, eos: &[u32]) -> Result<Tokenizer, String> {
+        let t: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("tokenizer.json: {e}"))?;
+        let m = &t["model"];
+        if m["type"] != "BPE" || m["ignore_merges"] != true || m["byte_fallback"] == true {
+            return Err("tokenizer.json: the model is not a byte-level BPE that ignores merges for whole-word tokens".into());
+        }
+        // the pre-tokenizer must split as SPLIT does, then map bytes to chars (ByteLevel without its own regex)
+        let pre = t["pre_tokenizer"]["pretokenizers"].as_array().map(Vec::as_slice).unwrap_or_default();
+        let ok = matches!(pre, [s, b] if s["type"] == "Split" && s["pattern"]["Regex"] == SPLIT && s["behavior"] == "Isolated"
+            && b["type"] == "ByteLevel" && b["use_regex"] == false && b["add_prefix_space"] == false);
+        if !ok || !t["normalizer"].is_null() {
+            return Err("tokenizer.json: the pre-tokenizer is not the inkling2 split".into());
+        }
+        let vocab = m["vocab"].as_object().ok_or("tokenizer.json: no vocab")?;
+        let added = t["added_tokens"].as_array().map(Vec::as_slice).unwrap_or_default();
+        let id = |v: &serde_json::Value| v.as_u64().filter(|&i| i < 1 << 24).map(|i| i as usize);
+        let n = vocab.values().filter_map(id).chain(added.iter().filter_map(|a| id(&a["id"]))).max().map_or(0, |m| m + 1);
+        let (mut pieces, mut types) = (vec![String::new(); n], vec![1; n]);
+        for (p, i) in vocab {
+            let i = id(i).ok_or_else(|| format!("tokenizer.json: bad id of {p}"))?;
+            pieces[i] = p.clone();
+        }
+        for a in added {
+            let (Some(i), Some(p)) = (id(&a["id"]), a["content"].as_str()) else { return Err("tokenizer.json: bad added token".into()) };
+            pieces[i] = p.to_string();
+            types[i] = if a["special"] == true { TYPE_CONTROL } else { TYPE_USER_DEFINED };
+        }
+        let merges = m["merges"].as_array().ok_or("tokenizer.json: no merges")?.iter().filter_map(|v| match v {
+            serde_json::Value::String(s) => s.split_once(' ').map(|(a, b)| (a.to_string(), b.to_string())),
+            serde_json::Value::Array(p) => Some((p.first()?.as_str()?.to_string(), p.get(1)?.as_str()?.to_string())),
+            _ => None,
+        });
+        Tokenizer::build(pieces, types, merges, eos.to_vec())
+    }
+
+    fn build(pieces: Vec<String>, types: Vec<i32>, merge_list: impl Iterator<Item = (String, String)>, eos: Vec<u32>) -> Result<Tokenizer, String> {
+        let vocab: HashMap<String, u32> = pieces.iter().enumerate().filter(|(_, p)| !p.is_empty()).map(|(i, p)| (p.clone(), i as u32)).collect();
         let mut merges = HashMap::new();
-        for (rank, m) in g.arr("tokenizer.ggml.merges")?.iter().enumerate() {
-            let m = m.as_str().unwrap_or("");
-            let Some((a, b)) = m.split_once(' ') else { continue };
-            let (Some(&ia), Some(&ib), Some(&im)) = (vocab.get(a), vocab.get(b), vocab.get(&format!("{a}{b}"))) else { continue };
+        for (rank, (a, b)) in merge_list.enumerate() {
+            let (Some(&ia), Some(&ib), Some(&im)) = (vocab.get(&a), vocab.get(&b), vocab.get(&format!("{a}{b}"))) else { continue };
             merges.entry((ia, ib)).or_insert((rank as u32, im));
         }
         let byte_char = byte_chars();
@@ -68,14 +116,6 @@ impl Tokenizer {
             .filter(|(s, _, _)| !s.is_empty())
             .collect();
         specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.1.cmp(&b.1)));
-        let mut eos = vec![];
-        for k in ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"] {
-            if let Ok(id) = g.u64(k) {
-                if !eos.contains(&(id as u32)) {
-                    eos.push(id as u32);
-                }
-            }
-        }
         Ok(Tokenizer { pieces, types, vocab, merges, split: Regex::new(SPLIT).map_err(|e| e.to_string())?, byte_char, char_byte, specials, eos })
     }
 

@@ -1,10 +1,9 @@
-//! Speed against context depth: `ik-ctx <model.gguf> <text file> <n_ctx> [n_gen] [max depth]`.
+//! Speed against context depth: `ik-ctx <checkpoint dir> <text file> <n_ctx> [n_gen] [max depth]`.
 //! Feeds the text in growing prefixes (1k, 2k, 4k, ... tokens, up to n_ctx) through the batched prefill and, at
 //! each depth, decodes n_gen tokens greedily; reports prefill speed of each new segment, decode speed and the
 //! expert-cache hit rate. IK_THREADS sets the expert threads. IK_PROF adds, at each depth, the GPU time of each kind
 //! of kernel in the last token, and the CPU expert time and misses per token.
 use ik_engine::engine::{Engine, Options, threads_from_env};
-use ik_engine::tokenizer::Tokenizer;
 use std::time::Instant;
 
 fn argmax(v: &[f32]) -> u32 {
@@ -14,7 +13,7 @@ fn argmax(v: &[f32]) -> u32 {
 fn main() -> Result<(), String> {
     let a: Vec<String> = std::env::args().collect();
     if a.len() < 4 {
-        return Err("usage: ik-ctx <model.gguf> <text file> <n_ctx> [n_gen]".into());
+        return Err("usage: ik-ctx <checkpoint dir> <text file> <n_ctx> [n_gen]".into());
     }
     let n_ctx: usize = a[3].parse().map_err(|_| "bad n_ctx")?;
     let n_gen: usize = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(64);
@@ -22,7 +21,7 @@ fn main() -> Result<(), String> {
     let t0 = Instant::now();
     let opt = Options { n_ctx, cache_slots: usize::MAX, threads: threads_from_env(), graph: true, upload_budget: 4 };
     let mut e = Engine::new(std::path::Path::new(&a[1]), opt)?;
-    let tok = Tokenizer::from_gguf(&e.g)?;
+    let tok = e.ck.tokenizer()?;
     let (free, total) = e.ctx.mem_info()?;
     eprintln!(
         "n_ctx {n_ctx}: loaded in {:.1?}, {} expert cache slots ({} MiB), {} MiB VRAM free of {}",

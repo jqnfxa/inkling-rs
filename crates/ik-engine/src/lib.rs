@@ -2,6 +2,7 @@
 #![allow(long_running_const_eval)]
 
 pub mod chat;
+pub mod checkpoint;
 pub mod compact;
 pub mod cpu;
 pub mod cpu_batch;

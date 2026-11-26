@@ -1,17 +1,17 @@
-//! One sequence of Inkling-2-Mini: weights, caches and the decode step.
+//! One sequence of Inkling-2-Mini from its safetensors checkpoint: weights, caches and the decode step.
 //! The GPU posts each MoE layer to the CPU team (cpu_pool) through host-mapped memory, so a token runs as one CUDA graph.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::checkpoint::{Checkpoint, Dtype};
+use crate::cpu::Act;
 use crate::cpu_pool::Pool;
 use crate::cuda::{self, Ctx, DevBuf, Graph, HostBuf, Result, Stream, VmBuf};
-use crate::experts::{ExpertCache, Experts};
-use crate::gguf::Gguf;
+use crate::experts::{ExpertCache, Experts, Fmt, upload_slot};
 use crate::hp::{Hp, Step};
 use crate::kernels::{Kernels, P};
-use crate::quant::dequant_q8_row;
-use crate::weights::Weights;
+use crate::weights::{Mat, Weights};
 
 /// The expert threads from IK_THREADS ("0,2,4" pins, "8" is 8 unpinned threads); default: 8 unpinned.
 pub fn threads_from_env() -> Vec<Option<usize>> {
@@ -27,8 +27,10 @@ const STAGES: usize = 24;
 
 /// The GPU computes the cached experts (else all experts run on the CPU, and the cache has no slots).
 const GPU_EXPERTS: bool = true;
-/// ... and in prefill too (else the prefill sends all experts to the CPU).
-const GPU_PREFILL: bool = true;
+
+/// The row of `Scratch::msgs` that holds the message of controller c (q, k, v, the MoE input): the loop's cross-pass
+/// queries give the q and MoE messages (rows 0, 1), its kv queries the k and v ones (rows 2, 3).
+const MSG: [usize; 4] = [0, 2, 3, 1];
 
 /// Tokens of a prefill ubatch, at most.
 pub const T_MAX: usize = 256;
@@ -88,11 +90,9 @@ struct Scratch {
     ctl_tmp: DevBuf, // [3][n]
     ctl_g: DevBuf,   // [2n]
     ctl_gate: DevBuf,
-    cq: DevBuf, // the inputs of 3 controllers, q8_1
-    cd: DevBuf,
-    cs: DevBuf,
-    ctl_gate3: DevBuf, // [64]
-    msgs: DevBuf,    // [4][n]
+    ctl_g3: DevBuf,    // the inputs of 3 controllers [3][2n]
+    ctl_gate3: DevBuf, // [3][64]
+    msgs: DevBuf,      // [4][n] (MSG)
     g0: DevBuf,      // q | gate | rel | sink
     gk: DevBuf,      // k | k taps
     gv: DevBuf,      // v | v taps
@@ -114,15 +114,10 @@ struct Scratch {
     dn: DevBuf,  // [8][n]
     f: DevBuf,
     logits_raw: DevBuf,
-    xq: DevBuf,  // q8_1 of a GEMV input: int8 [4608]
-    xd: DevBuf,  // [144]
-    xs: DevBuf,  // [144]
-    xq2: DevBuf, // a second q8_1 input (k and v of full attention)
-    xd2: DevBuf,
-    xs2: DevBuf,
-    xq3: DevBuf,
-    xd3: DevBuf,
-    xs3: DevBuf,
+    xq: DevBuf, // q8_1 of the MoE input, for NVFP4 experts: int8 [n]
+    xd: DevBuf, // [n/32]
+    xs: DevBuf, // [n/32]
+    af: DevBuf, // the expert activations [8][n_ff] (f32, for MXFP8 experts)
     aq: DevBuf, // q8_1 of the expert activations [8][n_ff]
     ad: DevBuf,
     asum: DevBuf,
@@ -142,9 +137,6 @@ struct BatchBufs {
     ctl_g: DevBuf,
     ctl_gate: DevBuf,
     inn: Vec<DevBuf>,
-    xq: Vec<DevBuf>,
-    xd: Vec<DevBuf>,
-    xs: Vec<DevBuf>,
     g0: DevBuf,
     gk: DevBuf,
     gv: DevBuf,
@@ -165,12 +157,6 @@ struct BatchBufs {
     ids: DevBuf,
     wts: DevBuf,
     slots: DevBuf,
-    groups: DevBuf,
-    gu: DevBuf,
-    aq: DevBuf,
-    ad: DevBuf,
-    asum: DevBuf,
-    dn: DevBuf,
     moe: DevBuf,
     f: DevBuf,
     tau: DevBuf,
@@ -178,7 +164,6 @@ struct BatchBufs {
     bl: Blocks,
     host_ids: HostBuf,
     host_xn: HostBuf,
-    host_groups: HostBuf,
     host_slots: HostBuf,
     cpu_out: HostBuf,
 }
@@ -196,7 +181,7 @@ struct Blocks {
 pub struct Engine {
     /// first, so that it stops before the host buffers it reads are freed
     pub pool: Pool,
-    pub g: Arc<Gguf>,
+    pub ck: Arc<Checkpoint>,
     pub hp: Hp,
     pub ctx: Ctx,
     pub k: Kernels,
@@ -225,7 +210,7 @@ pub struct Engine {
     ptr_lists: HashMap<Vec<u64>, usize>,
     ptr_used: usize,
     pass_bank: (Vec<P>, P),
-    /// debug: called with (name, slot, data) for the intermediates that llama.cpp names, if set
+    /// debug: called with (name, slot, data) for the named intermediates (Qcur, kqv_out, ffn_inp, l_out, ...), if set
     pub probe: Option<Box<dyn FnMut(&str, usize, &[f32])>>,
     job: HostBuf,      // the MoE job the GPU posts: seq, layer, ids, slots, x
     ack: HostBuf,      // the seq the CPU acknowledged
@@ -275,11 +260,11 @@ pub struct Stats {
 impl Engine {
     pub fn new(path: &std::path::Path, opt: Options) -> Result<Engine> {
         let ctx = Ctx::new(0)?;
-        let g = Arc::new(Gguf::open(path)?);
-        let hp = Hp::from_gguf(&g)?;
+        let ck = Arc::new(Checkpoint::open(path)?);
+        let hp = Hp::from_config(&ck.config)?;
         let k = Kernels::load()?;
-        let w = Weights::load(&g, &hp)?;
-        let ex = Arc::new(Experts::new(&g, &hp)?);
+        let w = Weights::load(&ck, &hp)?;
+        let ex = Arc::new(Experts::new(ck.clone(), &hp)?);
         let n_swa = hp.n_swa;
         let s = Stream::new()?;
         let n = hp.n_embd;
@@ -322,12 +307,10 @@ impl Engine {
             ctl_tmp: f(3 * n)?,
             ctl_g: f(2 * n)?,
             ctl_gate: f(64)?,
-            cq: f(3 * 4608 / 4)?,
-            cd: f(3 * 144)?,
-            cs: f(3 * 144)?,
-            ctl_gate3: f(3 * 64)?,
+            ctl_g3: f(3 * 2 * n)?,
+            ctl_gate3: f(3 * hp.gate_rank)?,
             msgs: f(4 * n)?,
-            g0: f(w.layers[0].g0.rows)?,
+            g0: f(w.layers[0].g0_rows())?,
             gk: f(kv + 64)?,
             gv: f(kv + 64)?,
             q: f(hp.n_head * hp.head_dim)?,
@@ -348,15 +331,10 @@ impl Engine {
             dn: f(8 * n)?,
             f: f(n)?,
             logits_raw: f(hp.n_vocab_padded)?,
-            xq: f(4608 / 4)?,
-            xd: f(144)?,
-            xs: f(144)?,
-            xq2: f(4608 / 4)?,
-            xd2: f(144)?,
-            xs2: f(144)?,
-            xq3: f(4608 / 4)?,
-            xd3: f(144)?,
-            xs3: f(144)?,
+            xq: f(n / 4)?,
+            xd: f(n / 32)?,
+            xs: f(n / 32)?,
+            af: f(8 * hp.n_ff_exp)?,
             aq: f(8 * hp.n_ff_exp / 4)?,
             ad: f(8 * hp.n_ff_exp / 32)?,
             asum: f(8 * hp.n_ff_exp / 32)?,
@@ -393,10 +371,7 @@ impl Engine {
             ctl_g: f(tm * 2 * n)?,
             ctl_gate: f(tm * 64)?,
             inn: fv(3)?,
-            xq: (0..3).map(|_| f(tm * 4608 / 4)).collect::<Result<_>>()?,
-            xd: (0..3).map(|_| f(tm * 144)).collect::<Result<_>>()?,
-            xs: (0..3).map(|_| f(tm * 144)).collect::<Result<_>>()?,
-            g0: f(tm * w.layers[0].g0.rows)?,
+            g0: f(tm * w.layers[0].g0_rows())?,
             gk: f(tm * (kv + 32))?,
             gv: f(tm * (kv + 32))?,
             kc: f(tm * kv)?,
@@ -416,12 +391,6 @@ impl Engine {
             ids: f(tm * 8)?,
             wts: f(tm * 8)?,
             slots: f(tm * 8)?,
-            groups: f(384 + 2 * tm * 8)?,
-            gu: f(tm * 8 * 2 * hp.n_ff_exp)?,
-            aq: f(tm * 8 * hp.n_ff_exp / 4)?,
-            ad: f(tm * 8 * hp.n_ff_exp / 32)?,
-            asum: f(tm * 8 * hp.n_ff_exp / 32)?,
-            dn: f(tm * 8 * n)?,
             moe: f(tm * n)?,
             f: f(tm * n)?,
             tau: f(tm)?,
@@ -429,7 +398,6 @@ impl Engine {
             bl: blocks_t,
             host_ids: HostBuf::new(4 * tm * 8)?,
             host_xn: HostBuf::new(4 * tm * n)?,
-            host_groups: HostBuf::new(4 * (384 + 2 * tm * 8))?,
             host_slots: HostBuf::new(4 * tm * 8)?,
             cpu_out: HostBuf::new(4 * tm * 8 * n)?,
         };
@@ -450,7 +418,7 @@ impl Engine {
         let pool = Pool::new(ex.clone(), &job, &ack, &cpu_out, hp.n_phys, hp.n_expert, threads);
         let mut e = Engine {
             params: DevBuf::zeroed(16, &s)?,
-            ptrs: DevBuf::zeroed(8 * 4096, &s)?,
+            ptrs: DevBuf::zeroed(8 * 16384, &s)?,
             ptr_lists: HashMap::new(),
             ptr_used: 0,
             pass_bank: (vec![], 0),
@@ -467,7 +435,7 @@ impl Engine {
             eager_done: false,
             tok: 0,
             upload_budget: opt.upload_budget,
-            g,
+            ck,
             hp,
             ctx,
             k,
@@ -598,17 +566,28 @@ impl Engine {
         Ok(self.ptrs.at(o))
     }
 
-    /// y = W x with x quantized to q8_1 in the buffers `which` (0..3)
-    fn qgemv(&self, m: &crate::weights::Q8Mat, x: P, y: P, which: usize, quantize: bool) -> Result<()> {
-        let (q, d, s) = match which {
-            0 => (&self.sc.xq, &self.sc.xd, &self.sc.xs),
-            1 => (&self.sc.xq2, &self.sc.xd2, &self.sc.xs2),
-            _ => (&self.sc.xq3, &self.sc.xd3, &self.sc.xs3),
-        };
-        if quantize {
-            self.k.quant_q8_1(&self.s, x, q.ptr, d.ptr, s.ptr, m.k as u32, 1)?;
+    /// y = W x: W a BF16 matrix of the checkpoint, x f32
+    fn gemv(&self, m: &Mat, x: P, y: P) -> Result<()> {
+        self.k.gemv_bf16(&self.s, m.w.ptr, x, y, m.rows as u32, m.k as u32, 1, m.rows as u32)
+    }
+
+    /// y[t] = W x[t] for nt tokens: x f32 [nt][k], y[t] at t y_stride (floats)
+    fn gemm(&self, m: &Mat, x: P, y: P, nt: usize, y_stride: usize) -> Result<()> {
+        self.k.gemv_bf16(&self.s, m.w.ptr, x, y, m.rows as u32, m.k as u32, nt as u32, y_stride as u32)
+    }
+
+    /// The embedding of `token` as f32: its BF16 row of the checkpoint, read from the mapped file.
+    fn embed(&self, token: u32, out: &mut [f32]) -> Result<()> {
+        let n = self.hp.n_embd;
+        if token as usize >= self.hp.n_vocab {
+            return Err(format!("token {token} is past the vocabulary of {}", self.hp.n_vocab));
         }
-        self.k.gemv_q8d(&self.s, m.qs.ptr, m.d.ptr, q.ptr, d.ptr, y, m.rows as u32, m.k as u32)
+        let e = self.ck.get("model.llm.embed.weight", Dtype::BF16, &[self.hp.n_vocab_padded, n])?;
+        let row = &e[token as usize * n * 2..(token as usize + 1) * n * 2];
+        for (o, b) in out.iter_mut().zip(row.chunks_exact(2)) {
+            *o = f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16);
+        }
+        Ok(())
     }
 
     fn mix(&mut self, states: &[P], cur: P, queries: P, out: P, nq: u32) -> Result<()> {
@@ -621,13 +600,10 @@ impl Engine {
     /// out = control(cur, msg) of controller c of physical layer ip
     fn control(&mut self, ip: usize, c: usize, cur: P, msg: P, out: P) -> Result<()> {
         let n = self.hp.n_embd as u32;
-        let tab = self.ptr_list(&[cur, msg])?;
-        self.k.ctrl_in_qz(&self.s, tab, self.sc.xq.ptr, self.sc.xd.ptr, self.sc.xs.ptr, n, 1)?;
+        self.k.ctrl_in(&self.s, cur, msg, self.sc.ctl_g.ptr, n)?;
         let lp = self.w.layers[ip].lp.as_ref().unwrap();
-        let d = &lp.down[c];
-        self.qgemv(d, self.sc.ctl_g.ptr, self.sc.ctl_gate.ptr, 0, false)?;
-        let (gm, fm) = (&lp.gain[c], &lp.forget[c]);
-        self.k.ctrl_out(&self.s, cur, msg, self.sc.ctl_gate.ptr, gm.qs.ptr, gm.d.ptr, fm.qs.ptr, fm.d.ptr, out, n)
+        self.gemv(&lp.down[c], self.sc.ctl_g.ptr, self.sc.ctl_gate.ptr)?;
+        self.k.ctrl_out(&self.s, cur, msg, self.sc.ctl_gate.ptr, lp.gain[c].ptr, lp.forget[c].ptr, out, n)
     }
 
     /// Starts a new sequence: the conv states are zeroed; the KV rows past the position are never read.
@@ -831,11 +807,8 @@ impl Engine {
         if self.pos + 1 > self.kv_mapped {
             self.plan_kv(self.pos + 1)?;
         }
-        // embedding row, dequantized on the host
-        let te = self.g.tensor("token_embd.weight")?;
-        let row = te.ty.row_bytes(n);
         let mut emb = vec![0f32; n];
-        dequant_q8_row(&self.g.mmap[te.offset + token as usize * row..te.offset + (token as usize + 1) * row], &mut emb);
+        self.embed(token, &mut emb)?;
         self.sc.x.upload(&emb)?;
         self.tok += 1;
         let tau = hp.tau(self.pos);
@@ -923,8 +896,7 @@ impl Engine {
         let orq = self.w.output_res_query.ptr;
         self.mix(&blocks.clone(), x, orq, self.sc.a.ptr, 1)?;
         self.k.rms_norm(&self.s, self.sc.a.ptr, Some(self.w.output_norm.ptr), self.sc.a.ptr, nu, 1, hp.eps)?;
-        let o = &self.w.output;
-        self.qgemv(o, self.sc.a.ptr, self.sc.logits_raw.ptr, 0, true)?;
+        self.gemv(&self.w.output, self.sc.a.ptr, self.sc.logits_raw.ptr)?;
         self.k.softcap(&self.s, self.sc.logits_raw.ptr, self.logits_h.dev, hp.n_vocab as u32, hp.softcap)?;
         self.k.prof_stop();
         Ok(())
@@ -1003,10 +975,9 @@ impl Engine {
                 let b = &mut self.cache.banks[bank];
                 b.owner[v] = (usize::MAX, usize::MAX);
                 b.busy[v] = true;
-                // the host copy is in the slot layout: one copy each
-                let (gu, dn) = (self.ex.gate_up(l, e).b, self.ex.down(l, e).b);
-                cuda::copy_h2d_async(b.gu.at(v * b.gu_bytes), gu.as_ptr(), gu.len(), &self.copy_s)?;
-                cuda::copy_h2d_async(b.down.at(v * b.down_bytes), dn.as_ptr(), dn.len(), &self.copy_s)?;
+                // a slot holds the expert's tensors as the checkpoint has them: a copy of each part
+                upload_slot(b.gu.at(v * b.gu_bytes), &self.ex.gate_up(l, e), &self.copy_s)?;
+                upload_slot(b.down.at(v * b.down_bytes), &self.ex.down(l, e), &self.copy_s)?;
                 let ev = cuda::Event::new(false)?;
                 ev.record(&self.copy_s)?;
                 self.cache.pending.push(crate::experts::Pending { bank, slot: v, layer: l, e, ev });
@@ -1042,11 +1013,9 @@ impl Engine {
         if self.pos + nt > self.kv_mapped {
             self.plan_kv(self.pos + nt)?;
         }
-        let te = self.g.tensor("token_embd.weight")?;
-        let row = te.ty.row_bytes(n);
         let mut emb = vec![0f32; nt * n];
         for (i, &t) in toks.iter().enumerate() {
-            dequant_q8_row(&self.g.mmap[te.offset + t as usize * row..te.offset + (t as usize + 1) * row], &mut emb[i * n..(i + 1) * n]);
+            self.embed(t, &mut emb[i * n..(i + 1) * n])?;
         }
         self.b.x.upload(&emb)?;
         let taus: Vec<f32> = (0..nt).map(|i| hp.tau(self.pos + i)).collect();
@@ -1084,8 +1053,7 @@ impl Engine {
         let pl = self.ptr_list(&last)?;
         self.k.mix(&self.s, pl, last.len() as u32, orq, self.sc.a.ptr, 1, n as u32)?;
         self.k.rms_norm(&self.s, self.sc.a.ptr, Some(self.w.output_norm.ptr), self.sc.a.ptr, n as u32, 1, hp.eps)?;
-        let o = &self.w.output;
-        self.qgemv(o, self.sc.a.ptr, self.sc.logits_raw.ptr, 0, true)?;
+        self.gemv(&self.w.output, self.sc.a.ptr, self.sc.logits_raw.ptr)?;
         self.k.softcap(&self.s, self.sc.logits_raw.ptr, self.logits_h.dev, hp.n_vocab as u32, hp.softcap)?;
         self.s.sync()?;
         let logits = self.logits_h.as_slice::<f32>()[..hp.n_vocab].to_vec();
@@ -1104,22 +1072,13 @@ impl Engine {
         self.k.mix_t(&self.s, p, list.len() as u32, queries, out, 1, self.hp.n_embd as u32, nt as u32)
     }
 
-    /// y[t] = W x[t]: x quantized into the batch's q8_1 buffers `which`
-    fn qgemm(&self, m: &crate::weights::Q8Mat, x: P, y: P, which: usize, quantize: bool, nt: usize) -> Result<()> {
-        let (q, d, sx) = (&self.b.xq[which], &self.b.xd[which], &self.b.xs[which]);
-        if quantize {
-            self.k.quant_q8_1(&self.s, x, q.ptr, d.ptr, sx.ptr, m.k as u32, nt as u32)?;
-        }
-        self.k.gemm_q8d_t(&self.s, m.qs.ptr, m.d.ptr, q.ptr, d.ptr, y, m.rows as u32, m.k as u32, nt as u32, m.rows as u32)
-    }
-
     fn control_t(&mut self, ip: usize, c: usize, cur: P, msg: P, out: P, nt: usize) -> Result<()> {
         let n = self.hp.n_embd as u32;
         self.k.ctrl_in_t(&self.s, cur, msg, self.b.ctl_g.ptr, n, nt as u32)?;
         let lp = self.w.layers[ip].lp.as_ref().unwrap();
-        self.qgemm(&lp.down[c], self.b.ctl_g.ptr, self.b.ctl_gate.ptr, 0, true, nt)?;
-        let (gm, fm) = (&lp.gain[c], &lp.forget[c]);
-        self.k.ctrl_out_t(&self.s, cur, msg, self.b.ctl_gate.ptr, gm.qs.ptr, gm.d.ptr, fm.qs.ptr, fm.d.ptr, out, n, nt as u32)
+        let d = &lp.down[c];
+        self.gemm(d, self.b.ctl_g.ptr, self.b.ctl_gate.ptr, nt, d.rows)?;
+        self.k.ctrl_out_t(&self.s, cur, msg, self.b.ctl_gate.ptr, lp.gain[c].ptr, lp.forget[c].ptr, out, n, nt as u32)
     }
 
     fn layer_t(&mut self, st: Step, blocks: &mut Vec<P>, nt: usize) -> Result<()> {
@@ -1134,11 +1093,11 @@ impl Engine {
         let nb = nt * n * 4;
 
         if looped {
+            // b.msg[c]: the message of controller c (q, k, v, the MoE input)
             let (bank, out) = self.pass_bank_t.clone();
-            let mq = self.w.layers[ip].lp.as_ref().unwrap().msg_query.ptr;
-            for j in 0..4 {
-                let dst = self.b.msg[j].ptr;
-                self.mix_t(&bank, out, mq + (j * n * 4) as u64, dst, nt)?;
+            for c in 0..4 {
+                let (q, dst) = (self.w.layers[ip].lp.as_ref().unwrap().query(c, n), self.b.msg[c].ptr);
+                self.mix_t(&bank, out, q, dst, nt)?;
             }
         }
         let block_start = ip % hp.block_size == 0;
@@ -1184,14 +1143,18 @@ impl Engine {
             ins[1] = ins[0];
             ins[2] = ins[0];
         }
+        // the projections of each input into rows [t][..]: g0 q | gate | rel | sink, gk k | k taps, gv v | v taps
         let l = &self.w.layers[ip];
-        let (g0, gk, gv) = (&l.g0, &l.gk, &l.gv);
-        let shared_in = nin == 1;
-        self.qgemm(g0, ins[0], self.b.g0.ptr, 0, true, nt)?;
-        self.qgemm(gk, ins[1], self.b.gk.ptr, if shared_in { 0 } else { 1 }, !shared_in, nt)?;
-        self.qgemm(gv, ins[2], self.b.gv.ptr, if shared_in { 0 } else { 2 }, !shared_in, nt)?;
-        let g0r = g0.rows as u32;
-        let (gkr, gvr) = (gk.rows as u32, gv.rows as u32);
+        let g0r = l.g0_rows();
+        let (gkr, gvr) = (l.gk.iter().map(|m| m.rows).sum::<usize>(), l.gv.iter().map(|m| m.rows).sum::<usize>());
+        for (mats, x, y, stride) in [(&l.g0, ins[0], &self.b.g0, g0r), (&l.gk, ins[1], &self.b.gk, gkr), (&l.gv, ins[2], &self.b.gv, gvr)] {
+            let mut off = 0;
+            for m in mats {
+                self.gemm(m, x, y.at(off * 4), nt, stride)?;
+                off += m.rows;
+            }
+        }
+        let (g0r, gkr, gvr) = (g0r as u32, gkr as u32, gvr as u32);
         let nh = hp.n_head * hp.head_dim;
 
         let conv = self.conv[il].ptr;
@@ -1236,17 +1199,17 @@ impl Engine {
         let window = if swa { hp.n_swa as u32 } else { u32::MAX };
         let scale = 1.0 / (hp.head_dim as f32).sqrt();
         if kv_f16() {
-            self.k.attn_prefill(&self.s, self.b.q.ptr, self.b.r.ptr, sink, l.rel_bias.ptr, kv8[0], kv8[2], self.b.att.ptr, self.params.ptr, ring, window, extent, scale, nh as u32, nhd * nr, g0r, ntu)?;
+            self.k.attn_prefill(&self.s, self.b.q.ptr, self.b.r.ptr, sink, l.rel_proj.ptr, kv8[0], kv8[2], self.b.att.ptr, self.params.ptr, ring, window, extent, scale, nh as u32, nhd * nr, g0r, ntu)?;
         } else {
             let int4 = self.int4_at(il);
             let l = &self.w.layers[ip];
-            self.k.attn_prefill8(&self.s, self.b.q.ptr, self.b.r.ptr, sink, l.rel_bias.ptr, kv8, self.b.att.ptr, self.params.ptr, ring, window, extent, scale, nh as u32, nhd * nr, g0r, ntu, int4)?;
+            self.k.attn_prefill8(&self.s, self.b.q.ptr, self.b.r.ptr, sink, l.rel_proj.ptr, kv8, self.b.att.ptr, self.params.ptr, ring, window, extent, scale, nh as u32, nhd * nr, g0r, ntu, int4)?;
         }
         self.probe("kqv_out", il, self.b.att.ptr, nt * nh)?;
         let gate = self.b.g0.at(nh * 4);
         self.k.mul_sigmoid_t(&self.s, self.b.att.ptr, gate, self.b.att2.ptr, ntu * nh as u32, nh as u32, g0r)?;
         let l = &self.w.layers[ip];
-        self.qgemm(&l.wo, self.b.att2.ptr, self.b.a.ptr, 0, true, nt)?;
+        self.gemm(&l.wo, self.b.att2.ptr, self.b.a.ptr, nt, n)?;
         let pscale = 1.0 / ((hp.n_conv + 1) as f32).sqrt();
         self.k.conv4_seq(&self.s, self.b.a.ptr, l.post_conv.ptr, st_post, None, self.b.a2.ptr, nu, 1, pscale, ntu, 0, nu)?;
         if block_start {
@@ -1268,8 +1231,8 @@ impl Engine {
         }
         let l = &self.w.layers[ip];
         self.k.rms_norm(&self.s, m, Some(l.ffn_norm.ptr), self.b.xn.ptr, nu, ntu, hp.eps)?;
-        self.k.router_logits_t(&self.s, l.router.ptr, self.b.xn.ptr, self.b.rlog.ptr, hp.n_expert as u32, nu, ntu)?;
-        self.k.router_topk_t(&self.s, self.b.rlog.ptr, l.probs_b.ptr, self.b.ids.ptr, self.b.wts.ptr, hp.w_scale, ntu)?;
+        self.gemm(&l.router, self.b.xn.ptr, self.b.rlog.ptr, nt, hp.n_expert)?;
+        self.k.router_topk_t(&self.s, self.b.rlog.ptr, l.router_bias.ptr, self.b.ids.ptr, self.b.wts.ptr, hp.w_scale, ntu)?;
         self.probe("ffn_norm_in", il, self.b.xn.ptr, nt * n)?;
         self.moe_t(ip, nt)?;
         self.probe("ffn_moe_out", il, self.b.moe.ptr, nt * n)?;
@@ -1280,13 +1243,11 @@ impl Engine {
         Ok(())
     }
 
-    /// The experts of a ubatch: the host groups the (token, expert) pairs by expert; the cached experts run as
-    /// grouped GEMMs on the GPU while the CPU team computes the others.
+    /// The experts of a ubatch: the host groups the (token, expert) pairs by expert, and the CPU team computes them all
+    /// (the GPU has no grouped kernels for NVFP4 and MXFP8 experts yet).
     fn moe_t(&mut self, ip: usize, nt: usize) -> Result<()> {
         let n = self.hp.n_embd;
         let nu = n as u32;
-        let ffu = self.hp.n_ff_exp as u32;
-        self.k.quant_q8_1(&self.s, self.b.xn.ptr, self.b.xq[0].ptr, self.b.xd[0].ptr, self.b.xs[0].ptr, nu, nt as u32)?;
         cuda::copy_d2h_async(self.b.host_ids.ptr, self.b.ids.ptr, nt * 8 * 4, &self.s)?;
         cuda::copy_d2h_async(self.b.host_xn.ptr, self.b.xn.ptr, nt * n * 4, &self.s)?;
         let t0 = std::time::Instant::now();
@@ -1294,93 +1255,36 @@ impl Engine {
         let t1 = std::time::Instant::now();
         self.stats.pf_gpu_s += (t1 - t0).as_secs_f64();
         let ids: Vec<u32> = self.b.host_ids.as_slice::<u32>()[..nt * 8].to_vec();
-        // group the pairs: cached experts by slot, the others by expert
-        let mut gpu_groups: Vec<(i32, Vec<(usize, usize)>)> = vec![];
-        let mut cpu_groups: Vec<(usize, Vec<(usize, usize)>)> = vec![];
-        let mut gi: HashMap<i32, usize> = HashMap::new();
-        let mut ci: HashMap<usize, usize> = HashMap::new();
-        let slots_h = self.b.host_slots.as_mut_slice::<i32>();
-        let slot_of: Vec<i32> = if GPU_PREFILL { self.cache.slot_of[ip].clone() } else { vec![-1; self.hp.n_expert] };
+        let mut groups: Vec<(usize, Vec<(usize, usize)>)> = vec![];
+        let mut gi: HashMap<usize, usize> = HashMap::new();
         for (p, &e) in ids.iter().enumerate() {
-            let e = e as usize;
-            let slot = slot_of[e];
-            slots_h[p] = slot;
-            let t = p / 8;
-            if slot >= 0 {
-                let g = *gi.entry(slot).or_insert_with(|| {
-                    gpu_groups.push((slot, vec![]));
-                    gpu_groups.len() - 1
-                });
-                gpu_groups[g].1.push((t, p));
-            } else {
-                let c = *ci.entry(e).or_insert_with(|| {
-                    cpu_groups.push((e, vec![]));
-                    cpu_groups.len() - 1
-                });
-                cpu_groups[c].1.push((t, p));
-            }
+            let g = *gi.entry(e as usize).or_insert_with(|| {
+                groups.push((e as usize, vec![]));
+                groups.len() - 1
+            });
+            groups[g].1.push((p / 8, p));
         }
-        if let Ok(mut u) = self.pool.usage.lock() {
-            for &e in &ids {
-                if slot_of[e as usize] >= 0 {
-                    u.freq[ip][e as usize] += 1.0;
-                }
-            }
-            u.hits += ids.iter().filter(|&&e| slot_of[e as usize] >= 0).count() as u64;
-            u.miss_count += ids.iter().filter(|&&e| slot_of[e as usize] < 0).count() as u64;
-        }
-        let gh = self.b.host_groups.as_mut_slice::<u32>();
-        let mut off = 0;
-        for (g, (slot, toks)) in gpu_groups.iter().enumerate() {
-            gh[3 * g] = *slot as u32;
-            gh[3 * g + 1] = toks.len() as u32;
-            gh[3 * g + 2] = off as u32;
-            for (i, &(t, p)) in toks.iter().enumerate() {
-                gh[384 + 2 * (off + i)] = t as u32;
-                gh[384 + 2 * (off + i) + 1] = p as u32;
-            }
-            off += toks.len();
-        }
-        let ng = gpu_groups.len();
+        // no pair on a GPU slot
+        self.b.host_slots.as_mut_slice::<i32>()[..nt * 8].fill(-1);
         cuda::copy_h2d_async(self.b.slots.ptr, self.b.host_slots.ptr, nt * 8 * 4, &self.s)?;
-        if ng > 0 && GPU_PREFILL {
-            cuda::copy_h2d_async(self.b.groups.ptr, self.b.host_groups.ptr, (384 + 2 * off) * 4, &self.s)?;
-            let tiles = gpu_groups.iter().map(|g| g.1.len()).max().unwrap_or(1).div_ceil(32) as u32;
-            let f = self.ex.fmt[ip];
-            let bk = &self.cache.banks[f.index()];
-            self.k.moe_g(&self.s, f, false, bk.gu.ptr, bk.gu_bytes as u64, self.b.groups.ptr, self.b.xq[0].ptr, self.b.xd[0].ptr, self.b.gu.ptr, 2 * ffu, nu, ng as u32, tiles)?;
-            self.k.situ_q8_n(&self.s, self.b.gu.ptr, self.b.aq.ptr, self.b.ad.ptr, self.b.asum.ptr, ffu, self.ex.beta, self.ex.lb, (nt * 8) as u32)?;
-            self.k.moe_g(&self.s, f, true, bk.down.ptr, bk.down_bytes as u64, self.b.groups.ptr, self.b.aq.ptr, self.b.ad.ptr, self.b.dn.ptr, nu, ffu, ng as u32, tiles)?;
-        }
-        // the misses on the CPU, meanwhile
-        self.stats.pf_gpu_pairs += gpu_groups.iter().map(|g| g.1.len() as u64).sum::<u64>();
-        self.stats.pf_cpu_pairs += cpu_groups.iter().map(|g| g.1.len() as u64).sum::<u64>();
-        let t2 = std::time::Instant::now();
-        let mut t3 = t2;
-        if !cpu_groups.is_empty() {
-            let xn = self.b.host_xn.as_slice::<f32>();
-            let mut need = vec![false; nt];
-            for (_, toks) in &cpu_groups {
-                for &(t, _) in toks {
-                    need[t] = true;
-                }
-            }
-            let xq: Vec<crate::cpu::Q8_0> = (0..nt)
-                .map(|t| {
-                    let mut q = crate::cpu::Q8_0::default();
-                    if need[t] {
-                        crate::cpu::quantize_q8_0(&xn[t * n..(t + 1) * n], &mut q);
-                    }
-                    q
-                })
-                .collect();
-            t3 = std::time::Instant::now();
-            self.pool.run_batch(crate::cpu_pool::BatchJob { layer: ip, xq, misses: cpu_groups, out: self.b.cpu_out.ptr as usize });
-        }
+        self.stats.pf_cpu_pairs += (nt * 8) as u64;
+        let xn = self.b.host_xn.as_slice::<f32>();
+        let fmt = self.ex.fmt[ip];
+        let xq: Vec<Act> = (0..nt)
+            .map(|t| {
+                let mut a = Act::default();
+                a.set(&xn[t * n..(t + 1) * n], fmt);
+                a
+            })
+            .collect();
+        let t3 = std::time::Instant::now();
+        self.pool.run_batch(crate::cpu_pool::BatchJob { layer: ip, xq, misses: groups, out: self.b.cpu_out.ptr as usize });
         let t4 = std::time::Instant::now();
         self.stats.pf_host_s += (t3 - t1).as_secs_f64();
         self.stats.pf_cpu_s += (t4 - t3).as_secs_f64();
-        self.k.moe_combine_t(&self.s, self.b.dn.ptr, self.b.cpu_out.dev, self.b.slots.ptr, self.b.wts.ptr, self.b.moe.ptr, nu, nt as u32)?;
+        // the slots are all -1: the combine reads only the CPU's outputs
+        let cpu = self.b.cpu_out.dev;
+        self.k.moe_combine_t(&self.s, cpu, cpu, self.b.slots.ptr, self.b.wts.ptr, self.b.moe.ptr, nu, nt as u32)?;
         // the cache keeps up during long prompts: uploads run on the copy stream meanwhile
         if self.ex.pinned {
             self.admit_d(false)?;
@@ -1416,8 +1320,10 @@ impl Engine {
         // messages of a looped pass: from the bank of the previous pass
         if looped {
             let (bank, out) = self.pass_bank.clone();
-            let mq = self.w.layers[ip].lp.as_ref().unwrap().msg_query.ptr;
-            self.mix(&bank, out, mq, self.sc.msgs.ptr, 4)?;
+            let lp = self.w.layers[ip].lp.as_ref().unwrap();
+            let (q_mlp, k_v) = (lp.q_mlp, lp.k_v);
+            self.mix(&bank, out, q_mlp, self.sc.msgs.ptr, 2)?;
+            self.mix(&bank, out, k_v, self.sc.msgs.at(2 * n * 4), 2)?;
         }
 
         // the layer input: a new block, or kept for the residual
@@ -1445,21 +1351,19 @@ impl Engine {
             }
         }
         if looped {
-            // the 3 input controllers at once
+            // the 3 input controllers at once: their inputs, down projections and outputs
             let lp = self.w.layers[ip].lp.as_ref().unwrap();
-            let mut t_in = vec![];
-            let mut t_w = vec![];
-            let mut t_out = vec![];
+            let rows = lp.down[0].rows;
+            let (mut t_in, mut t_down, mut t_out) = (vec![], vec![], vec![]);
             for j in 0..3 {
-                let (msg, out) = (self.sc.msgs.at(j * n * 4), self.sc.ctl_tmp.at(j * n * 4));
+                let (msg, out) = (self.sc.msgs.at(MSG[j] * n * 4), self.sc.ctl_tmp.at(j * n * 4));
                 t_in.extend([ins[j], msg]);
-                t_w.extend([lp.down[j].qs.ptr, lp.down[j].d.ptr]);
-                t_out.extend([ins[j], msg, lp.gain[j].qs.ptr, lp.gain[j].d.ptr, lp.forget[j].qs.ptr, lp.forget[j].d.ptr, out]);
+                t_down.extend([lp.down[j].w.ptr, self.sc.ctl_g3.at(j * 2 * n * 4), self.sc.ctl_gate3.at(j * rows * 4), rows as u64]);
+                t_out.extend([ins[j], msg, lp.gain[j].ptr, lp.forget[j].ptr, out]);
             }
-            let rows = lp.down[0].rows as u32;
-            let (t_in, t_w, t_out) = (self.ptr_list(&t_in)?, self.ptr_list(&t_w)?, self.ptr_list(&t_out)?);
-            self.k.ctrl_in_qz(&self.s, t_in, self.sc.cq.ptr, self.sc.cd.ptr, self.sc.cs.ptr, nu, 3)?;
-            self.k.gemv_q8dz(&self.s, t_w, self.sc.cq.ptr, self.sc.cd.ptr, self.sc.ctl_gate3.ptr, rows, 2 * nu, 3)?;
+            let (t_in, t_down, t_out) = (self.ptr_list(&t_in)?, self.ptr_list(&t_down)?, self.ptr_list(&t_out)?);
+            self.k.ctrl_in_z(&self.s, t_in, self.sc.ctl_g3.ptr, nu, 3)?;
+            self.k.gemv_bf16t(&self.s, t_down, rows as u32, 2 * nu, 3)?;
             self.k.ctrl_outz(&self.s, t_out, self.sc.ctl_gate3.ptr, nu, 3)?;
             for (j, inp) in ins.iter_mut().enumerate() {
                 *inp = self.sc.ctl_tmp.at(j * n * 4);
@@ -1469,32 +1373,30 @@ impl Engine {
         for j in 0..nin {
             let w = self.w.layers[ip].in_norms[if swa { 0 } else { j }].ptr;
             let out = self.sc.inputs.at(j * n * 4);
-            let (q, d, sx) = match j {
-                0 => (&self.sc.xq, &self.sc.xd, &self.sc.xs),
-                1 => (&self.sc.xq2, &self.sc.xd2, &self.sc.xs2),
-                _ => (&self.sc.xq3, &self.sc.xd3, &self.sc.xs3),
-            };
-            self.k.norm_q8(&self.s, ins[j], w, out, q.ptr, d.ptr, sx.ptr, nu, hp.eps, 1, nu)?;
+            self.k.rms_norm(&self.s, ins[j], Some(w), out, nu, 1, hp.eps)?;
+            ins[j] = out;
+        }
+        if nin == 1 {
+            ins[1] = ins[0];
+            ins[2] = ins[0];
         }
 
-        // projections
+        // the projections of the q, k and v inputs in one launch, each checkpoint matrix into its part of g0 (q | gate |
+        // rel | sink), gk (k | k taps) or gv (v | v taps)
         let l = &self.w.layers[ip];
-        let (g0, gk, gv) = (&l.g0, &l.gk, &l.gv);
-        let shared_in = nin == 1;
-        // g0, gk and gv in one launch
-        let xb = |w: usize| match w {
-            0 => (self.sc.xq.ptr, self.sc.xd.ptr),
-            1 => (self.sc.xq2.ptr, self.sc.xd2.ptr),
-            _ => (self.sc.xq3.ptr, self.sc.xd3.ptr),
-        };
         let mut tab = vec![];
-        for (j, (m, y)) in [(g0, self.sc.g0.ptr), (gk, self.sc.gk.ptr), (gv, self.sc.gv.ptr)].into_iter().enumerate() {
-            let (xq, xd) = xb(if shared_in { 0 } else { j });
-            tab.extend([m.qs.ptr, m.d.ptr, xq, xd, y, m.rows as u64]);
+        let mut max_rows = 0;
+        for (mats, x, y) in [(&l.g0, ins[0], &self.sc.g0), (&l.gk, ins[1], &self.sc.gk), (&l.gv, ins[2], &self.sc.gv)] {
+            let mut off = 0;
+            for m in mats {
+                tab.extend([m.w.ptr, x, y.at(off * 4), m.rows as u64]);
+                off += m.rows;
+                max_rows = max_rows.max(m.rows);
+            }
         }
-        let (max_rows, k) = (g0.rows.max(gk.rows).max(gv.rows) as u32, g0.k as u32);
+        let nz = (tab.len() / 4) as u32;
         let tab = self.ptr_list(&tab)?;
-        self.k.gemv_q8dt(&self.s, tab, max_rows, k, 3)?;
+        self.k.gemv_bf16t(&self.s, tab, max_rows as u32, nu, nz)?;
         let l = &self.w.layers[ip];
         let nh = (hp.n_head * hp.head_dim) as u32;
         let q_raw = self.sc.g0.ptr;
@@ -1541,12 +1443,12 @@ impl Engine {
         let nsplit = if swa { (hp.n_swa >> CS_SWA) as u32 } else { self.n_ctx.div_ceil(1 << CS_FULL) as u32 };
         if kv_f16() {
             let nsplit = if swa { hp.n_swa.div_ceil(256) as u32 } else { self.n_ctx.div_ceil(256) as u32 };
-            self.k.attn_part(&self.s, self.sc.q.ptr, self.sc.r.ptr, sink, l.rel_bias.ptr, kv8[0], kv8[2], self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, p_pos, ring, extent, scale, maxs, nsplit, window)?;
+            self.k.attn_part(&self.s, self.sc.q.ptr, self.sc.r.ptr, sink, l.rel_proj.ptr, kv8[0], kv8[2], self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, p_pos, ring, extent, scale, maxs, nsplit, window)?;
             self.k.attn_reduce(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, p_pos, window, maxs, hp.n_head as u32)?;
         } else {
             let int4 = self.int4_at(il);
             let l = &self.w.layers[ip];
-            self.k.attn_part8(&self.s, self.sc.q.ptr, self.sc.r.ptr, sink, l.rel_bias.ptr, kv8, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, p_pos, ring, extent, scale, maxs, nsplit, window, cs, int4)?;
+            self.k.attn_part8(&self.s, self.sc.q.ptr, self.sc.r.ptr, sink, l.rel_proj.ptr, kv8, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, p_pos, ring, extent, scale, maxs, nsplit, window, cs, int4)?;
             if !swa {
                 // the per-chunk max and sum of each head: [kv head][chunk][3]
                 self.probe("attn_pm", il, self.sc.pm.ptr, 8 * maxs as usize * 3)?;
@@ -1555,10 +1457,9 @@ impl Engine {
             self.k.attn_reduce8(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, p_pos, window, maxs, cs, hp.n_head as u32)?;
         }
         self.probe("kqv_out", il, self.sc.att.ptr, nh as usize)?;
-        self.k.gate_q8(&self.s, self.sc.att.ptr, gate, self.sc.xq.ptr, self.sc.xd.ptr, self.sc.xs.ptr, nh)?;
+        self.k.mul_sigmoid(&self.s, self.sc.att.ptr, gate, self.sc.att2.ptr, nh)?;
         let l = &self.w.layers[ip];
-        let wo = &l.wo;
-        self.qgemv(wo, self.sc.att2.ptr, self.sc.a.ptr, 0, false)?;
+        self.gemv(&l.wo, self.sc.att2.ptr, self.sc.a.ptr)?;
         let pscale = 1.0 / ((hp.n_conv + 1) as f32).sqrt();
         // residual streams: a block start begins a new one (the old one joins the blocks), else x = inp_sa + conv(a)
         if block_start {
@@ -1574,14 +1475,14 @@ impl Engine {
         self.mix(&blocks.clone(), x, frq, self.sc.ffm.ptr, 1)?;
         let mut m = self.sc.ffm.ptr;
         if looped {
-            self.control(ip, 3, m, self.sc.msgs.at(3 * n * 4), self.sc.ffm2.ptr)?;
+            self.control(ip, 3, m, self.sc.msgs.at(MSG[3] * n * 4), self.sc.ffm2.ptr)?;
             m = self.sc.ffm2.ptr;
         }
         let l = &self.w.layers[ip];
         self.k.norm_q8(&self.s, m, l.ffn_norm.ptr, self.sc.xn.ptr, self.sc.xq.ptr, self.sc.xd.ptr, self.sc.xs.ptr, nu, hp.eps, 1, nu)?;
         self.probe("ffn_norm_in", il, self.sc.xn.ptr, n)?;
         let l = &self.w.layers[ip];
-        self.k.router_logits(&self.s, l.router.ptr, self.sc.xn.ptr, self.sc.rlog.ptr, hp.n_expert as u32, nu)?;
+        self.gemv(&l.router, self.sc.xn.ptr, self.sc.rlog.ptr)?;
         self.moe(ip, il, si, st_ffn, pscale)?;
         self.probe("l_out", il, x, n)?;
         Ok(())
@@ -1593,16 +1494,11 @@ impl Engine {
         let map_row = self.map.at(ip * self.hp.n_expert * 4);
         let l = &self.w.layers[ip];
         self.k.router_dispatch(
-            &self.s, self.sc.rlog.ptr, l.probs_b.ptr, self.sc.ids.ptr, self.sc.wts.ptr, self.hp.w_scale, map_row, self.sc.slots.ptr, self.sc.xn.ptr, self.job.dev,
+            &self.s, self.sc.rlog.ptr, l.router_bias.ptr, self.sc.ids.ptr, self.sc.wts.ptr, self.hp.w_scale, map_row, self.sc.slots.ptr, self.sc.xn.ptr, self.job.dev,
             self.params.ptr, si, ip as u32, n,
         )?;
-        let ffu = self.hp.n_ff_exp as u32;
         if GPU_EXPERTS {
-            let f = self.ex.fmt[ip];
-            let bk = &self.cache.banks[f.index()];
-            self.k.moe_d(&self.s, f, bk.gu.ptr, bk.gu_bytes as u64, self.sc.slots.ptr, self.sc.xq.ptr, self.sc.xd.ptr, 0, self.sc.gu.ptr, 2 * ffu, n)?;
-            self.k.situ_q8(&self.s, self.sc.gu.ptr, self.sc.slots.ptr, self.sc.aq.ptr, self.sc.ad.ptr, self.sc.asum.ptr, ffu, self.ex.beta, self.ex.lb)?;
-            self.k.moe_d(&self.s, f, bk.down.ptr, bk.down_bytes as u64, self.sc.slots.ptr, self.sc.aq.ptr, self.sc.ad.ptr, ffu, self.sc.dn.ptr, n, ffu)?;
+            self.experts_d(ip)?;
         }
         self.k.moe_wait(&self.s, self.ack.dev, self.params.ptr, si, self.err.dev, 5_000_000_000)?;
         let l = &self.w.layers[ip];
@@ -1617,6 +1513,29 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// The cached experts of `sc.slots` (the 8 of physical layer ip) on the GPU: gate_up, the activation, and down into
+    /// sc.dn. NVFP4 experts read x as q8_1 (sc.xq, from the norm; the activations as aq), MXFP8 ones as f32 (sc.xn, af).
+    fn experts_d(&self, ip: usize) -> Result<()> {
+        let (n, ffu) = (self.hp.n_embd as u32, self.hp.n_ff_exp as u32);
+        let (sc, f) = (&self.sc, self.ex.fmt[ip]);
+        let bk = &self.cache.banks[f.index()];
+        let (gu_b, dn_b) = (bk.gu_bytes as u64, bk.down_bytes as u64);
+        let situ = || self.k.situ_q8(&self.s, sc.gu.ptr, sc.slots.ptr, sc.af.ptr, sc.aq.ptr, sc.ad.ptr, sc.asum.ptr, ffu, self.ex.beta, self.ex.lb);
+        match f {
+            Fmt::NvFp4 => {
+                let ((gu_a, gu_d), (dn_a, dn_d)) = (self.cache.factor_ptrs(ip, 0), self.cache.factor_ptrs(ip, 1));
+                self.k.moe_nvfp4_d(&self.s, bk.gu.ptr, gu_b, sc.slots.ptr, sc.ids.ptr, gu_a, gu_d, sc.xq.ptr, sc.xd.ptr, 0, sc.gu.ptr, 2 * ffu, n)?;
+                situ()?;
+                self.k.moe_nvfp4_d(&self.s, bk.down.ptr, dn_b, sc.slots.ptr, sc.ids.ptr, dn_a, dn_d, sc.aq.ptr, sc.ad.ptr, ffu, sc.dn.ptr, n, ffu)
+            }
+            Fmt::MxFp8 => {
+                self.k.moe_mxfp8_d(&self.s, bk.gu.ptr, gu_b, sc.slots.ptr, sc.xn.ptr, 0, sc.gu.ptr, 2 * ffu, n)?;
+                situ()?;
+                self.k.moe_mxfp8_d(&self.s, bk.down.ptr, dn_b, sc.slots.ptr, sc.af.ptr, ffu, sc.dn.ptr, n, ffu)
+            }
+        }
     }
 
     /// Times each kernel kind on layer 6's buffers: (name, microseconds per call, bytes read per call).
@@ -1648,21 +1567,20 @@ impl Engine {
         self.k.quant_q8_1(&self.s, x, self.sc.xq.ptr, self.sc.xd.ptr, self.sc.xs.ptr, n, 1)?;
         time!("quant_q8_1 2304", 4 * n as usize, self.k.quant_q8_1(&self.s, x, self.sc.xq.ptr, self.sc.xd.ptr, self.sc.xs.ptr, n, 1)?);
         let l = &self.w.layers[6];
-        let (g0, wo) = (&l.g0, &l.wo);
-        time!("gemv_q8d g0 6552x2304", g0.bytes(), self.qgemv(g0, x, self.sc.g0.ptr, 0, false)?);
-        time!("gemv_q8d wo 2304x3072", wo.bytes(), self.qgemv(wo, x, self.sc.a.ptr, 0, false)?);
+        let (wq, wo) = (&l.g0[0], &l.wo);
+        time!("gemv_bf16 wq 3072x2304", wq.bytes(), self.gemv(wq, x, self.sc.g0.ptr)?);
+        time!("gemv_bf16 wo 2304x3072", wo.bytes(), self.gemv(wo, x, self.sc.a.ptr)?);
         let o = &self.w.output;
-        time!("gemv_q8d output 201024x2304", o.bytes(), self.qgemv(o, x, self.sc.logits_raw.ptr, 0, false)?);
+        time!(format!("gemv_bf16 output {}x2304", o.rows), o.bytes(), self.gemv(o, x, self.sc.logits_raw.ptr)?);
         self.sc.slots.upload(&[0i32, 1, 2, 3, 4, 5, 6, 7])?;
-        let ffu = hp.n_ff_exp as u32;
-        let (nv, b0) = (crate::experts::Fmt::Nv4, &self.cache.banks[0]);
-        time!("moe_nv4_d gate_up 8 experts", 8 * b0.gu_bytes, self.k.moe_d(&self.s, nv, b0.gu.ptr, b0.gu_bytes as u64, self.sc.slots.ptr, self.sc.xq.ptr, self.sc.xd.ptr, 0, self.sc.gu.ptr, 2 * ffu, n)?);
-        time!("situ_q8 8 experts", 8 * 8 * ffu as usize, self.k.situ_q8(&self.s, self.sc.gu.ptr, self.sc.slots.ptr, self.sc.aq.ptr, self.sc.ad.ptr, self.sc.asum.ptr, ffu, 4.0, 25.0)?);
-        time!("moe_nv4_d down 8 experts", 8 * b0.down_bytes, self.k.moe_d(&self.s, nv, b0.down.ptr, b0.down_bytes as u64, self.sc.slots.ptr, self.sc.aq.ptr, self.sc.ad.ptr, ffu, self.sc.dn.ptr, n, ffu)?);
-        let (q8, b1) = (crate::experts::Fmt::Q8, &self.cache.banks[1]);
-        if b1.n_slots >= 8 {
-            time!("moe_q8_d gate_up 8 experts", 8 * b1.gu_bytes, self.k.moe_d(&self.s, q8, b1.gu.ptr, b1.gu_bytes as u64, self.sc.slots.ptr, self.sc.xq.ptr, self.sc.xd.ptr, 0, self.sc.gu.ptr, 2 * ffu, n)?);
-            time!("moe_q8_d down 8 experts", 8 * b1.down_bytes, self.k.moe_d(&self.s, q8, b1.down.ptr, b1.down_bytes as u64, self.sc.slots.ptr, self.sc.aq.ptr, self.sc.ad.ptr, ffu, self.sc.dn.ptr, n, ffu)?);
+        self.sc.ids.upload(&[0u32, 1, 2, 3, 4, 5, 6, 7])?;
+        // an NVFP4 layer and the MXFP8 last one, on the first 8 slots of their banks
+        for ip in [6, hp.n_phys - 1] {
+            let f = self.ex.fmt[ip];
+            let bk = &self.cache.banks[f.index()];
+            if bk.n_slots >= 8 {
+                time!(format!("experts {f:?} x8: gate_up, act, down"), 8 * (bk.gu_bytes + bk.down_bytes), self.experts_d(ip)?);
+            }
         }
         let maxs = self.maxs as u32;
         let mut cases = vec![(1024u32, (hp.n_swa + T_MAX) as u32, 6usize)];
@@ -1681,7 +1599,7 @@ impl Engine {
             let int4 = self.int4_at(kvi);
             let row: usize = if ring != 0 { KV_ROW * 2 } else { kv_widths(int4).iter().sum() };
             time!(format!("attn part+reduce {keys} keys"), keys as usize * row, {
-                self.k.attn_part8(&self.s, self.sc.q.ptr, self.sc.r.ptr, self.sc.g0.ptr, lr.rel_bias.ptr, kv8, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.params.ptr, ring, 1024, 0.088, maxs, nsplit, window, cs, int4)?;
+                self.k.attn_part8(&self.s, self.sc.q.ptr, self.sc.r.ptr, self.sc.g0.ptr, lr.rel_proj.ptr, kv8, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.params.ptr, ring, 1024, 0.088, maxs, nsplit, window, cs, int4)?;
                 self.k.attn_reduce8(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, self.params.ptr, window, maxs, cs, hp.n_head as u32)?
             });
         }
@@ -1690,18 +1608,18 @@ impl Engine {
         let l = &self.w.layers[6];
         time!("mix 4 states 1 query", 4 * 4 * n as usize, self.k.mix(&self.s, pl, 4, l.ffn_res_query.ptr, self.sc.ffm.ptr, 1, n)?);
         time!("rms_norm 2304", 4 * n as usize, self.k.rms_norm(&self.s, self.sc.x.ptr, Some(l.ffn_norm.ptr), self.sc.xn.ptr, n, 1, hp.eps)?);
-        time!("router logits+topk", 4 * n as usize * 128, {
-            self.k.router_logits(&self.s, l.router.ptr, self.sc.xn.ptr, self.sc.rlog.ptr, hp.n_expert as u32, n)?;
-            self.k.router_topk(&self.s, self.sc.rlog.ptr, l.probs_b.ptr, self.sc.ids.ptr, self.sc.wts.ptr, 8.0)?
+        time!("router logits+topk", l.router.bytes(), {
+            self.gemv(&l.router, self.sc.xn.ptr, self.sc.rlog.ptr)?;
+            self.k.router_topk(&self.s, self.sc.rlog.ptr, l.router_bias.ptr, self.sc.ids.ptr, self.sc.wts.ptr, 8.0)?
         });
         time!("conv4 2304", 4 * 8 * n as usize, self.k.conv4(&self.s, self.sc.a.ptr, l.post_conv.ptr, self.conv[6].ptr, None, self.sc.a2.ptr, n, 1, 0.4)?);
         time!("clip 24x128", 4 * 3072, self.k.clip_rows(&self.s, self.sc.g0.ptr, Some(l.q_clip.ptr), self.sc.q.ptr, 128, 24, 24, 22.6, self.params.at(8))?);
         time!("add 2304", 12 * n as usize, self.k.add(&self.s, self.sc.x.ptr, self.sc.f.ptr, self.sc.x.ptr, n)?);
         let lp = self.w.layers[6].lp.as_ref().unwrap();
         let d = &lp.down[0];
-        time!("ctrl down 64x4608 (q8d)", d.bytes(), self.qgemv(d, self.sc.ctl_g.ptr, self.sc.ctl_gate.ptr, 0, true)?);
-        let (gm, fm) = (&lp.gain[0], &lp.forget[0]);
-        time!("ctrl_out", gm.bytes() + fm.bytes(), self.k.ctrl_out(&self.s, self.sc.x.ptr, self.sc.msgs.ptr, self.sc.ctl_gate.ptr, gm.qs.ptr, gm.d.ptr, fm.qs.ptr, fm.d.ptr, self.sc.ffm2.ptr, n)?);
+        time!("ctrl down 64x4608 (bf16)", d.bytes(), self.gemv(d, self.sc.ctl_g.ptr, self.sc.ctl_gate.ptr)?);
+        let (gw, fw) = (lp.gain[0].ptr, lp.forget[0].ptr);
+        time!("ctrl_out", 2 * 2 * n as usize * hp.gate_rank, self.k.ctrl_out(&self.s, self.sc.x.ptr, self.sc.msgs.ptr, self.sc.ctl_gate.ptr, gw, fw, self.sc.ffm2.ptr, n)?);
         time!("ctrl_in", 16 * n as usize, self.k.ctrl_in(&self.s, self.sc.x.ptr, self.sc.msgs.ptr, self.sc.ctl_g.ptr, n)?);
         Ok(res)
     }

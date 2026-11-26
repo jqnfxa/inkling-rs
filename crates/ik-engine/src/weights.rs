@@ -1,81 +1,96 @@
-//! Device-resident weights: everything but the experts and the token embedding.
+//! Device-resident weights: everything but the experts and the token embedding. Each is a copy of a checkpoint tensor
+//! as the file holds it: the BF16 matrices and vectors, the F32 queries of the residual mixes and the router's F32
+//! bias. The kernels read them in these layouts.
 
+use crate::checkpoint::{Checkpoint, Dtype};
 use crate::cuda::{DevBuf, Result};
-use crate::gguf::{Gguf, GgmlType};
 use crate::hp::Hp;
-use crate::quant::{float_row, quantize_q8_rows, repack_q8};
+use crate::kernels::P;
 
-/// A repacked Q8_0 matrix: `qs` [rows][k] int8, `d` [rows][k/32] f16 (float matrices are quantized to it). Several GGUF matrices of the same k may be
-/// stacked by rows, so that one GEMV computes them all.
-pub struct Q8Mat {
-    pub qs: DevBuf,
-    pub d: DevBuf,
+/// A BF16 matrix [rows][k], row-major as the checkpoint has it.
+pub struct Mat {
+    pub w: DevBuf,
     pub rows: usize,
     pub k: usize,
 }
 
-impl Q8Mat {
-    pub fn load(g: &Gguf, names: &[&str]) -> Result<Q8Mat> {
-        let (mut qs, mut d) = (Vec::new(), Vec::new());
-        let mut rows = 0;
-        let mut k = 0;
-        for name in names {
-            let t = g.tensor(name)?;
-            if t.ne.len() != 2 {
-                return Err(format!("{name} is not a matrix"));
-            }
-            if k != 0 && k != t.ne[0] {
-                return Err(format!("{name}: k {} differs from {k}", t.ne[0]));
-            }
-            k = t.ne[0];
-            rows += t.ne[1];
-            match t.ty {
-                GgmlType::Q8_0 => repack_q8(g.bytes(t), t.ne[1], k, &mut qs, &mut d),
-                // the small float matrices (BF16 projections, F32 loop gates) join the Q8_0 GEMVs they are stacked in
-                GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => {
-                    let mut x = vec![0f32; t.ne[0] * t.ne[1]];
-                    float_row(t.ty, g.bytes(t), &mut x);
-                    quantize_q8_rows(&x, k, &mut qs, &mut d);
-                }
-                ty => return Err(format!("{name} is {ty:?}: the GEMVs take Q8_0 or float matrices")),
-            }
-        }
-        Ok(Q8Mat { qs: DevBuf::from_slice(&qs)?, d: DevBuf::from_slice(&d)?, rows, k })
+impl Mat {
+    fn load(ck: &Checkpoint, name: &str, rows: usize, k: usize) -> Result<Mat> {
+        Self::first_rows(ck, name, rows, rows, k)
+    }
+
+    /// The first `keep` rows of BF16 [rows][k] tensor `name` (the unembedding without its padded rows).
+    fn first_rows(ck: &Checkpoint, name: &str, rows: usize, keep: usize, k: usize) -> Result<Mat> {
+        let b = ck.get(name, Dtype::BF16, &[rows, k])?;
+        Ok(Mat { w: DevBuf::from_slice(&b[..keep * k * 2])?, rows: keep, k })
     }
 
     pub fn bytes(&self) -> usize {
-        self.qs.len + self.d.len
+        self.rows * self.k * 2
     }
 }
 
+/// Tensor `name`, which must be of `dtype` and `shape`, copied to the GPU.
+fn tensor(ck: &Checkpoint, name: &str, dtype: Dtype, shape: &[usize]) -> Result<DevBuf> {
+    DevBuf::from_slice(ck.get(name, dtype, shape)?)
+}
+
 pub struct LoopW {
-    pub msg_query: DevBuf, // [4][n_embd]
-    pub down: Vec<Q8Mat>,   // [4] of [64][2 n_embd]
-    pub gain: Vec<Q8Mat>,   // [4] of [n_embd][64]
-    pub forget: Vec<Q8Mat>,
+    /// this loop layer's message queries (f32, two each): its q and mlp ones in Weights::msg_queries, its k and v ones
+    /// in Weights::msg_kv_queries
+    pub q_mlp: P,
+    pub k_v: P,
+    /// the controllers (message gates) of the q, k and v inputs and of the MoE input: the checkpoint's attn, k, v and
+    /// mlp controllers. down [64][2 n_embd]; gain (the message gate) and forget [n_embd][64]
+    pub down: Vec<Mat>,
+    pub gain: Vec<DevBuf>,
+    pub forget: Vec<DevBuf>,
+}
+
+impl LoopW {
+    /// The message query of controller c (0 q, 1 k, 2 v, 3 the MoE input).
+    pub fn query(&self, c: usize, n_embd: usize) -> P {
+        match c {
+            0 => self.q_mlp,
+            1 => self.k_v,
+            2 => self.k_v + (n_embd * 4) as u64,
+            _ => self.q_mlp + (n_embd * 4) as u64,
+        }
+    }
 }
 
 pub struct Layer {
     pub swa: bool,
     /// SWA: [attn_norm]; full attention: [q, k, v] input norms
     pub in_norms: Vec<DevBuf>,
-    pub attn_res_query: Option<DevBuf>, // [nq][n_embd], nq = 1 (SWA) or 3
-    pub ffn_res_query: DevBuf,
+    pub attn_res_query: Option<DevBuf>, // [nq][n_embd] f32, nq = 1 (SWA) or 3 (q, k, v)
+    pub ffn_res_query: DevBuf,          // [n_embd] f32
     pub ffn_norm: DevBuf,
-    pub g0: Q8Mat, // q | gate | rel | sink
-    pub gk: Q8Mat, // k | k_conv_proj
-    pub gv: Q8Mat, // v | v_conv_proj
-    pub wo: Q8Mat,
-    pub q_clip: DevBuf,
-    pub rel_clip: DevBuf,
-    pub rel_bias: DevBuf,
+    /// the projections of the q input, in their order in g0: q, the output gate, the relative states, the sinks
+    pub g0: Vec<Mat>,
+    /// the projections of the k (v) input in their order in gk (gv): k (v), and in full attention the dynamic taps of
+    /// its convolution
+    pub gk: Vec<Mat>,
+    pub gv: Vec<Mat>,
+    pub wo: Mat,
+    pub q_clip: DevBuf,   // [n_head][head_dim]
+    pub rel_clip: DevBuf, // [n_head][n_rel]
+    pub rel_proj: DevBuf, // [n_rel][extent]: the bias profiles (extent n_swa or rel_extent)
+    /// SWA: the conv1d weights [kv][4]; full attention: the static taps [4][kv] (lag 0 the current token)
     pub k_conv: DevBuf,
     pub v_conv: DevBuf,
-    pub post_conv: DevBuf,
-    pub ffn_post_conv: DevBuf,
-    pub router: DevBuf, // [n_expert][n_embd]
-    pub probs_b: DevBuf,
+    pub post_conv: DevBuf,     // [n_embd][4]
+    pub ffn_post_conv: DevBuf, // [n_embd][4]
+    pub router: Mat,           // [n_expert][n_embd]
+    pub router_bias: DevBuf,   // [n_expert] f32
     pub lp: Option<LoopW>,
+}
+
+impl Layer {
+    /// Rows of g0: q, gate, relative states and sinks.
+    pub fn g0_rows(&self) -> usize {
+        self.g0.iter().map(|m| m.rows).sum()
+    }
 }
 
 pub struct Weights {
@@ -83,82 +98,104 @@ pub struct Weights {
     pub tok_norm: DevBuf,
     pub output_norm: DevBuf,
     pub output_res_query: DevBuf,
-    pub output: Q8Mat,
+    /// the unembedding's first n_vocab rows (the rest pad the vocabulary)
+    pub output: Mat,
+    /// [2 loop layers][n_embd] f32 each: middle_cycle_cross_pass_queries (q, mlp) and its kv_queries (k, v)
+    pub msg_queries: DevBuf,
+    pub msg_kv_queries: DevBuf,
     pub bytes: usize,
 }
 
-fn f32buf(g: &Gguf, name: &str) -> Result<DevBuf> {
-    DevBuf::from_slice(&g.f32s(name)?)
-}
-
 impl Weights {
-    pub fn load(g: &Gguf, hp: &Hp) -> Result<Weights> {
+    pub fn load(ck: &Checkpoint, hp: &Hp) -> Result<Weights> {
+        let (n, nh, kv) = (hp.n_embd, hp.n_head * hp.head_dim, hp.kv_dim());
+        let (bf, f32_) = (Dtype::BF16, Dtype::F32);
+        let core = hp.loop_end - hp.loop_start;
+        let msg_queries = tensor(ck, "model.llm.middle_cycle_cross_pass_queries", f32_, &[2 * core, n])?;
+        let msg_kv_queries = tensor(ck, "model.llm.middle_cycle_cross_pass_kv_queries", f32_, &[2 * core, n])?;
         let mut layers = Vec::with_capacity(hp.n_phys);
         let mut bytes = 0;
         for i in 0..hp.n_phys {
-            let n = |s: &str| format!("blk.{i}.{s}");
+            let p = |s: &str| format!("model.llm.layers.{i}.{s}");
+            let vec_bf = |s: &str| tensor(ck, &p(s), bf, &[n]);
             let swa = hp.is_swa[i];
             let in_norms = if swa {
-                vec![f32buf(g, &n("attn_norm.weight"))?]
+                vec![vec_bf("attn_norm.weight")?]
             } else {
-                vec![f32buf(g, &n("attn_q_inp_norm.weight"))?, f32buf(g, &n("attn_k_inp_norm.weight"))?, f32buf(g, &n("attn_v_inp_norm.weight"))?]
+                vec![vec_bf("q_input_norm.weight")?, vec_bf("k_input_norm.weight")?, vec_bf("v_input_norm.weight")?]
             };
-            let attn_res_query = if i > 0 { Some(f32buf(g, &n("attn_res_query.weight"))?) } else { None };
-            let g0 = Q8Mat::load(g, &[&n("attn_q.weight"), &n("attn_gate.weight"), &n("attn_rel.weight"), &n("attn_sink_proj.weight")])?;
-            let (gk, gv) = if swa {
-                (Q8Mat::load(g, &[&n("attn_k.weight")])?, Q8Mat::load(g, &[&n("attn_v.weight")])?)
+            // the query of layer i's attention inputs is attn_queries.{i - 1} (layer 0 has none)
+            let attn_res_query = if i == 0 {
+                None
             } else {
-                (
-                    Q8Mat::load(g, &[&n("attn_k.weight"), &n("attn_k_conv_proj.weight")])?,
-                    Q8Mat::load(g, &[&n("attn_v.weight"), &n("attn_v_conv_proj.weight")])?,
-                )
+                let name = format!("model.llm.attn_res.attn_queries.{}", i - 1);
+                Some(if swa { tensor(ck, &name, f32_, &[n])? } else { tensor(ck, &name, f32_, &[3, n])? })
             };
-            let wo = Q8Mat::load(g, &[&n("attn_output.weight")])?;
+            let g0 = vec![
+                Mat::load(ck, &p("attn.wq_du.weight"), nh, n)?,
+                Mat::load(ck, &p("attn.gate_attn.weight"), nh, n)?,
+                Mat::load(ck, &p("attn.wr_du.weight"), hp.n_head * hp.n_rel, n)?,
+                Mat::load(ck, &p("attn.attn_sink_proj.weight"), hp.n_head, n)?,
+            ];
+            let mut gk = vec![Mat::load(ck, &p("attn.wk_dv.weight"), kv, n)?];
+            let mut gv = vec![Mat::load(ck, &p("attn.wv_dv.weight"), kv, n)?];
+            let taps = hp.n_head_kv * hp.n_conv;
+            let (k_conv, v_conv) = if swa {
+                (tensor(ck, &p("attn.k_sconv.weight"), bf, &[kv, 1, hp.n_conv])?, tensor(ck, &p("attn.v_sconv.weight"), bf, &[kv, 1, hp.n_conv])?)
+            } else {
+                gk.push(Mat::load(ck, &p("attn.k_sconv.weight_proj"), taps, n)?);
+                gv.push(Mat::load(ck, &p("attn.v_sconv.weight_proj"), taps, n)?);
+                (tensor(ck, &p("attn.k_sconv.static_w"), bf, &[hp.n_conv, kv])?, tensor(ck, &p("attn.v_sconv.static_w"), bf, &[hp.n_conv, kv])?)
+            };
+            let wo = Mat::load(ck, &p("attn.wo_ud.weight"), n, nh)?;
             let lp = if i >= hp.loop_start && i < hp.loop_end {
-                let ctl = ["q", "k", "v", "ffn"];
-                let mut down = vec![];
-                let mut gain = vec![];
-                let mut forget = vec![];
-                for c in ctl {
-                    down.push(Q8Mat::load(g, &[&n(&format!("loop_{c}_ctrl_down.weight"))])?);
-                    gain.push(Q8Mat::load(g, &[&n(&format!("loop_{c}_ctrl_gain.weight"))])?);
-                    forget.push(Q8Mat::load(g, &[&n(&format!("loop_{c}_ctrl_forget.weight"))])?);
+                let j = i - hp.loop_start;
+                let (mut down, mut gain, mut forget) = (vec![], vec![], vec![]);
+                for c in ["attn", "k", "v", "mlp"] {
+                    let q = |s: &str| p(&format!("controllers.{c}.{s}"));
+                    down.push(Mat::load(ck, &q("down_weight"), hp.gate_rank, 2 * n)?);
+                    gain.push(tensor(ck, &q("gain_weight"), bf, &[n, hp.gate_rank])?);
+                    forget.push(tensor(ck, &q("forget_weight"), bf, &[n, hp.gate_rank])?);
                 }
-                Some(LoopW { msg_query: f32buf(g, &n("loop_msg_query.weight"))?, down, gain, forget })
+                Some(LoopW { q_mlp: msg_queries.at(2 * j * n * 4), k_v: msg_kv_queries.at(2 * j * n * 4), down, gain, forget })
             } else {
                 None
             };
-            bytes += g0.bytes() + gk.bytes() + gv.bytes() + wo.bytes();
+            let router = Mat::load(ck, &p("mlp.gate.weight"), hp.n_expert, n)?;
+            bytes += g0.iter().chain(&gk).chain(&gv).chain([&wo, &router]).map(Mat::bytes).sum::<usize>();
+            bytes += lp.as_ref().map_or(0, |l| l.down.iter().map(Mat::bytes).sum::<usize>() + 2 * 4 * n * hp.gate_rank * 2);
             layers.push(Layer {
                 swa,
                 in_norms,
                 attn_res_query,
-                ffn_res_query: f32buf(g, &n("ffn_res_query.weight"))?,
-                ffn_norm: f32buf(g, &n("ffn_norm.weight"))?,
+                ffn_res_query: tensor(ck, &format!("model.llm.attn_res.mlp_queries.{i}"), f32_, &[n])?,
+                ffn_norm: vec_bf("mlp_norm.weight")?,
                 g0,
                 gk,
                 gv,
                 wo,
-                q_clip: f32buf(g, &n("attn_q_clip.weight"))?,
-                rel_clip: f32buf(g, &n("attn_rel_clip.weight"))?,
-                rel_bias: f32buf(g, &n("attn_rel_bias.weight"))?,
-                k_conv: f32buf(g, &n("attn_k_conv.weight"))?,
-                v_conv: f32buf(g, &n("attn_v_conv.weight"))?,
-                post_conv: f32buf(g, &n("attn_post_conv.weight"))?,
-                ffn_post_conv: f32buf(g, &n("ffn_post_conv.weight"))?,
-                router: f32buf(g, &n("ffn_gate_inp.weight"))?,
-                probs_b: f32buf(g, &n("exp_probs_b.bias"))?,
+                q_clip: tensor(ck, &p("attn.q_l2_clip.scale"), bf, &[hp.n_head, hp.head_dim])?,
+                rel_clip: tensor(ck, &p("attn.rel_l2_clip.scale"), bf, &[hp.n_head, hp.n_rel])?,
+                rel_proj: tensor(ck, &p("attn.rel_logits_proj.proj"), bf, &[hp.n_rel, if swa { hp.n_swa } else { hp.rel_extent }])?,
+                k_conv,
+                v_conv,
+                post_conv: tensor(ck, &p("attn_sconv.weight"), bf, &[n, 1, hp.n_conv])?,
+                ffn_post_conv: tensor(ck, &p("mlp_sconv.weight"), bf, &[n, 1, hp.n_conv])?,
+                router,
+                router_bias: tensor(ck, &p("mlp.gate.bias"), f32_, &[hp.n_expert])?,
                 lp,
             });
         }
-        let output = Q8Mat::load(g, &["output.weight"])?;
+        let output = Mat::first_rows(ck, "model.llm.unembed.weight", hp.n_vocab_padded, hp.n_vocab, n)?;
         bytes += output.bytes();
         Ok(Weights {
             layers,
-            tok_norm: f32buf(g, "token_embd_norm.weight")?,
-            output_norm: f32buf(g, "output_norm.weight")?,
-            output_res_query: f32buf(g, "output_res_query.weight")?,
+            tok_norm: tensor(ck, "model.llm.embed_norm.weight", bf, &[n])?,
+            output_norm: tensor(ck, "model.llm.norm.weight", bf, &[n])?,
+            output_res_query: tensor(ck, "model.llm.attn_res.output_query", f32_, &[n])?,
             output,
+            msg_queries,
+            msg_kv_queries,
             bytes,
         })
     }

@@ -78,6 +78,21 @@ impl Kernels {
         Ok(())
     }
 
+    /// y[t][r] = W x[t] for `ntok` tokens: W a BF16 [rows][k] (as the checkpoint has it), x f32 [ntok][k], y at
+    /// t y_stride. k a multiple of 256.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_bf16(&self, s: &Stream, w: P, x: P, y: P, rows: u32, k: u32, ntok: u32, y_stride: u32) -> Result<()> {
+        assert!(k % 256 == 0, "gemv_bf16: k {k}");
+        self.run(s, "gemv_bf16", (rows.div_ceil(16), ntok, 1), 256, &[&w, &x, &y, &rows, &k, &y_stride])
+    }
+
+    /// gemv_bf16 of `nz` matrices of the same k in one launch: tab[4 z ..] = w, x, y, rows of matrix z; `max_rows` the
+    /// largest rows.
+    pub fn gemv_bf16t(&self, s: &Stream, tab: P, max_rows: u32, k: u32, nz: u32) -> Result<()> {
+        assert!(k % 256 == 0, "gemv_bf16t: k {k}");
+        self.run(s, "gemv_bf16t", (max_rows.div_ceil(16), 1, nz), 256, &[&tab, &k])
+    }
+
     /// y[t][r] = W x[t] for `ntok` tokens, W repacked Q8_0 [rows][k]
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_q8(&self, s: &Stream, qs: P, d: P, x: P, y: P, rows: u32, k: u32, ntok: u32, y_stride: u32) -> Result<()> {
@@ -149,14 +164,21 @@ impl Kernels {
         self.run(s, "ctrl_in", (1, ntok, 1), 1024, &[&cur, &msg, &g, &n])
     }
 
+    /// ctrl_in of `nz` controllers of one token: cur and msg of controller z at tab[2 z], tab[2 z + 1]; its input at
+    /// g + 2 n z.
+    pub fn ctrl_in_z(&self, s: &Stream, tab: P, g: P, n: u32, nz: u32) -> Result<()> {
+        self.run(s, "ctrl_in_z", (1, 1, nz), 1024, &[&tab, &g, &n])
+    }
+
+    /// y = (1 - tanh(F gate)) cur + tanh(G gate) msg: gw (G) and fw (F) the BF16 [n][64] gain and forget projections.
     #[allow(clippy::too_many_arguments)]
-    pub fn ctrl_out(&self, s: &Stream, cur: P, msg: P, gate: P, gq: P, gd: P, fq: P, fd: P, y: P, n: u32) -> Result<()> {
-        self.ctrl_out_t(s, cur, msg, gate, gq, gd, fq, fd, y, n, 1)
+    pub fn ctrl_out(&self, s: &Stream, cur: P, msg: P, gate: P, gw: P, fw: P, y: P, n: u32) -> Result<()> {
+        self.ctrl_out_t(s, cur, msg, gate, gw, fw, y, n, 1)
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn ctrl_out_t(&self, s: &Stream, cur: P, msg: P, gate: P, gq: P, gd: P, fq: P, fd: P, y: P, n: u32, ntok: u32) -> Result<()> {
-        self.run(s, "ctrl_out", (n.div_ceil(256), ntok, 1), 256, &[&cur, &msg, &gate, &gq, &gd, &fq, &fd, &y, &n])
+    pub fn ctrl_out_t(&self, s: &Stream, cur: P, msg: P, gate: P, gw: P, fw: P, y: P, n: u32, ntok: u32) -> Result<()> {
+        self.run(s, "ctrl_out", (n.div_ceil(256), ntok, 1), 256, &[&cur, &msg, &gate, &gw, &fw, &y, &n])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -219,32 +241,24 @@ impl Kernels {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn situ_q8(&self, s: &Stream, gu: P, slots: P, aq: P, ad: P, asum: P, nff: u32, beta: f32, lb: f32) -> Result<()> {
-        self.run(s, "situ_q8", ((nff / 32).div_ceil(8), 8, 1), 256, &[&gu, &slots, &aq, &ad, &asum, &nff, &beta, &lb])
+    #[allow(clippy::too_many_arguments)]
+    pub fn situ_q8(&self, s: &Stream, gu: P, slots: P, af: P, aq: P, ad: P, asum: P, nff: u32, beta: f32, lb: f32) -> Result<()> {
+        self.run(s, "situ_q8", ((nff / 32).div_ceil(8), 8, 1), 256, &[&gu, &slots, &af, &aq, &ad, &asum, &nff, &beta, &lb])
     }
 
-    /// Prefill: y[pair] = W x for each group of (token, pair) of a cached expert, on a bank of format `f` (moe_nv4_g,
-    /// moe_q8_g); x by token (`by_pair` false: gate_up) or by pair (down).
+    /// y = W x for the 8 experts of `slots` on a bank of ModelOpt NVFP4 slots (codes, then scales): x q8_1, expert j's
+    /// factor amax[ids[j]] / denom[0].
     #[allow(clippy::too_many_arguments)]
-    pub fn moe_g(&self, s: &Stream, f: crate::experts::Fmt, by_pair: bool, bank: P, slot_bytes: u64, groups: P, xq: P, xd: P, y: P, rows: u32, k: u32, ngroups: u32, tiles: u32) -> Result<()> {
-        let name = match (f, by_pair) {
-            (crate::experts::Fmt::Nv4, false) => "moe_nv4_g_0",
-            (crate::experts::Fmt::Nv4, true) => "moe_nv4_g_1",
-            (crate::experts::Fmt::Q8, false) => "moe_q8_g_0",
-            (crate::experts::Fmt::Q8, true) => "moe_q8_g_1",
-        };
-        self.run(s, name, (rows.div_ceil(32), ngroups, tiles), 128, &[&bank, &slot_bytes, &groups, &xq, &xd, &y, &rows, &k])
+    pub fn moe_nvfp4_d(&self, s: &Stream, bank: P, slot_bytes: u64, slots: P, ids: P, amax: P, denom: P, xq: P, xd: P, xstride: u32, y: P, rows: u32, k: u32) -> Result<()> {
+        assert!(k % 32 == 0, "moe_nvfp4_d: k {k}");
+        self.run(s, "moe_nvfp4_d", (rows.div_ceil(64), 8, 1), 128, &[&bank, &slot_bytes, &slots, &ids, &amax, &denom, &xq, &xd, &xstride, &y, &rows, &k])
     }
 
-    /// y = W x for the 8 cached experts of `slots`, on a bank of format `f` (moe_nv4_d, moe_q8_d); x the same for all
-    /// (xstride 0) or each expert's at xq + ke xstride.
+    /// y = W x for the 8 experts of `slots` on a bank of MXFP8 slots (e4m3 values, then UE8M0 scales): x f32.
     #[allow(clippy::too_many_arguments)]
-    pub fn moe_d(&self, s: &Stream, f: crate::experts::Fmt, bank: P, slot_bytes: u64, slots: P, xq: P, xd: P, xstride: u32, y: P, rows: u32, k: u32) -> Result<()> {
-        let name = match f {
-            crate::experts::Fmt::Nv4 => "moe_nv4_d",
-            crate::experts::Fmt::Q8 => "moe_q8_d",
-        };
-        self.run(s, name, (rows.div_ceil(64), 8, 1), 128, &[&bank, &slot_bytes, &slots, &xq, &xd, &xstride, &y, &rows, &k])
+    pub fn moe_mxfp8_d(&self, s: &Stream, bank: P, slot_bytes: u64, slots: P, x: P, xstride: u32, y: P, rows: u32, k: u32) -> Result<()> {
+        assert!(k % 128 == 0, "moe_mxfp8_d: k {k}");
+        self.run(s, "moe_mxfp8_d", (rows.div_ceil(64), 8, 1), 128, &[&bank, &slot_bytes, &slots, &x, &xstride, &y, &rows, &k])
     }
 
     pub fn router_logits(&self, s: &Stream, w: P, x: P, logits: P, n_expert: u32, n: u32) -> Result<()> {
@@ -296,6 +310,8 @@ impl Kernels {
         self.run(s, "gemv_q8dt", (max_rows.div_ceil(16), 1, nz), 256, &[&tab, &k])
     }
 
+    /// ctrl_out of `nz` controllers of one token: cur, msg, gw, fw, y of controller z at tab[5 z ..]; its gate at
+    /// gate + 64 z.
     pub fn ctrl_outz(&self, s: &Stream, tab: P, gate: P, n: u32, nz: u32) -> Result<()> {
         self.run(s, "ctrl_outz", (n.div_ceil(256), 1, nz), 256, &[&tab, &gate, &n])
     }

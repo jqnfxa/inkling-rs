@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
-use crate::cpu::{Q8_0, c12_at, dot_row, quantize_q8_0, quantize_q8_0_block16};
+use crate::cpu::{Act, Q8, dot_row};
 use crate::cpu_batch::dot_tokens;
 use crate::cuda::HostBuf;
 use crate::experts::Experts;
@@ -16,7 +16,7 @@ const JOB_IDS: usize = 2; // u32 index of ids
 const JOB_SLOTS: usize = 10;
 const JOB_X: usize = 32;
 const ROWS: usize = 32; // rows per chunk of the interleaved split (prefill)
-const ACT: usize = 32; // decode: activations per gate_up chunk (its gate and up rows, and one Q8_0 block)
+const ACT: usize = 32; // decode: activations per gate_up chunk (its gate and up rows, and one block of the activations)
 const DN_ROWS: usize = 32; // decode: down rows per chunk
 
 /// Usage of the experts, decayed, as the CPU sees the jobs: [layer][expert].
@@ -53,7 +53,7 @@ unsafe impl Sync for Shared {}
 #[derive(Default)]
 pub struct BatchJob {
     pub layer: usize,
-    pub xq: Vec<Q8_0>,                           // per token
+    pub xq: Vec<Act>,                            // per token
     pub misses: Vec<(usize, Vec<(usize, usize)>)>, // (expert, [(token, pair)])
     pub out: usize,                              // host address of [pair][n] outputs
 }
@@ -62,11 +62,11 @@ pub struct BatchJob {
 struct Work {
     batch: Option<BatchJob>,
     bh: Vec<Vec<f32>>,  // batch: gate_up per CPU pair
-    bact: Vec<Q8_0>,    // batch: quantized activation per CPU pair
+    bact: Vec<Act>,     // batch: activations per CPU pair
     layer: usize,
     misses: Vec<(usize, usize)>, // (k, expert)
-    xq: Q8_0,
-    aq: Vec<Q8_0>, // quantized activations per miss, written a block per gate_up chunk
+    xq: Act,
+    aq: Vec<Act>, // activations per miss (both forms), written a block per gate_up chunk
     out: usize,    // host address of cpu_out [8][n]
 }
 
@@ -157,7 +157,7 @@ fn run_batch(sh: &Shared, cx: &Ctx, t: usize) {
         let (e, toks) = &job.misses[m];
         let gu = ex.gate_up(job.layer, *e);
         let sg = gu.scale();
-        let xs: Vec<&Q8_0> = toks.iter().map(|&(tk, _)| &job.xq[tk]).collect();
+        let xs: Vec<&Act> = toks.iter().map(|&(tk, _)| &job.xq[tk]).collect();
         let mut out = vec![0f32; toks.len()];
         for r in c * ROWS..((c + 1) * ROWS).min(2 * nff) {
             dot_tokens(&gu, r, &xs, &mut out);
@@ -174,16 +174,17 @@ fn run_batch(sh: &Shared, cx: &Ctx, t: usize) {
         if p >= acc {
             break;
         }
+        // gate i in row 2i, up i in row 2i + 1
         let h = &w.bh[p];
         let act: Vec<f32> = (0..nff)
             .map(|i| {
-                let (gv, uv) = (h[i], h[nff + i]);
+                let (gv, uv) = (h[2 * i], h[2 * i + 1]);
                 ex.beta * (gv / ex.beta).tanh() / (1.0 + (-gv).exp()) * ex.lb * (uv / ex.lb).tanh()
             })
             .collect();
         // SAFETY: pair p is written by the thread that took it
-        let aq = unsafe { &mut *(w.bact.as_ptr() as *mut Q8_0).add(p) };
-        quantize_q8_0(&act, aq);
+        let aq = unsafe { &mut *(w.bact.as_ptr() as *mut Act).add(p) };
+        aq.set(&act, ex.fmt[job.layer]);
     }
     barrier(sh);
     let tp2 = std::time::Instant::now();
@@ -197,7 +198,7 @@ fn run_batch(sh: &Shared, cx: &Ctx, t: usize) {
         let (e, toks) = &job.misses[m];
         let dn = ex.down(job.layer, *e);
         let sd = dn.scale();
-        let xs: Vec<&Q8_0> = (0..toks.len()).map(|i| &w.bact[base[m] + i]).collect();
+        let xs: Vec<&Act> = (0..toks.len()).map(|i| &w.bact[base[m] + i]).collect();
         let mut out = vec![0f32; toks.len()];
         for r in c * ROWS..((c + 1) * ROWS).min(n) {
             dot_tokens(&dn, r, &xs, &mut out);
@@ -267,8 +268,8 @@ fn run(sh: &Shared, cx: &Ctx, t: usize, epoch: u32) {
     }
 }
 
-/// A decode job: the misses of one token at one layer. Chunks of gate_up rows with their activations and its Q8_0
-/// block, then, once all are done, chunks of down rows. No barrier: a thread that the OS put aside only delays the
+/// A decode job: the misses of one token at one layer. Chunks of gate_up rows with their activations (a block of
+/// them), then, once all are done, chunks of down rows. No barrier: a thread that the OS put aside only delays the
 /// chunk it holds, and one that wakes late finds the chunks taken.
 fn run_decode(sh: &Shared, cx: &Ctx, t: usize, epoch: u32) {
     let ex = &cx.ex;
@@ -286,23 +287,15 @@ fn run_decode(sh: &Shared, cx: &Ctx, t: usize, epoch: u32) {
                 let sg = gu.scale();
                 let mut act = [0f32; ACT];
                 for (i, a) in act.iter_mut().enumerate() {
-                    let r = blk * ACT + i;
+                    // gate i in row 2i, up i in row 2i + 1
+                    let r = 2 * (blk * ACT + i);
                     let gv = dot_row(&gu, r, &w.xq) * sg;
-                    let uv = dot_row(&gu, nff + r, &w.xq) * sg;
+                    let uv = dot_row(&gu, r + 1, &w.xq) * sg;
                     let s = ex.beta * (gv / ex.beta).tanh() / (1.0 + (-gv).exp());
                     *a = s * ex.lb * (uv / ex.lb).tanh();
                 }
-                let aq = &w.aq[m];
                 // SAFETY: block `blk` of miss m is written by this chunk alone, and read only after all are done
-                unsafe {
-                    let qs = std::slice::from_raw_parts_mut((aq.qs.as_ptr() as *mut i8).add(blk * 32), 32);
-                    let (d, sum, s16) = quantize_q8_0_block16(&act, qs);
-                    *(aq.d.as_ptr() as *mut f32).add(blk) = d;
-                    *(aq.sums.as_ptr() as *mut i32).add(blk) = sum;
-                    let (lo, hi) = c12_at(blk);
-                    *(aq.c12.as_ptr() as *mut i32).add(lo) = 12 * s16[0];
-                    *(aq.c12.as_ptr() as *mut i32).add(hi) = 12 * s16[1];
-                }
+                unsafe { w.aq[m].put_block(blk, &act, ex.fmt[w.layer]) };
                 sh.gu_done.fetch_add(1, Ordering::Release);
             }
         }
@@ -427,7 +420,7 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
             for h in w.bh.iter_mut().take(npairs) {
                 h.resize(2 * nff, 0.0);
             }
-            w.bact.resize_with(npairs.max(w.bact.len()), Q8_0::default);
+            w.bact.resize_with(npairs.max(w.bact.len()), Act::default);
             for c in &sh.next {
                 c.store(0, Ordering::Relaxed);
             }
@@ -483,9 +476,9 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
             w.misses.extend((0..8).filter(|&k| slots[k] < 0).map(|k| (k, ids[k])));
             // SAFETY: host-mapped memory the GPU wrote before seq
             let x = unsafe { std::slice::from_raw_parts(job.add(JOB_X) as *const f32, n) };
-            quantize_q8_0(x, &mut w.xq);
+            w.xq.set(x, cx.ex.fmt[layer]);
             if w.aq.len() < n_miss {
-                w.aq.resize_with(n_miss, || Q8_0 { d: vec![0.0; nff / 32], qs: vec![0; nff], sums: vec![0; nff / 32], c12: vec![0; nff / 16] });
+                w.aq.resize_with(n_miss, || Act { q: Q8::with_len(nff), f: vec![0.0; nff] });
             }
             w.out = cx.out;
             let g = sh.epoch.load(Ordering::Relaxed).wrapping_add(1);

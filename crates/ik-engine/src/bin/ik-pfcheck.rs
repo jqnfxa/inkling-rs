@@ -1,6 +1,5 @@
-//! Prefill vs one-token-at-a-time decode on the same text: `ik-pfcheck <model.gguf> <text file> [n_tokens]`
+//! Prefill vs one-token-at-a-time decode on the same text: `ik-pfcheck <checkpoint dir> <text file> [n_tokens]`
 use ik_engine::engine::{Engine, Options, threads_from_env};
-use ik_engine::tokenizer::Tokenizer;
 
 fn main() -> Result<(), String> {
     let a: Vec<String> = std::env::args().collect();
@@ -8,7 +7,7 @@ fn main() -> Result<(), String> {
     let n: usize = a.get(3).and_then(|v| v.parse().ok()).unwrap_or(300);
     let slots: usize = a.get(4).and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
     let mut e = Engine::new(std::path::Path::new(&a[1]), Options { n_ctx: 8192, cache_slots: slots, threads: threads_from_env(), graph: true, upload_budget: 4 })?;
-    let tok = Tokenizer::from_gguf(&e.g)?;
+    let tok = e.ck.tokenizer()?;
     let ids: Vec<u32> = tok.encode(&text, false).into_iter().take(n).collect();
     let am = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
     // decode, one at a time

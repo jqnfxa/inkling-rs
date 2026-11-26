@@ -1,4 +1,4 @@
-//! Compares the engine with a llama.cpp reference dump (tools/refdump): `ik-check <model.gguf> <ref.bin> [cache_slots]`
+//! Compares the engine with a llama.cpp reference dump (tools/refdump): `ik-check <checkpoint dir> <ref.bin> [cache_slots]`
 //! The prompt runs one token at a time; each probed tensor is compared with the matching row of the reference.
 
 use std::cell::RefCell;

@@ -1,13 +1,12 @@
 //! Branch check: a sequence that goes on straight, against the same sequence with a branch of `len` tokens (at most
-//! T_MAX) taken at a checkpoint and dropped: `ik-branch <model.gguf> [branch tokens, 256]`. The logits after it
+//! T_MAX) taken at a checkpoint and dropped: `ik-branch <checkpoint dir> [branch tokens, 256]`. The logits after it
 //! should be the ones without it.
 use ik_engine::engine::{Engine, Options, T_MAX, threads_from_env};
-use ik_engine::tokenizer::Tokenizer;
 
 fn main() -> Result<(), String> {
     let a: Vec<String> = std::env::args().collect();
     let mut e = Engine::new(std::path::Path::new(&a[1]), Options { n_ctx: 8192, cache_slots: 0, threads: threads_from_env(), graph: true, upload_budget: 0 })?;
-    let tok = Tokenizer::from_gguf(&e.g)?;
+    let tok = e.ck.tokenizer()?;
     let len: usize = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(T_MAX).min(T_MAX);
     // a prompt longer than the sliding window, so that the rings have wrapped
     let pa = tok.encode(&"The history of the bicycle begins in the early nineteenth century. ".repeat(100), false);

@@ -1,4 +1,4 @@
-//! The Inkling-2-Mini server: `inkling-server <model.gguf> [--host 127.0.0.1] [--port 8080] [--ctx 16384] [--slots N] [--ui DIR]
+//! The Inkling-2-Mini server: `inkling-server <checkpoint dir> [--host 127.0.0.1] [--port 8080] [--ctx 16384] [--slots N] [--ui DIR]
 //! [--compact-reserve min(16384, ctx/8)] [--compact-keep 20000] [--compact-max 8] [--no-compact]
 //! [--reasoning-summary off|inline|only] [--summary-every 1024]
 //! [--temp 1.0] [--top-k 40] [--top-p 0.95] [--min-p 0.05] [--repeat-penalty 1.0] [--presence-penalty 0.0]
@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use ik_engine::engine::{Engine, Options, threads_from_env};
 use ik_engine::server;
-use ik_engine::tokenizer::Tokenizer;
 
 fn arg(a: &[String], k: &str) -> Option<String> {
     a.iter().position(|x| x == k).and_then(|i| a.get(i + 1).cloned())
@@ -20,7 +19,7 @@ fn arg(a: &[String], k: &str) -> Option<String> {
 
 fn main() -> Result<(), String> {
     let a: Vec<String> = std::env::args().collect();
-    let model = a.get(1).ok_or("usage: inkling-server <model.gguf> [--host H] [--port P] [--ctx N] [--slots N]")?.clone();
+    let model = a.get(1).ok_or("usage: inkling-server <checkpoint dir> [--host H] [--port P] [--ctx N] [--slots N]")?.clone();
     let host = arg(&a, "--host").unwrap_or("127.0.0.1".into());
     let port = arg(&a, "--port").unwrap_or("8080".into());
     let n_ctx: usize = arg(&a, "--ctx").and_then(|v| v.parse().ok()).unwrap_or(16384);
@@ -62,8 +61,8 @@ fn main() -> Result<(), String> {
     }
     let t0 = std::time::Instant::now();
     let eng = Engine::new(std::path::Path::new(&model), Options { n_ctx, cache_slots: slots, threads: threads_from_env(), graph: true, upload_budget: 4 })?;
-    let tok = Arc::new(Tokenizer::from_gguf(&eng.g)?);
-    let name = eng.g.str("general.name").unwrap_or("inkling").to_string();
+    let tok = Arc::new(eng.ck.tokenizer()?);
+    let name = eng.ck.name();
     eprintln!("{name}: loaded in {:.1}s on {}, context {n_ctx}, {} expert cache slots (fewer as the context fills)", t0.elapsed().as_secs_f64(), eng.ctx.name, eng.cache.n_slots());
     eprintln!("sampling unless a request says otherwise: temp {} top-k {} top-p {} min-p {} repeat-penalty {} presence-penalty {} frequency-penalty {} (last {})", sampling.temperature, sampling.top_k, sampling.top_p, sampling.min_p, sampling.repeat_penalty, sampling.presence_penalty, sampling.frequency_penalty, sampling.repeat_last_n);
     let site = site(&eng, &model, &name, n_ctx, ui.clone(), compaction, notes, sampling);
@@ -89,7 +88,7 @@ fn main() -> Result<(), String> {
 fn site(eng: &Engine, path: &str, name: &str, n_ctx: usize, ui: Option<std::path::PathBuf>, compaction: ik_engine::compact::Settings, notes: ik_engine::compact::Notes, sampling: ik_engine::sampler::SamplingParams) -> server::Site {
     use serde_json::json;
     let d = &sampling;
-    let template = eng.g.str("tokenizer.chat_template").unwrap_or("").to_string();
+    let template = eng.ck.text("chat_template.jinja").unwrap_or_default();
     let props = json!({
         "default_generation_settings": {
             "n_ctx": n_ctx,
@@ -131,7 +130,7 @@ fn site(eng: &Engine, path: &str, name: &str, n_ctx: usize, ui: Option<std::path
     let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_secs()).unwrap_or(0);
     let models = json!({
         "object": "list",
-        "models": [{"name": name, "model": name, "type": "model", "capabilities": ["completion"], "details": {"format": "gguf"}}],
+        "models": [{"name": name, "model": name, "type": "model", "capabilities": ["completion"], "details": {"format": "safetensors"}}],
         "data": [{
             "id": name, "aliases": [name], "tags": [], "object": "model", "owned_by": "inkling-rs", "created": created,
             "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
