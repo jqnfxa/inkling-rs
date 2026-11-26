@@ -44,6 +44,10 @@ const KV_ROW: usize = 2048;
 const KV_STEP: usize = 1024;
 /// host memory left free when the KV cache spills there
 const HOST_MARGIN: usize = 1 << 30;
+/// Prefill reads the host rows of the KV cache from copies in VRAM, this many rows at a time.
+const STAGE_ROWS: usize = 4096;
+/// floats of attn_prefill's state between passes, per token and kv head: m[3], l[3], acc[3][128]
+const PF_STATE: usize = 390;
 
 /// Decode attention: keys per chunk of attn_part, log2, of the sliding-window layers (16 chunks of the window) and of
 /// the full ones.
@@ -179,6 +183,9 @@ pub struct Engine {
     attn_idx: Vec<u32>,
     /// the CPU team's partials of the host rows, [24] of m, l, acc[128]
     attn_out: HostBuf,
+    /// when there are host rows: the VRAM copies of a chunk of them (K, V) that prefill reads, and its state between
+    /// passes [T_MAX][8][PF_STATE]
+    stage: Option<[DevBuf; 3]>,
     /// VRAM for the expert cache and the mapped rows of kv_vm together
     vram_budget: usize,
     ring: Vec<u32>,
@@ -438,6 +445,7 @@ impl Engine {
             kv_cpu: false,
             attn_idx: vec![],
             attn_out: HostBuf::new(4 * ATTN_OUT)?,
+            stage: None,
             vram_budget,
             ring,
             conv,
@@ -460,13 +468,18 @@ impl Engine {
         // memory where the device can map it there
         let all = e.n_ctx.div_ceil(KV_STEP) * KV_STEP;
         let per_step = e.kv_bytes(KV_STEP).max(1);
-        let mut vram_rows = (e.vram_budget / per_step * KV_STEP).min(all);
-        if let Some(cap) = std::env::var("IK_KV_VRAM_ROWS").ok().and_then(|v| v.parse::<usize>().ok()) {
-            vram_rows = vram_rows.min(cap.div_ceil(KV_STEP) * KV_STEP);
-        }
+        let cap = std::env::var("IK_KV_VRAM_ROWS").ok().and_then(|v| v.parse::<usize>().ok());
+        let rows_for = |budget: usize| {
+            let r = (budget / per_step * KV_STEP).min(all);
+            cap.map_or(r, |c| r.min(c.div_ceil(KV_STEP) * KV_STEP))
+        };
         let host_ok = VmBuf::host_pages_supported(e.ctx.device);
-        if !host_ok {
-            vram_rows = all;
+        let mut vram_rows = if host_ok { rows_for(e.vram_budget) } else { all };
+        if vram_rows < all {
+            let stage = [DevBuf::new(STAGE_ROWS * KV_ROW)?, DevBuf::new(STAGE_ROWS * KV_ROW)?, DevBuf::new(T_MAX * e.hp.n_head_kv * PF_STATE * 4)?];
+            e.vram_budget = e.vram_budget.saturating_sub(stage.iter().map(|b| b.len).sum());
+            vram_rows = rows_for(e.vram_budget);
+            e.stage = Some(stage);
         }
         let (need_vram, need_host) = (e.kv_bytes(vram_rows), e.kv_bytes(all) - e.kv_bytes(vram_rows));
         let host_free = host_mem_free().saturating_sub(HOST_MARGIN);
@@ -1209,7 +1222,28 @@ impl Engine {
         let extent = if swa { hp.n_swa } else { hp.rel_extent } as u32;
         let window = if swa { hp.n_swa as u32 } else { u32::MAX };
         let scale = 1.0 / (hp.head_dim as f32).sqrt();
-        self.k.attn_prefill(&self.s, self.b.q.ptr, self.b.r.ptr, sink, l.rel_proj.ptr, kc, vc, self.b.att.ptr, self.params.ptr, ring, window, extent, scale, nh as u32, nhd * nr, g0r, ntu)?;
+        let host = !swa && self.stage.is_some() && self.pos + nt > self.kv_vram_rows;
+        let pass = |e: &Engine, kc: P, vc: P, rows: (u32, u32), state: P, mode: u32| {
+            e.k.attn_prefill(&e.s, e.b.q.ptr, e.b.r.ptr, sink, l.rel_proj.ptr, kc, vc, e.b.att.ptr, e.params.ptr, ring, window, extent, scale, nh as u32, nhd * nr, g0r, ntu, rows, state, mode)
+        };
+        if !host {
+            pass(self, kc, vc, (0, u32::MAX), 0, 0)?;
+        } else {
+            // the rows in VRAM, then the host rows from a VRAM copy a chunk at a time (read over PCIe once, not once per
+            // token), the softmax state carried between the passes
+            let [sk, sv, state] = self.stage.as_ref().map(|b| [b[0].ptr, b[1].ptr, b[2].ptr]).unwrap();
+            let (vram, end) = (self.kv_vram_rows, self.pos + nt);
+            pass(self, kc, vc, (0, vram as u32), state, 2)?;
+            let mut r0 = vram;
+            while r0 < end {
+                let r1 = (r0 + STAGE_ROWS).min(end);
+                let off = (r0 * KV_ROW) as u64;
+                cuda::copy_d2d(sk, kc + off, (r1 - r0) * KV_ROW, &self.s)?;
+                cuda::copy_d2d(sv, vc + off, (r1 - r0) * KV_ROW, &self.s)?;
+                pass(self, sk.wrapping_sub(off), sv.wrapping_sub(off), (r0 as u32, r1 as u32), state, if r1 == end { 1 } else { 3 })?;
+                r0 = r1;
+            }
+        }
         self.probe("kqv_out", il, self.b.att.ptr, nt * nh)?;
         let gate = self.b.g0.at(nh * 4);
         self.k.mul_sigmoid_t(&self.s, self.b.att.ptr, gate, self.b.att2.ptr, ntu * nh as u32, nh as u32, g0r)?;

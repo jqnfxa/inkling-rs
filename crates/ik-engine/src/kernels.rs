@@ -281,11 +281,19 @@ impl Kernels {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// `rows` (lo, hi), `state` and `mode`: one pass of several (see the kernel); (0, u32::MAX), 0, 0 for all rows in one.
     pub fn attn_prefill(
         &self, s: &Stream, q: P, r: P, sink: P, rb: P, kc: P, vc: P, out: P, params: P, ring: u32, window: u32, extent: u32, scale: f32,
-        q_stride: u32, r_stride: u32, s_stride: u32, ntok: u32,
+        q_stride: u32, r_stride: u32, s_stride: u32, ntok: u32, rows: (u32, u32), state: P, mode: u32,
     ) -> Result<()> {
-        self.run(s, "attn_prefill", (8, ntok, 1), 128, &[&q, &r, &sink, &rb, &kc, &vc, &out, &params, &ring, &window, &extent, &scale, &q_stride, &r_stride, &s_stride])
+        let (lo, hi) = rows;
+        self.run(
+            s,
+            "attn_prefill",
+            (8, ntok, 1),
+            128,
+            &[&q, &r, &sink, &rb, &kc, &vc, &out, &params, &ring, &window, &extent, &scale, &q_stride, &r_stride, &s_stride, &lo, &hi, &state, &mode],
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -525,15 +525,28 @@ fn main() -> Result<(), String> {
         let r: Vec<f32> = (0..nt * rs).map(|_| rnd(&mut seed)).collect();
         let sink: Vec<f32> = (0..nt * ss).map(|_| rnd(&mut seed) * 2.0).collect();
         let (bq, br, bs, bp, bo) = (DevBuf::from_slice(&q)?, DevBuf::from_slice(&r)?, DevBuf::from_slice(&sink)?, DevBuf::from_slice(&[p0 as u32, 0, 0, 0])?, DevBuf::new(nt * 3072 * 4)?);
-        k.attn_prefill(&s, bq.ptr, br.ptr, bs.ptr, brb.ptr, bkc.ptr, bvc.ptr, bo.ptr, bp.ptr, ring as u32, w, 1024, scale, qs as u32, rs as u32, ss as u32, nt as u32)?;
+        k.attn_prefill(&s, bq.ptr, br.ptr, bs.ptr, brb.ptr, bkc.ptr, bvc.ptr, bo.ptr, bp.ptr, ring as u32, w, 1024, scale, qs as u32, rs as u32, ss as u32, nt as u32, (0, u32::MAX), 0, 0)?;
         s.sync()?;
-        let out: Vec<f32> = bo.download(nt * 3072)?;
-        let mut err = 0f64;
-        for t in 0..nt {
-            let want = attn_ref(&q[t * qs..][..3072], &r[t * rs..][..384], &sink[t * ss..][..24], rb, &kc, &vc, p0 + t, ring, window, 1024, scale as f64);
-            err = err.max(rel_err(&out[t * 3072..][..3072], &want));
+        let wants: Vec<Vec<f64>> =
+            (0..nt).map(|t| attn_ref(&q[t * qs..][..3072], &r[t * rs..][..384], &sink[t * ss..][..24], rb, &kc, &vc, p0 + t, ring, window, 1024, scale as f64)).collect();
+        let err_of = |out: &[f32]| (0..nt).map(|t| rel_err(&out[t * 3072..][..3072], &wants[t])).fold(0.0, f64::max);
+        check(&format!("attn_prefill {what}, pos {p0}..{}", p0 + nt), err_of(&bo.download::<f32>(nt * 3072)?), 1e-5, &mut fails);
+        if ring == 0 {
+            // in passes, the state carried: rows 0..700 in place, then 700..1299 and 1299.. each from a copy of its own
+            // (as prefill reads host rows); the last pass has no rows of the first token
+            let state = DevBuf::new(nt * 8 * 390 * 4)?;
+            k.attn_prefill(&s, bq.ptr, br.ptr, bs.ptr, brb.ptr, bkc.ptr, bvc.ptr, bo.ptr, bp.ptr, 0, w, 1024, scale, qs as u32, rs as u32, ss as u32, nt as u32, (0, 700), state.ptr, 2)?;
+            let mut copies = vec![];
+            for (r0, r1, mode) in [(700usize, 1299usize, 3u32), (1299, rows, 1)] {
+                let (kcopy, vcopy) = (DevBuf::from_slice(&kc[r0 * 1024..r1 * 1024])?, DevBuf::from_slice(&vc[r0 * 1024..r1 * 1024])?);
+                let off = (r0 * 2048) as u64;
+                let (kp, vp) = (kcopy.ptr.wrapping_sub(off), vcopy.ptr.wrapping_sub(off));
+                k.attn_prefill(&s, bq.ptr, br.ptr, bs.ptr, brb.ptr, kp, vp, bo.ptr, bp.ptr, 0, w, 1024, scale, qs as u32, rs as u32, ss as u32, nt as u32, (r0 as u32, r1 as u32), state.ptr, mode)?;
+                copies.push((kcopy, vcopy));
+            }
+            s.sync()?;
+            check(&format!("attn_prefill full in 3 passes, pos {p0}..{}", p0 + nt), err_of(&bo.download::<f32>(nt * 3072)?), 1e-5, &mut fails);
         }
-        check(&format!("attn_prefill {what}, pos {p0}..{}", p0 + nt), err, 1e-5, &mut fails);
     }
 
     // an attention job for the CPU: word, position, then q [24][128], r [24][16] and the sink [24] copied whole into

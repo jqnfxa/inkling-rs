@@ -2134,10 +2134,14 @@ pub mod gpu {
     /// 0, 1, ..), online softmax; the sink is the initial state (m = 0, l = 1). Token t is at position params[0] + t;
     /// it sees distances below `window` (SWA) or all; row of a position: pos % ring, or pos where ring is 0.
     /// q [t][q_stride] (3 heads of 128 per kv head), r [t][r_stride], sink [t][s_stride], out [t][3072].
+    /// Only the rows lo..hi count (0, u32::MAX: all), so a pass can read rows copied elsewhere: kc and vc then point
+    /// where row 0 would be. mode bit 0: start from the state an earlier pass left; bit 1: leave the state for a later
+    /// pass instead of the output. state [t][8 kv heads][390]: m[3], l[3], acc[3][128].
     #[reqntid(128)]
     pub unsafe extern "ptx-kernel" fn attn_prefill(
         q: *const f32, r: *const f32, sink: *const f32, rb: *const u16, kc: *const u16, vc: *const u16, out: *mut f32, params: *const u32,
-        ring: u32, window: u32, extent: u32, scale: f32, q_stride: u32, r_stride: u32, s_stride: u32,
+        ring: u32, window: u32, extent: u32, scale: f32, q_stride: u32, r_stride: u32, s_stride: u32, lo: u32, hi: u32, state: *mut f32,
+        mode: u32,
     ) {
         let qsh: shared<[f32; 384], 16>;
         let rsh: shared<[f32; 48], 16>;
@@ -2148,11 +2152,31 @@ pub mod gpu {
         mov.u32(kvh, ctaid.x);
         mov.u32(tk, ctaid.y);
         mov.u32(t, tid.x);
-        let (pos, nk): (u32, u32);
+        let (pos, nk, d_lo, d_hi): (u32, u32, u32, u32);
         ld.global.u32(pos, [params]);
         add.u32(pos, pos, tk);
         add.u32(nk, pos, 1);
         min.u32(nk, nk, window);
+        // the distances of the rows lo..hi: from pos + 1 - hi to below pos + 1 - lo
+        add.u32(d_lo, pos, 1);
+        max.u32(d_lo, d_lo, hi);
+        sub.u32(d_lo, d_lo, hi);
+        add.u32(d_hi, pos, 1);
+        max.u32(d_hi, d_hi, lo);
+        sub.u32(d_hi, d_hi, lo);
+        min.u32(nk, nk, d_hi);
+        let (mbit, so): (u32, u32);
+        let (resume, keep): (pred, pred);
+        and.b32(mbit, mode, 1);
+        setp.ne.u32(resume, mbit, 0);
+        and.b32(mbit, mode, 2);
+        setp.ne.u32(keep, mbit, 0);
+        // this thread's floats of the block's state at sacc: m and l of head t (t < 3) at 0 and 12, acc of the 3 heads
+        // at 24, 536 and 1048
+        let sacc: u64;
+        mad.lo.u32(so, tk, 8, kvh);
+        mad.lo.u32(so, so, 390, t);
+        mad.wide.u32(sacc, so, 4, state);
         let (qb, rbs, kb, sb, mb): (u32, u32, u32, u32, u32);
         mov.u32(qb, qsh);
         mov.u32(rbs, rsh);
@@ -2203,16 +2227,32 @@ pub mod gpu {
             st.shared.f32([ma], 0.0);
             st.shared.f32([ma + 12], 1.0);
         }
+        let lt3_resume: pred;
+        and.pred(lt3_resume, lt3, resume);
+        if lt3_resume {
+            let ma: u32;
+            let (mv, lv): (f32, f32);
+            mad.lo.u32(ma, t, 4, mb);
+            ld.global.f32(mv, [sacc]);
+            ld.global.f32(lv, [sacc + 12]);
+            st.shared.f32([ma], mv);
+            st.shared.f32([ma + 12], lv);
+        }
         bar.sync(0);
         let (a0, a1, a2): (f32, f32, f32);
         mov.f32(a0, 0.0);
         mov.f32(a1, 0.0);
         mov.f32(a2, 0.0);
+        if resume {
+            ld.global.f32(a0, [sacc + 24]);
+            ld.global.f32(a1, [sacc + 536]);
+            ld.global.f32(a2, [sacc + 1048]);
+        }
         let (lane, w): (u32, u32);
         and.b32(lane, t, 31);
         shr.u32(w, t, 5);
         let start: u32;
-        mov.u32(start, 0);
+        mov.u32(start, d_lo);
         label(ctop);
         let cdone: pred;
         setp.ge.u32(cdone, start, nk);
@@ -2292,6 +2332,23 @@ pub mod gpu {
         add.u32(start, start, 256);
         bra(ctop);
         label(cend);
+        let lt3_keep: pred;
+        and.pred(lt3_keep, lt3, keep);
+        if lt3_keep {
+            let ma: u32;
+            let (mv, lv): (f32, f32);
+            mad.lo.u32(ma, t, 4, mb);
+            ld.shared.f32(mv, [ma]);
+            ld.shared.f32(lv, [ma + 12]);
+            st.global.f32([sacc], mv);
+            st.global.f32([sacc + 12], lv);
+        }
+        if keep {
+            st.global.f32([sacc + 24], a0);
+            st.global.f32([sacc + 536], a1);
+            st.global.f32([sacc + 1048], a2);
+            bra(pdone);
+        }
         let (l0, l1, l2): (f32, f32, f32);
         ld.shared.f32(l0, [mb + 12]);
         ld.shared.f32(l1, [mb + 16]);
@@ -2306,6 +2363,7 @@ pub mod gpu {
         st.global.f32([oa], a0);
         st.global.f32([oa + 512], a1);
         st.global.f32([oa + 1024], a2);
+        label(pdone);
     }
 
     /// The scores of distance start + jj (key position pos - dist) for the 3 heads in shared q, into sc[h][jj].
