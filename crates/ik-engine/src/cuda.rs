@@ -40,6 +40,8 @@ unsafe extern "C" {
     fn cuMemcpyDtoDAsync_v2(dst: CUdeviceptr, src: CUdeviceptr, n: usize, s: CUstream) -> CUresult;
     fn cuMemsetD8Async(dst: CUdeviceptr, v: u8, n: usize, s: CUstream) -> CUresult;
     fn cuStreamCreate(s: *mut CUstream, flags: c_uint) -> CUresult;
+    fn cuStreamCreateWithPriority(s: *mut CUstream, flags: c_uint, priority: c_int) -> CUresult;
+    fn cuCtxGetStreamPriorityRange(least: *mut c_int, greatest: *mut c_int) -> CUresult;
     fn cuStreamDestroy_v2(s: CUstream) -> CUresult;
     fn cuStreamSynchronize(s: CUstream) -> CUresult;
     fn cuStreamWaitEvent(s: CUstream, e: CUevent, flags: c_uint) -> CUresult;
@@ -165,6 +167,15 @@ impl Stream {
     pub fn new_nonblocking() -> Result<Stream> {
         let mut s = null_mut();
         ck!(cuStreamCreate(&mut s, 1))?; // CU_STREAM_NON_BLOCKING
+        Ok(Stream(s))
+    }
+    /// new_nonblocking at the context's highest priority: once a block of another stream's kernel ends, a waiting block
+    /// of this one's starts first.
+    pub fn new_nonblocking_high() -> Result<Stream> {
+        let (mut least, mut greatest) = (0, 0);
+        ck!(cuCtxGetStreamPriorityRange(&mut least, &mut greatest))?;
+        let mut s = null_mut();
+        ck!(cuStreamCreateWithPriority(&mut s, 1, greatest))?;
         Ok(Stream(s))
     }
     pub fn sync(&self) -> Result<()> {

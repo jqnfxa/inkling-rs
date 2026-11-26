@@ -174,6 +174,8 @@ struct PfStream {
     /// copy they are written to
     tab: DevBuf,
     tab_h: HostBuf,
+    /// the expert stream, at the highest priority: the cached experts' kernels on the main stream, thousands of blocks
+    /// each, would hold its small ones back, and its uploads with them
     s: Stream,
     /// per staging slot: its upload is done; its last reader is done
     up: Vec<cuda::Event>,
@@ -207,7 +209,7 @@ impl PfStream {
             lists_h: HostBuf::new(3 * cap * 4)?,
             tab: DevBuf::new(2 * hp.n_expert * 32)?,
             tab_h: HostBuf::new(2 * hp.n_expert * 32)?,
-            s: Stream::new_nonblocking()?,
+            s: Stream::new_nonblocking_high()?,
             up: events()?,
             free: events()?,
             t0: cuda::Event::new(true)?,
