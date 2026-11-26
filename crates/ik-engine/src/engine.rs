@@ -216,13 +216,10 @@ pub struct Stats {
     /// decode: misses of experts, and those of an expert that had missed earlier in the same token
     pub misses_all: usize,
     pub misses_repeat: usize,
-    pub gpu_experts: u64,
-    pub cpu_experts: u64,
-    /// prefill: seconds waiting for the GPU up to the router, grouping on the host, in the CPU experts, after them
+    /// prefill: seconds waiting for the GPU up to the router, grouping on the host, in the CPU experts
     pub pf_gpu_s: f64,
     pub pf_host_s: f64,
     pub pf_cpu_s: f64,
-    pub pf_tail_s: f64,
     pub pf_cpu_pairs: u64,
     pub pf_gpu_pairs: u64,
 }

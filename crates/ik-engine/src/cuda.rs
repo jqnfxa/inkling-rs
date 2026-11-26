@@ -44,7 +44,6 @@ unsafe extern "C" {
     fn cuStreamCreate(s: *mut CUstream, flags: c_uint) -> CUresult;
     fn cuStreamDestroy_v2(s: CUstream) -> CUresult;
     fn cuStreamSynchronize(s: CUstream) -> CUresult;
-    fn cuStreamWaitEvent(s: CUstream, e: CUevent, flags: c_uint) -> CUresult;
     fn cuEventCreate(e: *mut CUevent, flags: c_uint) -> CUresult;
     fn cuEventDestroy_v2(e: CUevent) -> CUresult;
     fn cuEventRecord(e: CUevent, s: CUstream) -> CUresult;
@@ -53,7 +52,6 @@ unsafe extern "C" {
     fn cuEventElapsedTime(ms: *mut f32, a: CUevent, b: CUevent) -> CUresult;
     fn cuModuleLoadDataEx(m: *mut CUmodule, image: *const c_void, n: c_uint, opts: *mut c_int, vals: *mut *mut c_void) -> CUresult;
     fn cuModuleGetFunction(f: *mut CUfunction, m: CUmodule, name: *const c_char) -> CUresult;
-    fn cuFuncSetAttribute(f: CUfunction, attr: c_int, v: c_int) -> CUresult;
     fn cuLaunchKernel(
         f: CUfunction, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, by: c_uint, bz: c_uint,
         shared: c_uint, s: CUstream, params: *mut *mut c_void, extra: *mut *mut c_void,
@@ -116,16 +114,11 @@ macro_rules! ck {
 
 /// The primary context of a device, current on the thread that made it.
 pub struct Ctx {
-    ctx: CUcontext,
     pub device: CUdevice,
     pub name: String,
     pub sm_count: u32,
     pub cc: (u32, u32),
 }
-
-// SAFETY: a context handle may be made current on any thread.
-unsafe impl Send for Ctx {}
-unsafe impl Sync for Ctx {}
 
 impl Ctx {
     pub fn new(ordinal: i32) -> Result<Ctx> {
@@ -144,12 +137,7 @@ impl Ctx {
         };
         let sm_count = attr(16)?; // CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT
         let cc = (attr(75)?, attr(76)?);
-        Ok(Ctx { ctx, device, name: unsafe { CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned(), sm_count, cc })
-    }
-
-    /// Makes the context current on the calling thread.
-    pub fn bind(&self) -> Result<()> {
-        ck!(cuCtxSetCurrent(self.ctx))
+        Ok(Ctx { device, name: unsafe { CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned(), sm_count, cc })
     }
 
     pub fn sync(&self) -> Result<()> {
@@ -182,9 +170,6 @@ impl Stream {
     }
     pub fn sync(&self) -> Result<()> {
         ck!(cuStreamSynchronize(self.0))
-    }
-    pub fn wait(&self, e: &Event) -> Result<()> {
-        ck!(cuStreamWaitEvent(self.0, e.0, 0))
     }
     pub fn begin_capture(&self) -> Result<()> {
         ck!(cuStreamBeginCapture_v2(self.0, 2)) // relaxed
@@ -284,11 +269,6 @@ impl DevBuf {
         let n = size_of_val(data);
         assert!(off + n <= self.len, "upload of {n} bytes at {off} past {}", self.len);
         ck!(cuMemcpyHtoD_v2(self.ptr + off as u64, data.as_ptr() as *const c_void, n))
-    }
-    pub fn upload_async<T: Copy>(&self, off: usize, data: &[T], s: &Stream) -> Result<()> {
-        let n = size_of_val(data);
-        assert!(off + n <= self.len);
-        ck!(cuMemcpyHtoDAsync_v2(self.ptr + off as u64, data.as_ptr() as *const c_void, n, s.0))
     }
     pub fn download<T: Copy + Default>(&self, n: usize) -> Result<Vec<T>> {
         self.download_at(0, n)
@@ -521,9 +501,6 @@ impl Arg for f32 {
 }
 
 impl Func {
-    pub fn set_max_shared(&self, bytes: u32) -> Result<()> {
-        ck!(cuFuncSetAttribute(self.0, 8, bytes as c_int)) // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
-    }
     /// Launches the kernel on `s`; `args` are the parameters in order.
     pub fn launch(&self, s: &Stream, grid: (u32, u32, u32), block: (u32, u32, u32), shared: u32, args: &[&dyn Arg]) -> Result<()> {
         let mut ps: Vec<*mut c_void> = args.iter().map(|a| a.ptr()).collect();
