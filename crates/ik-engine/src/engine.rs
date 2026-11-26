@@ -545,6 +545,15 @@ impl Engine {
             }
             Ok(())
         };
+        // host pages are page-locked, which the cgroup's memory.max does not reliably count: new checked the whole
+        // context against what was free then, and each step past it is checked against what is free now
+        if rows > self.kv_mapped.max(self.kv_vram_rows) {
+            let more = self.kv_bytes(rows) - self.kv_bytes(self.kv_mapped.max(self.kv_vram_rows));
+            let free = host_mem_free().saturating_sub(HOST_MARGIN);
+            if more > free {
+                return Err(format!("the KV cache of {rows} tokens needs {} MiB more of host memory; {} MiB are free", more >> 20, free >> 20));
+            }
+        }
         // release before taking: the KV rows first when they shrink, the slots first when they do
         if rows < self.kv_mapped {
             resize(self, rows)?;
