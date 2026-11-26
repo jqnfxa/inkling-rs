@@ -564,8 +564,8 @@ fn main() -> Result<(), String> {
     // attention on made-up f16 caches (every 97th row subnormal) with the BF16 bias profiles [16][1024] of layer 0
     // (sliding: a ring of 1280 rows, a window of 1024, 18 chunks of 64) and of layer 5 (full, 8 chunks of 256): decode
     // (attn_part, then attn_reduce, the last chunks past the keys) at a position before the window or the profiles'
-    // extent and at one past it, then prefill (attn_prefill) of the 3 tokens up to the second, their rows of q, r and
-    // sink padded
+    // extent and at one past it, then prefill (attn_prefill) of the 37 tokens up to the second (tiles of 16, 16 and 5),
+    // their rows of q, r and sink padded
     let scale = 1.0 / 128f32.sqrt();
     for (l, ring, window, cs, positions) in [(0usize, 1280usize, 1024usize, 6u32, [100usize, 2000]), (5, 0, usize::MAX, 8, [37, 1300])] {
         let rb = ck.get(&format!("model.llm.layers.{l}.attn.rel_logits_proj.proj"), Dtype::BF16, &[16, 1024])?;
@@ -604,7 +604,7 @@ fn main() -> Result<(), String> {
                 }
             }
         }
-        let (p0, nt, qs, rs, ss) = (positions[1] - 2, 3, 3072 + 64, 384 + 16, 24 + 8);
+        let (p0, nt, qs, rs, ss) = (positions[1] - 36, 37, 3072 + 64, 384 + 16, 24 + 8);
         let q: Vec<f32> = (0..nt * qs).map(|_| rnd(&mut seed) * 3.0).collect();
         let r: Vec<f32> = (0..nt * rs).map(|_| rnd(&mut seed)).collect();
         let sink: Vec<f32> = (0..nt * ss).map(|_| rnd(&mut seed) * 2.0).collect();
@@ -617,7 +617,7 @@ fn main() -> Result<(), String> {
         check(&format!("attn_prefill {what}, pos {p0}..{}", p0 + nt), err_of(&bo.download::<f32>(nt * 3072)?), 1e-5, &mut fails);
         if ring == 0 {
             // in passes, the state carried: rows 0..700 in place, then 700..1299 and 1299.. each from a copy of its own
-            // (as prefill reads host rows); the last pass has no rows of the first token
+            // (as prefill reads host rows); the last pass has rows of the last 2 tokens alone
             let state = DevBuf::new(nt * 8 * 390 * 4)?;
             k.attn_prefill(&s, bq.ptr, br.ptr, bs.ptr, brb.ptr, bkc.ptr, bvc.ptr, bo.ptr, bp.ptr, 0, w, 1024, scale, qs as u32, rs as u32, ss as u32, nt as u32, (0, 700), state.ptr, 2)?;
             let mut copies = vec![];

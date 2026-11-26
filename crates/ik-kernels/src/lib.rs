@@ -2261,240 +2261,444 @@ pub mod gpu {
         st.global.b16([vca], vh);
     }
 
-    /// Prefill attention: a block per (kv head, query token), all keys of the token in chunks of 256 (by distance
-    /// 0, 1, ..), online softmax; the sink is the initial state (m = 0, l = 1). Token t is at position params[0] + t;
-    /// it sees distances below `window` (SWA) or all; row of a position: pos % ring, or pos where ring is 0.
-    /// q [t][q_stride] (3 heads of 128 per kv head), r [t][r_stride], sink [t][s_stride], out [t][3072].
-    /// Only the rows lo..hi count (0, u32::MAX: all), so a pass can read rows copied elsewhere: kc and vc then point
-    /// where row 0 would be. mode bit 0: start from the state an earlier pass left; bit 1: leave the state for a later
-    /// pass instead of the output. state [t][8 kv heads][390]: m[3], l[3], acc[3][128].
+    /// Prefill attention by tiles: a block takes the 3 heads of kv head ctaid.x for the 16 query tokens from 16
+    /// ctaid.y (of nt), 48 rows of q kept in shared memory, and walks the keys they see by tiles of 32 positions,
+    /// ascending, so that a tile's K and V are read once for the 48 rows. Online softmax, the sink the initial state
+    /// (m = 0, l = 1). Token t is at position params[0] + t; it sees distances below `window` (SWA) or all; row of a
+    /// position: pos % ring, or pos where ring is 0. q [t][q_stride] (3 heads of 128 per kv head), r [t][r_stride],
+    /// sink [t][s_stride], out [t][3072]. Only the rows lo..hi count (0, u32::MAX: all), so a pass can read rows
+    /// copied elsewhere: kc and vc then point where row 0 would be. mode bit 0: start from the state an earlier pass
+    /// left; bit 1: leave the state for a later pass instead of the output. state [t][8 kv heads][390]: m[3], l[3],
+    /// acc[3][128].
+    ///
+    /// Thread t takes token tk = t / 8 and, of each tile, the 4 keys 4 g .. (g = t % 8) of the scores and the 16 dims
+    /// 4 g + 32 i .. + 4 (i < 4) of the output, of the 3 heads; it holds its partial sum l of the keys it took. Shared
+    /// memory: q times scale as [32][3][16][4] (q[t][h][4 i .. 4 i + 4] at [i][h][t]); the tile's K as [128][32] or its
+    /// V as [32][132], in f32; its probabilities as [8][3][16][4] (keys 4 g .. of head h, token t, at [g][h][t]), where
+    /// the bias profiles of the tile's 48 distances wait as [48][20] while the scores are made.
     #[reqntid(128)]
+    #[minnctapersm(2)]
     pub unsafe extern "ptx-kernel" fn attn_prefill(
         q: *const f32, r: *const f32, sink: *const f32, rb: *const u16, kc: *const u16, vc: *const u16, out: *mut f32, params: *const u32,
         ring: u32, window: u32, extent: u32, scale: f32, q_stride: u32, r_stride: u32, s_stride: u32, lo: u32, hi: u32, state: *mut f32,
-        mode: u32,
+        mode: u32, nt: u32,
     ) {
-        let qsh: shared<[f32; 384], 16>;
-        let rsh: shared<[f32; 48], 16>;
-        let ksh: shared<[f32; 4], 16>;
-        let sc: shared<[f32; 768], 16>;
-        let ml: shared<[f32; 12], 16>; // m[3], l[3], alpha[3]
-        let (kvh, tk, t): (u32, u32, u32);
-        mov.u32(kvh, ctaid.x);
-        mov.u32(tk, ctaid.y);
+        let qsh: shared<[f32; 6144], 16>;
+        let kvsh: shared<[f32; 4224], 16>;
+        let psh: shared<[f32; 1536], 16>;
+        let (t, tk, g, kvh, tq0, h0): (u32, u32, u32, u32, u32, u32);
         mov.u32(t, tid.x);
-        let (pos, nk, d_lo, d_hi): (u32, u32, u32, u32);
-        ld.global.u32(pos, [params]);
-        add.u32(pos, pos, tk);
-        add.u32(nk, pos, 1);
-        min.u32(nk, nk, window);
-        // the distances of the rows lo..hi: from pos + 1 - hi to below pos + 1 - lo
-        add.u32(d_lo, pos, 1);
-        max.u32(d_lo, d_lo, hi);
-        sub.u32(d_lo, d_lo, hi);
-        add.u32(d_hi, pos, 1);
-        max.u32(d_hi, d_hi, lo);
-        sub.u32(d_hi, d_hi, lo);
-        min.u32(nk, nk, d_hi);
-        let (mbit, so): (u32, u32);
-        let (resume, keep): (pred, pred);
+        shr.u32(tk, t, 3);
+        and.b32(g, t, 7);
+        mov.u32(kvh, ctaid.x);
+        mov.u32(tq0, ctaid.y);
+        shl.b32(tq0, tq0, 4);
+        mul.lo.u32(h0, kvh, 3);
+        // the block's tokens tq0 .. tq0 + ntile at positions p0 ..; this thread's at ptk; tr the token it reads for
+        // (its own, or the last one where it has none)
+        let (p0, ntile, p1, ptk, tr): (u32, u32, u32, u32, u32);
+        ld.global.u32(p0, [params]);
+        add.u32(p0, p0, tq0);
+        sub.u32(ntile, nt, tq0);
+        min.u32(ntile, ntile, 16);
+        add.u32(p1, p0, ntile);
+        add.u32(ptk, p0, tk);
+        sub.u32(tr, ntile, 1);
+        min.u32(tr, tr, tk);
+        add.u32(tr, tr, tq0);
+        let tok_ok: pred;
+        setp.lt.u32(tok_ok, tk, ntile);
+        // the keys kstart .. kend: from the first token's window (and lo) to the last token (and hi)
+        let (kstart, kend, wst): (u32, u32, u32);
+        add.u32(wst, p0, 1);
+        min.u32(kstart, wst, window);
+        sub.u32(kstart, wst, kstart);
+        max.u32(kstart, kstart, lo);
+        min.u32(kend, p1, hi);
+        let (qb, kb, pb): (u32, u32, u32);
+        mov.u32(qb, qsh);
+        mov.u32(kb, kvsh);
+        mov.u32(pb, psh);
+        // q: thread t brings 4 floats (dq = t % 32) of rows 4 k + t / 32, row h * 16 + token
+        let (dq, hq): (u32, u32);
+        and.b32(dq, t, 31);
+        shr.u32(hq, t, 5);
+        for k in 0..12 {
+            let (row, hh, tt, qi, sa): (u32, u32, u32, u32, u32);
+            add.u32(row, hq, 4 * k);
+            shr.u32(hh, row, 4);
+            and.b32(tt, row, 15);
+            let ok: pred;
+            setp.lt.u32(ok, tt, ntile);
+            let x: [f32; 4];
+            for i in 0..4 {
+                mov.f32(x[i], 0.0);
+            }
+            if ok {
+                let qa: u64;
+                add.u32(tt, tt, tq0);
+                add.u32(hh, hh, h0);
+                shl.b32(hh, hh, 7);
+                mad.lo.u32(qi, dq, 4, hh);
+                mad.lo.u32(qi, tt, q_stride, qi);
+                mad.wide.u32(qa, qi, 4, q);
+                ld.global.nc.v4.f32((x[0], x[1], x[2], x[3]), [qa]);
+                for i in 0..4 {
+                    mul.rn.f32(x[i], x[i], scale);
+                }
+            }
+            mad.lo.u32(sa, dq, 48, row);
+            shl.b32(sa, sa, 4);
+            add.u32(sa, sa, qb);
+            st.shared.v4.f32([sa], (x[0], x[1], x[2], x[3]));
+        }
+        // r [3][16] and the sink [3] of this thread's token
+        let rv: [f32; 48];
+        let sk: [f32; 3];
+        {
+            let (ro, so): (u32, u32);
+            let (ra, sa): (u64, u64);
+            mul.lo.u32(ro, h0, 16);
+            mad.lo.u32(ro, tr, r_stride, ro);
+            mad.wide.u32(ra, ro, 4, r);
+            for k in 0..12 {
+                ld.global.nc.v4.f32((rv[4 * k], rv[4 * k + 1], rv[4 * k + 2], rv[4 * k + 3]), [ra + (16 * k)]);
+            }
+            mad.lo.u32(so, tr, s_stride, h0);
+            mad.wide.u32(sa, so, 4, sink);
+            for h in 0..3 {
+                ld.global.nc.f32(sk[h], [sa + (4 * h)]);
+            }
+        }
+        // the state: m, this thread's part of l (lane 0 of the token's 8 holds the rest) and its 48 outputs
+        let m: [f32; 3];
+        let l: [f32; 3];
+        let o: [f32; 48];
+        let (mbit, sto): (u32, u32);
+        let (resume, keep, first): (pred, pred, pred);
         and.b32(mbit, mode, 1);
         setp.ne.u32(resume, mbit, 0);
         and.b32(mbit, mode, 2);
         setp.ne.u32(keep, mbit, 0);
-        // this thread's floats of the block's state at sacc: m and l of head t (t < 3) at 0 and 12, acc of the 3 heads
-        // at 24, 536 and 1048
+        setp.eq.u32(first, g, 0);
         let sacc: u64;
-        mad.lo.u32(so, tk, 8, kvh);
-        mad.lo.u32(so, so, 390, t);
-        mad.wide.u32(sacc, so, 4, state);
-        let (qb, rbs, kb, sb, mb): (u32, u32, u32, u32, u32);
-        mov.u32(qb, qsh);
-        mov.u32(rbs, rsh);
-        mov.u32(kb, ksh);
-        mov.u32(sb, sc);
-        mov.u32(mb, ml);
-        let h0: u32;
-        mul.lo.u32(h0, kvh, 3);
-        for k in 0..3 {
-            let (qi, qa2): (u32, u32);
-            let qa: u64;
-            let v: f32;
-            mad.lo.u32(qi, tk, q_stride, t);
-            mad.lo.u32(qi, h0, 128, qi);
-            add.u32(qi, qi, k * 128);
-            mad.wide.u32(qa, qi, 4, q);
-            ld.global.f32(v, [qa]);
-            mul.rn.f32(v, v, scale);
-            mad.lo.u32(qa2, t, 4, qb);
-            st.shared.f32([qa2 + (k * 512)], v);
+        mad.lo.u32(sto, tr, 8, kvh);
+        mul.lo.u32(sto, sto, 390);
+        mad.wide.u32(sacc, sto, 4, state);
+        for h in 0..3 {
+            mov.f32(m[h], 0.0);
+            selp.f32(l[h], 1.0, 0.0, first);
         }
-        let lt48: pred;
-        setp.lt.u32(lt48, t, 48);
-        if lt48 {
-            let (ri, ra2): (u32, u32);
-            let ra: u64;
-            let v: f32;
-            mad.lo.u32(ri, tk, r_stride, t);
-            mad.lo.u32(ri, h0, 16, ri);
-            mad.wide.u32(ra, ri, 4, r);
-            ld.global.f32(v, [ra]);
-            mad.lo.u32(ra2, t, 4, rbs);
-            st.shared.f32([ra2], v);
+        for i in 0..48 {
+            mov.f32(o[i], 0.0);
         }
-        let lt3: pred;
-        setp.lt.u32(lt3, t, 3);
-        if lt3 {
-            let (si, sa2, ma): (u32, u32, u32);
-            let sa: u64;
-            let v: f32;
-            mad.lo.u32(si, tk, s_stride, h0);
-            add.u32(si, si, t);
-            mad.wide.u32(sa, si, 4, sink);
-            ld.global.f32(v, [sa]);
-            mad.lo.u32(sa2, t, 4, kb);
-            st.shared.f32([sa2], v);
-            mad.lo.u32(ma, t, 4, mb);
-            st.shared.f32([ma], 0.0);
-            st.shared.f32([ma + 12], 1.0);
-        }
-        let lt3_resume: pred;
-        and.pred(lt3_resume, lt3, resume);
-        if lt3_resume {
-            let ma: u32;
-            let (mv, lv): (f32, f32);
-            mad.lo.u32(ma, t, 4, mb);
-            ld.global.f32(mv, [sacc]);
-            ld.global.f32(lv, [sacc + 12]);
-            st.shared.f32([ma], mv);
-            st.shared.f32([ma + 12], lv);
-        }
-        bar.sync(0);
-        let (a0, a1, a2): (f32, f32, f32);
-        mov.f32(a0, 0.0);
-        mov.f32(a1, 0.0);
-        mov.f32(a2, 0.0);
         if resume {
-            ld.global.f32(a0, [sacc + 24]);
-            ld.global.f32(a1, [sacc + 536]);
-            ld.global.f32(a2, [sacc + 1048]);
+            let (oa, ob): (u32, u64);
+            for h in 0..3 {
+                let lv: f32;
+                ld.global.f32(m[h], [sacc + (4 * h)]);
+                ld.global.f32(lv, [sacc + (12 + 4 * h)]);
+                selp.f32(l[h], lv, 0.0, first);
+            }
+            shl.b32(oa, g, 4);
+            mad.wide.u32(ob, oa, 1, sacc);
+            for h in 0..3 {
+                for i in 0..16 {
+                    ld.global.f32(o[16 * h + i], [ob + (24 + 512 * h + 128 * (i / 4) + 4 * (i % 4))]);
+                }
+            }
         }
-        let (lane, w): (u32, u32);
-        and.b32(lane, t, 31);
-        shr.u32(w, t, 5);
-        let start: u32;
-        mov.u32(start, d_lo);
-        label(ctop);
-        let cdone: pred;
-        setp.ge.u32(cdone, start, nk);
-        if cdone {
-            bra(cend);
+        // a tile's rows: thread t brings key kp0 + t % 32 (the last one where it is past kend), dims 32 (t / 32) ..
+        let (koff, last): (u32, u32);
+        shl.b32(koff, kvh, 7);
+        mad.lo.u32(koff, hq, 32, koff);
+        sub.u32(last, kend, 1);
+        let kr: [u32; 16];
+        let vr: [u32; 16];
+        for i in 0..16 {
+            mov.u32(kr[i], 0);
         }
-        let cnt: u32;
-        sub.u32(cnt, nk, start);
-        min.u32(cnt, cnt, 256);
-        // scores of distances start + jj
-        let jj: u32;
-        mov.u32(jj, t);
-        label(stop);
-        let sdone: pred;
-        setp.ge.u32(sdone, jj, cnt);
-        if sdone {
-            bra(send);
+        let kp0: u32;
+        mov.u32(kp0, kstart);
+        let any: pred;
+        setp.lt.u32(any, kstart, kend);
+        if any {
+            let (kp, ka, va): (u32, u64, u64);
+            add.u32(kp, kp0, dq);
+            kv_at(ka, va, kp, last, ring, koff, kc, vc);
+            for i in 0..4 {
+                ld.global.nc.v4.u32((kr[4 * i], kr[4 * i + 1], kr[4 * i + 2], kr[4 * i + 3]), [ka + (16 * i)]);
+            }
         }
-        score_dist(start, jj, kvh, pos, ring, extent, kc, rb, qb, rbs, kb, sb);
-        add.u32(jj, jj, 128);
-        bra(stop);
-        label(send);
+        // where this thread stores K ([d][32]: kb + 4 (32 d + key)) and V ([key][132]: kb + 4 (132 key + d)), reads q,
+        // K, the bias profiles, the probabilities and V
+        let (kst, vst, qrd, krd, brd, pst, prd, vrd): (u32, u32, u32, u32, u32, u32, u32, u32);
+        mad.lo.u32(kst, dq, 4, kb);
+        mad.lo.u32(kst, hq, 4096, kst);
+        mad.lo.u32(vst, dq, 528, kb);
+        mad.lo.u32(vst, hq, 128, vst);
+        mad.lo.u32(qrd, tk, 16, qb);
+        mad.lo.u32(krd, g, 16, kb);
+        // the profile of distance tk - 4 g - c + 31 at index (tk + 28 - 4 g) + (3 - c) of [48][20]
+        let g4: u32;
+        shl.b32(g4, g, 2);
+        add.u32(brd, tk, 28);
+        sub.u32(brd, brd, g4);
+        mad.lo.u32(brd, brd, 80, pb);
+        mad.lo.u32(pst, g, 768, pb);
+        mad.lo.u32(pst, tk, 16, pst);
+        mad.lo.u32(prd, tk, 16, pb);
+        mad.lo.u32(vrd, g, 16, kb);
+        // the bias profiles' fill: entry (i, j), i = t / 16 + 8 k, j = t % 16, at pb + 4 (20 i + j)
+        let (bj, bi, bst): (u32, u32, u32);
+        and.b32(bj, t, 15);
+        shr.u32(bi, t, 4);
+        mad.lo.u32(bst, bi, 20, bj);
+        mad.lo.u32(bst, bst, 4, pb);
+        label(top);
+        let done: pred;
+        setp.ge.u32(done, kp0, kend);
+        if done {
+            bra(fin);
+        }
+        // this tile's K to shared memory, f32, and the profiles of its distances p0 - kp0 - 31 + i where it needs them
+        for i in 0..16 {
+            let (h1, h2): (f16, f16);
+            let (f1, f2): (f32, f32);
+            mov.b32((h1, h2), kr[i]);
+            cvt.f32.f16(f1, h1);
+            cvt.f32.f16(f2, h2);
+            st.shared.f32([kst + (256 * i)], f1);
+            st.shared.f32([kst + (256 * i + 128)], f2);
+        }
+        let (bias, bend): (pred, u32);
+        add.u32(bend, kp0, 31);
+        add.u32(bend, bend, extent);
+        setp.gt.u32(bias, bend, p0);
+        if !bias {
+            bra(filled);
+        }
+        {
+            let dmin: u32;
+            sub.u32(dmin, p0, kp0);
+            sub.u32(dmin, dmin, 31);
+            add.u32(dmin, dmin, bi);
+            for k in 0..6 {
+                let d: u32;
+                let v: f32;
+                add.u32(d, dmin, 8 * k);
+                mov.f32(v, 0.0);
+                let inb: pred;
+                setp.lt.u32(inb, d, extent);
+                if inb {
+                    let (bo, ba): (u32, u64);
+                    mad.lo.u32(bo, bj, 1024, d);
+                    mad.wide.u32(ba, bo, 2, rb);
+                    ld_bf16(v, ba);
+                }
+                st.shared.f32([bst + (640 * k)], v);
+            }
+        }
+        label(filled);
         bar.sync(0);
-        let no_head: pred;
-        setp.ge.u32(no_head, w, 3);
-        if no_head {
-            bra(sm_skip);
+        // the tile's V, read while the scores are made
+        {
+            let (kp, ka, va): (u32, u64, u64);
+            add.u32(kp, kp0, dq);
+            kv_at(ka, va, kp, last, ring, koff, kc, vc);
+            for i in 0..4 {
+                ld.global.nc.v4.u32((vr[4 * i], vr[4 * i + 1], vr[4 * i + 2], vr[4 * i + 3]), [va + (16 * i)]);
+            }
         }
-        softmax_online(w, lane, cnt, sb, mb);
-        label(sm_skip);
+        // scores s[4 h + c] of keys kp0 + 4 g + c, summed over the dims in order
+        let s: [f32; 12];
+        for i in 0..12 {
+            mov.f32(s[i], 0.0);
+        }
+        for d4 in 0..32 {
+            let qv: [f32; 12];
+            let kv: [f32; 16];
+            for h in 0..3 {
+                ld.shared.v4.f32((qv[4 * h], qv[4 * h + 1], qv[4 * h + 2], qv[4 * h + 3]), [qrd + (768 * d4 + 256 * h)]);
+            }
+            for e in 0..4 {
+                ld.shared.v4.f32((kv[4 * e], kv[4 * e + 1], kv[4 * e + 2], kv[4 * e + 3]), [krd + (128 * (4 * d4 + e))]);
+            }
+            for e in 0..4 {
+                for h in 0..3 {
+                    for c in 0..4 {
+                        fma.rn.f32(s[4 * h + c], qv[4 * h + e], kv[4 * e + c], s[4 * h + c]);
+                    }
+                }
+            }
+        }
+        if bias {
+            for c in 0..4 {
+                let bv: [f32; 16];
+                for j in 0..4 {
+                    ld.shared.v4.f32((bv[4 * j], bv[4 * j + 1], bv[4 * j + 2], bv[4 * j + 3]), [brd + (80 * (3 - c) + 16 * j)]);
+                }
+                for h in 0..3 {
+                    for j in 0..16 {
+                        fma.rn.f32(s[4 * h + c], rv[16 * h + j], bv[j], s[4 * h + c]);
+                    }
+                }
+            }
+        }
+        // the sink, and the keys this token does not see: past it, past the window, past kend, or no token
+        for c in 0..4 {
+            let (key, dist): (u32, u32);
+            let see: pred;
+            add.u32(key, kp0, c);
+            mad.lo.u32(key, g, 4, key);
+            sub.u32(dist, ptk, key);
+            setp.le.and.u32(see, key, ptk, tok_ok);
+            setp.lt.and.u32(see, key, kend, see);
+            setp.lt.and.u32(see, dist, window, see);
+            for h in 0..3 {
+                sub.rn.f32(s[4 * h + c], s[4 * h + c], sk[h]);
+                selp.f32(s[4 * h + c], s[4 * h + c], -3.0e38, see);
+            }
+        }
+        // online softmax over the token's 8 threads: m' = max(m, max s), p = e^(s - m'), l = l e^(m - m') + sum p
+        for h in 0..3 {
+            let (mx, ot, al): (f32, f32, f32);
+            max.f32(mx, s[4 * h], s[4 * h + 1]);
+            max.f32(mx, mx, s[4 * h + 2]);
+            max.f32(mx, mx, s[4 * h + 3]);
+            for sh in [4, 2, 1] {
+                shfl.sync.bfly.b32(ot, mx, sh, 31, 0xffff_ffff);
+                max.f32(mx, mx, ot);
+            }
+            max.f32(mx, mx, m[h]);
+            sub.rn.f32(al, m[h], mx);
+            exp(al, al);
+            mov.f32(m[h], mx);
+            mul.rn.f32(l[h], l[h], al);
+            for c in 0..4 {
+                sub.rn.f32(s[4 * h + c], s[4 * h + c], mx);
+                exp(s[4 * h + c], s[4 * h + c]);
+                add.rn.f32(l[h], l[h], s[4 * h + c]);
+            }
+            for i in 0..16 {
+                mul.rn.f32(o[16 * h + i], o[16 * h + i], al);
+            }
+        }
         bar.sync(0);
-        // acc = acc * alpha + sum p v
-        let (al0, al1, al2): (f32, f32, f32);
-        ld.shared.f32(al0, [mb + 24]);
-        ld.shared.f32(al1, [mb + 28]);
-        ld.shared.f32(al2, [mb + 32]);
-        mul.rn.f32(a0, a0, al0);
-        mul.rn.f32(a1, a1, al1);
-        mul.rn.f32(a2, a2, al2);
-        let j2: u32;
-        mov.u32(j2, 0);
-        label(vtop);
-        let vdone: pred;
-        setp.ge.u32(vdone, j2, cnt);
-        if vdone {
-            bra(vend);
+        // the probabilities and V to shared memory
+        for h in 0..3 {
+            st.shared.v4.f32([pst + (256 * h)], (s[4 * h], s[4 * h + 1], s[4 * h + 2], s[4 * h + 3]));
         }
-        let (dist, kp, row, vo, pa): (u32, u32, u32, u32, u32);
-        add.u32(dist, start, j2);
-        sub.u32(kp, pos, dist);
-        mov.u32(row, kp);
+        for i in 0..8 {
+            let f: [f32; 4];
+            for j in 0..2 {
+                let (h1, h2): (f16, f16);
+                mov.b32((h1, h2), vr[2 * i + j]);
+                cvt.f32.f16(f[2 * j], h1);
+                cvt.f32.f16(f[2 * j + 1], h2);
+            }
+            st.shared.v4.f32([vst + (16 * i)], (f[0], f[1], f[2], f[3]));
+        }
+        bar.sync(0);
+        // the next tile's K, read while this one's values are summed
+        add.u32(kp0, kp0, 32);
+        let more: pred;
+        setp.lt.u32(more, kp0, kend);
+        if more {
+            let (kp, ka, va): (u32, u64, u64);
+            add.u32(kp, kp0, dq);
+            kv_at(ka, va, kp, last, ring, koff, kc, vc);
+            for i in 0..4 {
+                ld.global.nc.v4.u32((kr[4 * i], kr[4 * i + 1], kr[4 * i + 2], kr[4 * i + 3]), [ka + (16 * i)]);
+            }
+        }
+        // o += p v, over the tile's keys in order
+        for kq in 0..8 {
+            let pv: [f32; 12];
+            for h in 0..3 {
+                ld.shared.v4.f32((pv[4 * h], pv[4 * h + 1], pv[4 * h + 2], pv[4 * h + 3]), [prd + (768 * kq + 256 * h)]);
+            }
+            for e in 0..4 {
+                let vv: [f32; 16];
+                for i in 0..4 {
+                    ld.shared.v4.f32((vv[4 * i], vv[4 * i + 1], vv[4 * i + 2], vv[4 * i + 3]), [vrd + (528 * (4 * kq + e) + 128 * i)]);
+                }
+                for h in 0..3 {
+                    for i in 0..16 {
+                        fma.rn.f32(o[16 * h + i], pv[4 * h + e], vv[i], o[16 * h + i]);
+                    }
+                }
+            }
+        }
+        bar.sync(0);
+        bra(top);
+        label(fin);
+        // l over the token's 8 threads
+        for h in 0..3 {
+            for sh in [4, 2, 1] {
+                let ot: f32;
+                shfl.sync.bfly.b32(ot, l[h], sh, 31, 0xffff_ffff);
+                add.rn.f32(l[h], l[h], ot);
+            }
+        }
+        if !tok_ok {
+            bra(end);
+        }
+        if !keep {
+            bra(output);
+        }
+        {
+            let (oa, ob): (u32, u64);
+            if first {
+                for h in 0..3 {
+                    st.global.f32([sacc + (4 * h)], m[h]);
+                    st.global.f32([sacc + (12 + 4 * h)], l[h]);
+                }
+            }
+            shl.b32(oa, g, 4);
+            mad.wide.u32(ob, oa, 1, sacc);
+            for h in 0..3 {
+                for i in 0..16 {
+                    st.global.f32([ob + (24 + 512 * h + 128 * (i / 4) + 4 * (i % 4))], o[16 * h + i]);
+                }
+            }
+            bra(end);
+        }
+        label(output);
+        {
+            let (oi, ow): (u32, u32);
+            let oa: u64;
+            add.u32(oi, tq0, tk);
+            mul.lo.u32(oi, oi, 3072);
+            mad.lo.u32(ow, h0, 128, oi);
+            mad.lo.u32(ow, g, 4, ow);
+            mad.wide.u32(oa, ow, 4, out);
+            for h in 0..3 {
+                for i in 0..4 {
+                    let y: [f32; 4];
+                    for x in 0..4 {
+                        div.rn.f32(y[x], o[16 * h + 4 * i + x], l[h]);
+                    }
+                    st.global.v4.f32([oa + (512 * h + 128 * i)], (y[0], y[1], y[2], y[3]));
+                }
+            }
+        }
+        label(end);
+    }
+
+    /// The addresses in K and V of position kp (the last key where it is past it) at offset off of its row.
+    fn kv_at(ka: u64, va: u64, kp: u32, last: u32, ring: u32, off: u32, kc: u64, vc: u64) {
+        let row: u32;
+        min.u32(row, kp, last);
+        // a row past the ring's is its position; no position is u32::MAX
+        let (rd, o): (u32, u32);
         let is_ring: pred;
         setp.ne.u32(is_ring, ring, 0);
-        if is_ring {
-            rem.u32(row, kp, ring);
-        }
-        mad.lo.u32(vo, row, 8, kvh);
-        shl.b32(vo, vo, 7);
-        add.u32(vo, vo, t);
-        let va: u64;
-        mad.wide.u32(va, vo, 2, vc);
-        let vh: f16;
-        let (vf, p0, p1, p2): (f32, f32, f32, f32);
-        ld.global.nc.b16(vh, [va]);
-        cvt.f32.f16(vf, vh);
-        mad.lo.u32(pa, j2, 4, sb);
-        ld.shared.f32(p0, [pa]);
-        ld.shared.f32(p1, [pa + 1024]);
-        ld.shared.f32(p2, [pa + 2048]);
-        fma.rn.f32(a0, p0, vf, a0);
-        fma.rn.f32(a1, p1, vf, a1);
-        fma.rn.f32(a2, p2, vf, a2);
-        add.u32(j2, j2, 1);
-        bra(vtop);
-        label(vend);
-        bar.sync(0);
-        add.u32(start, start, 256);
-        bra(ctop);
-        label(cend);
-        let lt3_keep: pred;
-        and.pred(lt3_keep, lt3, keep);
-        if lt3_keep {
-            let ma: u32;
-            let (mv, lv): (f32, f32);
-            mad.lo.u32(ma, t, 4, mb);
-            ld.shared.f32(mv, [ma]);
-            ld.shared.f32(lv, [ma + 12]);
-            st.global.f32([sacc], mv);
-            st.global.f32([sacc + 12], lv);
-        }
-        if keep {
-            st.global.f32([sacc + 24], a0);
-            st.global.f32([sacc + 536], a1);
-            st.global.f32([sacc + 1048], a2);
-            bra(pdone);
-        }
-        let (l0, l1, l2): (f32, f32, f32);
-        ld.shared.f32(l0, [mb + 12]);
-        ld.shared.f32(l1, [mb + 16]);
-        ld.shared.f32(l2, [mb + 20]);
-        div.rn.f32(a0, a0, l0);
-        div.rn.f32(a1, a1, l1);
-        div.rn.f32(a2, a2, l2);
-        let (oo, oa): (u32, u64);
-        mad.lo.u32(oo, tk, 3072, t);
-        mad.lo.u32(oo, h0, 128, oo);
-        mad.wide.u32(oa, oo, 4, out);
-        st.global.f32([oa], a0);
-        st.global.f32([oa + 512], a1);
-        st.global.f32([oa + 1024], a2);
-        label(pdone);
+        selp.u32(rd, ring, 0xFFFF_FFFF, is_ring);
+        rem.u32(row, row, rd);
+        mad.lo.u32(o, row, 1024, off);
+        mad.wide.u32(ka, o, 2, kc);
+        mad.wide.u32(va, o, 2, vc);
     }
 
     /// The scores of distance start + jj (key position pos - dist) for the 3 heads in shared q, into sc[h][jj].
@@ -2599,64 +2803,6 @@ pub mod gpu {
         st.shared.f32([sa], s0);
         st.shared.f32([sa + 1024], s1);
         st.shared.f32([sa + 2048], s2);
-    }
-
-    /// Warp h, online: m' = max(m, max s), p = exp(s - m') in place, l = l alpha + sum p with alpha = exp(m - m');
-    /// ml holds m[3] @0, l[3] @12, alpha[3] @24.
-    fn softmax_online(h: u32, lane: u32, cnt: u32, sb: u32, mb: u32) {
-        let (hb, i, ma): (u32, u32, u32);
-        mad.lo.u32(hb, h, 1024, sb);
-        mad.lo.u32(ma, h, 4, mb);
-        let (m, mo): (f32, f32);
-        ld.shared.f32(mo, [ma]);
-        mov.f32(m, mo);
-        mov.u32(i, lane);
-        label(mt);
-        let md: pred;
-        setp.ge.u32(md, i, cnt);
-        if md {
-            bra(me);
-        }
-        let (a, v): (u32, f32);
-        mad.lo.u32(a, i, 4, hb);
-        ld.shared.f32(v, [a]);
-        max.f32(m, m, v);
-        add.u32(i, i, 32);
-        bra(mt);
-        label(me);
-        warp_max(m);
-        let l: f32;
-        mov.f32(l, 0.0);
-        mov.u32(i, lane);
-        label(et);
-        let ed: pred;
-        setp.ge.u32(ed, i, cnt);
-        if ed {
-            bra(ee);
-        }
-        let (a2, v2): (u32, f32);
-        mad.lo.u32(a2, i, 4, hb);
-        ld.shared.f32(v2, [a2]);
-        sub.rn.f32(v2, v2, m);
-        exp(v2, v2);
-        st.shared.f32([a2], v2);
-        add.rn.f32(l, l, v2);
-        add.u32(i, i, 32);
-        bra(et);
-        label(ee);
-        warp_sum(l);
-        let first: pred;
-        setp.eq.u32(first, lane, 0);
-        if first {
-            let (alpha, lo): (f32, f32);
-            sub.rn.f32(alpha, mo, m);
-            exp(alpha, alpha);
-            ld.shared.f32(lo, [ma + 12]);
-            fma.rn.f32(lo, lo, alpha, l);
-            st.shared.f32([ma], m);
-            st.shared.f32([ma + 12], lo);
-            st.shared.f32([ma + 24], alpha);
-        }
     }
 
     // ---------------------------------------------------------------- grouped experts (prefill)

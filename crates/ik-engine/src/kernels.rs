@@ -300,9 +300,9 @@ impl Kernels {
         self.run(
             s,
             "attn_prefill",
-            (8, ntok, 1),
+            (8, ntok.div_ceil(16), 1),
             128,
-            &[&q, &r, &sink, &rb, &kc, &vc, &out, &params, &ring, &window, &extent, &scale, &q_stride, &r_stride, &s_stride, &lo, &hi, &state, &mode],
+            &[&q, &r, &sink, &rb, &kc, &vc, &out, &params, &ring, &window, &extent, &scale, &q_stride, &r_stride, &s_stride, &lo, &hi, &state, &mode, &ntok],
         )
     }
 

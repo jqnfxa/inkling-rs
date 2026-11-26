@@ -1704,6 +1704,22 @@ impl Engine {
                 self.k.attn_reduce(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, self.params.ptr, window, maxs, cs, hp.n_head as u32, 0, u32::MAX)?
             });
         }
+        // prefill's attention on T_MAX tokens: a sliding layer's whole window, a full layer's keys up to each length
+        // timed; GB/s here are GFLOP/s of q k and p v (24 heads of 128 dims: 12288 a key and token)
+        let nh = hp.n_head * hp.head_dim;
+        let sink = self.b.g0.at((2 * nh + hp.n_head * hp.n_rel) * 4);
+        let (g0r, nr) = (self.w.layers[6].g0_rows() as u32, (hp.n_head * hp.n_rel) as u32);
+        for &(keys, ring, kvi) in &cases {
+            let (p0, window, extent) = if ring != 0 { (4096u32, hp.n_swa as u32, hp.n_swa as u32) } else { (keys - T_MAX as u32, u32::MAX, hp.rel_extent as u32) };
+            self.params.upload(&[p0, 1f32.to_bits(), 1f32.to_bits(), 0])?;
+            let pairs: u64 = (0..T_MAX as u64).map(|t| (p0 as u64 + t + 1).min(window as u64)).sum();
+            let ([kc, vc], rb) = (self.kv(kvi), self.w.layers[kvi].rel_proj.ptr);
+            let what = if ring != 0 { "sliding" } else { "full" };
+            let (b, ntu, scale) = (&self.b, T_MAX as u32, 1.0 / (hp.head_dim as f32).sqrt());
+            time!(format!("attn_prefill {what} to {}", p0 + ntu), pairs * 12288, {
+                self.k.attn_prefill(&self.s, b.q.ptr, b.r.ptr, sink, rb, kc, vc, b.att.ptr, self.params.ptr, ring, window, extent, scale, nh as u32, nr, g0r, ntu, (0, u32::MAX), 0, 0)?
+            });
+        }
         let list = vec![self.bl.b0.ptr, self.bl.b6[0].ptr, self.bl.b12[0].ptr, self.sc.x.ptr];
         let pl = self.ptr_list(&list)?;
         let l = &self.w.layers[6];
