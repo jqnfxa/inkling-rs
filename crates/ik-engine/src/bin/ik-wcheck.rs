@@ -647,11 +647,14 @@ fn main() -> Result<(), String> {
                 let rms = (vs.iter().map(|a| a * a).sum::<f64>() / 128.0 + eps as f64).sqrt();
                 vs.iter_mut().for_each(|a| *a /= rms);
             }
-            err = err.max(rel_err(&bk.download::<f32>(kv)?, &kr)).max(rel_err(&bv.download::<f32>(kv)?, &vr));
+            let (kf, vf) = (bk.download::<f32>(kv)?, bv.download::<f32>(kv)?);
+            err = err.max(rel_err(&kf, &kr)).max(rel_err(&vf, &vr));
+            // the f16 rows: the kernel's f32 values (checked above) rounded to nearest, exactly. Against f64 they would
+            // also carry the f32 error, which near 0 is many f16 spacings.
             let row = if ring > 0 { pos % ring } else { pos };
-            for (c, want) in [(bkc.download::<u16>(rows * 1024)?, &kr), (bvc.download::<u16>(rows * 1024)?, &vr)] {
-                for (i, &w) in want.iter().enumerate() {
-                    e16 = e16.max((f16(c[row * 1024 + i]) - w).abs() / f16_ulp(w));
+            for (c, got) in [(bkc.download::<u16>(rows * 1024)?, &kf), (bvc.download::<u16>(rows * 1024)?, &vf)] {
+                for (i, &w) in got.iter().enumerate() {
+                    e16 = e16.max((f16(c[row * 1024 + i]) - f16_round(w)).abs() / f16_ulp(w as f64));
                 }
             }
         }
@@ -665,7 +668,7 @@ fn main() -> Result<(), String> {
             fails.push(format!("kv_prep layer {l}: {clipped} of 40 heads clipped; the check wants both kinds"));
         }
         check(&format!("kv_prep layer {l} k, v"), err, 1e-5, &mut fails);
-        check(&format!("kv_prep layer {l} f16 rows (f16 spacings)"), e16, 0.501, &mut fails);
+        check(&format!("kv_prep layer {l} f16 rows: its f32 rounded (f16 spacings)"), e16, 0.0, &mut fails);
     }
 
     if fails.is_empty() {
