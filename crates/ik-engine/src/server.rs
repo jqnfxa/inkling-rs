@@ -799,6 +799,12 @@ struct Request {
     path: String,
     /// X-Conversation-Id (the llama.cpp UI's, "<conversation>::<model>"): the stream is a resumable session
     conv: Option<String>,
+    /// Host and Origin, which POST /tools checks
+    host: Option<String>,
+    origin: Option<String>,
+    /// the llama.cpp UI's x-tool-cwd (the conversation's working directory) and x-resp-type, for POST /tools
+    tool_cwd: Option<String>,
+    resp_type: Option<String>,
     body: Vec<u8>,
 }
 
@@ -809,7 +815,7 @@ fn read_request(s: &mut BufReader<TcpStream>) -> Option<Request> {
     let method = it.next()?.to_string();
     let path = it.next()?.to_string();
     let mut len = 0usize;
-    let mut conv = None;
+    let (mut conv, mut host, mut origin, mut tool_cwd, mut resp_type) = (None, None, None, None, None);
     loop {
         let mut h = String::new();
         if s.read_line(&mut h).ok()? == 0 {
@@ -822,8 +828,16 @@ fn read_request(s: &mut BufReader<TcpStream>) -> Option<Request> {
         if let Some((k, v)) = h.split_once(':') {
             if k.eq_ignore_ascii_case("content-length") {
                 len = v.trim().parse().ok()?;
-            } else if k.eq_ignore_ascii_case("x-conversation-id") && !v.trim().is_empty() {
-                conv = Some(v.trim().to_string());
+            } else if !v.trim().is_empty() {
+                let to = match k.to_ascii_lowercase().as_str() {
+                    "x-conversation-id" => &mut conv,
+                    "host" => &mut host,
+                    "origin" => &mut origin,
+                    "x-tool-cwd" => &mut tool_cwd,
+                    "x-resp-type" => &mut resp_type,
+                    _ => continue,
+                };
+                *to = Some(v.trim().to_string());
             }
         }
     }
@@ -832,7 +846,7 @@ fn read_request(s: &mut BufReader<TcpStream>) -> Option<Request> {
     }
     let mut body = vec![0u8; len];
     s.read_exact(&mut body).ok()?;
-    Some(Request { method, path, conv, body })
+    Some(Request { method, path, conv, host, origin, tool_cwd, resp_type, body })
 }
 
 /// A query parameter, percent-decoded.
@@ -865,6 +879,7 @@ fn respond(s: &mut TcpStream, code: u16, body: &Value) {
     let reason = match code {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         _ => "Internal Server Error",
     };
@@ -905,6 +920,8 @@ pub struct Site {
     pub notes: compact::Notes,
     /// sampling settings unless a request says otherwise
     pub sampling: SamplingParams,
+    /// the chat UI's server tools (--tools): files and search on this machine, for the model
+    pub tools: bool,
 }
 
 /// The request's `reasoning_summary` (or `reasoning.summary`) and `reasoning_summary_interval` over the server's.
@@ -1080,8 +1097,23 @@ fn handle(mut stream: TcpStream, jobs: Sender<Job>, tok: Arc<Tokenizer>, model: 
         }
         ("GET", "/health") | ("GET", "/v1/health") => respond(&mut stream, 200, &json!({"status": "ok"})),
         ("GET", "/props") => respond(&mut stream, 200, &site.props),
-        // llama-server's own tools (--tools): none here
-        ("GET", "/tools") => respond(&mut stream, 200, &json!([])),
+        // the chat UI's server tools; 403 tells it they're off
+        ("GET", "/tools") if site.tools => respond(&mut stream, 200, &crate::tools::list()),
+        ("POST", "/tools") if site.tools => {
+            let caller = stream.peer_addr().and_then(|peer| Ok((peer, stream.local_addr()?.port())));
+            let ok = caller.map_err(|e| e.to_string()).and_then(|(peer, port)| crate::tools::caller_ok(peer.ip(), port, req.host.as_deref(), req.origin.as_deref()));
+            if let Err(e) = ok {
+                return respond(&mut stream, 403, &json!({"error": e}));
+            }
+            let r: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            let tool = r.get("tool").and_then(Value::as_str).unwrap_or("");
+            let raw = req.resp_type.as_deref() == Some("base64");
+            match crate::tools::call(tool, r.get("params").unwrap_or(&json!({})), req.tool_cwd.as_deref(), raw) {
+                Some(v) => respond(&mut stream, 200, &v),
+                None => respond(&mut stream, 404, &json!({"error": format!("no tool {tool:?}")})),
+            }
+        }
+        ("GET", "/tools") | ("POST", "/tools") => respond(&mut stream, 403, &json!({"error": "the tools are off: start the server with --tools"})),
         ("POST", "/v1/streams/lookup") => {
             let r: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
             let keys: Vec<&str> = r.get("conversation_ids").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();

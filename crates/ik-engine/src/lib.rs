@@ -16,4 +16,5 @@ pub mod kernels;
 pub mod sampler;
 pub mod server;
 pub mod tokenizer;
+pub mod tools;
 pub mod weights;

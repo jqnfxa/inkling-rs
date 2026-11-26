@@ -33,7 +33,8 @@ tools/fetch-ui.sh           # llama.cpp's chat UI, into ./ui (optional)
 Open http://127.0.0.1:8080 to chat. `run-inkling-rs.sh` reads `MODEL` (the checkpoint's directory), `CTX` (131072),
 `PORT`, `HOST`, `IK_THREADS` (the CPU expert threads: a count, or a list of CPUs to pin) and `MEM_MAX` (20G). The
 server runs in a systemd scope of its own, with that memory limit and no swap. If memory runs out, the server stops,
-not the terminal it was started from (systemd-oomd stops a whole cgroup). `MEM_MAX=` turns the limit off.
+not the terminal it was started from (systemd-oomd stops a whole cgroup). `MEM_MAX=` turns the limit off. The
+script passes its arguments on to the server: `./run-inkling-rs.sh --tools` turns on the chat UI's tools (below).
 
 ## API
 
@@ -102,6 +103,16 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
   header, a client that leaves stops its request at the next token.
 - The KV cache is reused when a prompt extends the previous one. When a chat UI sends the history again, the cache is
   rolled back to the end of the last prompt.
+- `--tools` gives the chat UI's model the server tools it knows: `read_file`, `write_file`, `edit_file`,
+  `file_glob_search`, `grep_search` and `get_info` (`GET /tools` lists them, `POST /tools {"tool", "params"}` runs
+  one; without `--tools` both answer 403, which the UI reads as "off"). They act as the user the server runs as, and
+  the UI asks before each call unless told to always allow it. A relative path is taken from the conversation's working
+  directory (the UI's `x-tool-cwd`). `POST /tools` answers only connections from this machine whose `Host` is
+  `localhost` or a loopback address on the server's port, and whose `Origin`, if they send one, is the server's own
+  page: another site's page can't use the tools, nor one whose DNS name was rebound to 127.0.0.1. Other users of the
+  same machine can, so use `--tools` on a machine that is yours alone. The searches walk nearest first, skip hidden
+  directories, `node_modules` and build caches (a `CACHEDIR.TAG` inside, as in cargo's `target`) unless the search
+  starts in one, and stop after 500k entries or 10 s.
 
 ## Design
 

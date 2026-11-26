@@ -2,10 +2,12 @@
 //! [--compact-reserve min(16384, ctx/8)] [--compact-keep 20000] [--compact-max 8] [--no-compact]
 //! [--reasoning-summary off|inline|only] [--summary-every 1024]
 //! [--temp 1.0] [--top-k 40] [--top-p 0.95] [--min-p 0.05] [--repeat-penalty 1.0] [--presence-penalty 0.0]
-//! [--frequency-penalty 0.0] [--repeat-last-n 64]`
+//! [--frequency-penalty 0.0] [--repeat-last-n 64] [--tools]`
 //! The sampling flags set the defaults; a request's own temperature, top_k, ... take precedence.
 //! OpenAI-compatible: /v1/chat/completions, /v1/completions, /v1/models, /health; /props as llama-server answers it, and
-//! with --ui the files of a browser UI at / (the llama.cpp chat UI: tools/fetch-ui.sh).
+//! with --ui the files of a browser UI at / (the llama.cpp chat UI: tools/fetch-ui.sh). --tools gives that UI's model
+//! the server's tools (/tools): it reads, searches and writes files as the user the server runs as, for callers on
+//! this machine only.
 #![recursion_limit = "256"]
 
 use std::sync::Arc;
@@ -65,7 +67,11 @@ fn main() -> Result<(), String> {
     let name = eng.ck.name();
     eprintln!("{name}: loaded in {:.1}s on {}, context {n_ctx}, {} expert cache slots (fewer as the context fills)", t0.elapsed().as_secs_f64(), eng.ctx.name, eng.cache.n_slots());
     eprintln!("sampling unless a request says otherwise: temp {} top-k {} top-p {} min-p {} repeat-penalty {} presence-penalty {} frequency-penalty {} (last {})", sampling.temperature, sampling.top_k, sampling.top_p, sampling.min_p, sampling.repeat_penalty, sampling.presence_penalty, sampling.frequency_penalty, sampling.repeat_last_n);
-    let site = site(&eng, &model, &name, n_ctx, ui.clone(), compaction, notes, sampling);
+    let tools = a.iter().any(|x| x == "--tools");
+    if tools {
+        eprintln!("tools on: the chat UI's model may read, search and write files as this user (the UI asks first); only callers on this machine");
+    }
+    let site = server::Site { tools, ..site(&eng, &model, &name, n_ctx, ui.clone(), compaction, notes, sampling) };
     let (tx, rx) = std::sync::mpsc::channel();
     let addr = format!("{host}:{port}");
     let tok2 = tok.clone();
@@ -137,5 +143,5 @@ fn site(eng: &Engine, path: &str, name: &str, n_ctx: usize, ui: Option<std::path
             "meta": {"n_ctx": n_ctx, "n_ctx_train": 1048576, "n_vocab": eng.hp.n_vocab, "n_embd": eng.hp.n_embd}
         }]
     });
-    server::Site { props, models, ui, compaction, notes, sampling }
+    server::Site { props, models, ui, compaction, notes, sampling, tools: false }
 }
