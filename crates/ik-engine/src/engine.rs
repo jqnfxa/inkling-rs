@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::checkpoint::{Checkpoint, Dtype};
 use crate::cpu_pool::{ATTN_JOB, ATTN_OUT, ATTN_STEP, AttnCtx, Pool};
-use crate::cuda::{self, Ctx, DevBuf, Graph, HostBuf, Result, Stream, VmBuf};
+use crate::cuda::{self, Ctx, DevBuf, Graph, HostBuf, Region, Result, Stream, VmBuf};
 use crate::experts::{ExpertCache, Experts, Fmt};
 use crate::hp::{Hp, Step};
 use crate::kernels::{Kernels, P};
@@ -52,6 +52,9 @@ const PF_GROUP: usize = 32;
 const G_MIN: usize = 12;
 /// Chunks of grouped pairs in a ubatch, at most: they fill the pf buffers' 8 PF_GROUP rows.
 const G_CHUNKS: usize = T_MAX / PF_GROUP;
+
+/// Addresses reserved for prefill's region, more than its buffers take.
+const PF_REGION: usize = 2 << 30;
 
 /// Bytes of BatchBufs::grp: for nt tokens, the tokens at 0, the pair by pair slots at 32 nt, chunk c's rows at
 /// 32 nt (2 + c), and the entries after the last chunk's rows.
@@ -211,19 +214,20 @@ struct PfStream {
 }
 
 impl PfStream {
-    fn new(ex: &Experts, hp: &Hp) -> Result<PfStream> {
+    /// The stream, its device buffers in prefill's region `rg`.
+    fn new(ex: &Experts, hp: &Hp, rg: &mut Region) -> Result<PfStream> {
         let (n, nff, cap) = (hp.n_embd, hp.n_ff_exp, 8 * T_MAX);
         let events = || (0..STREAM_SLOTS).map(|_| cuda::Event::new(false)).collect::<Result<Vec<_>>>();
         let slot = ex.gu_bytes.iter().max().unwrap() + ex.down_bytes.iter().max().unwrap();
         Ok(PfStream {
-            gu: DevBuf::new(STREAM_SLOTS * ex.gu_bytes.iter().max().unwrap())?,
-            dn: DevBuf::new(STREAM_SLOTS * ex.down_bytes.iter().max().unwrap())?,
-            x: DevBuf::new(T_MAX * n * 4)?,
-            gu_out: DevBuf::new(T_MAX * 2 * nff * 4)?,
-            af: DevBuf::new(T_MAX * nff * 4)?,
-            lists: DevBuf::new(3 * cap * 4)?,
+            gu: rg.take(STREAM_SLOTS * ex.gu_bytes.iter().max().unwrap()),
+            dn: rg.take(STREAM_SLOTS * ex.down_bytes.iter().max().unwrap()),
+            x: rg.take(T_MAX * n * 4),
+            gu_out: rg.take(T_MAX * 2 * nff * 4),
+            af: rg.take(T_MAX * nff * 4),
+            lists: rg.take(3 * cap * 4),
             lists_h: HostBuf::new(3 * cap * 4)?,
-            tab: DevBuf::new(2 * hp.n_expert * 32)?,
+            tab: rg.take(2 * hp.n_expert * 32),
             tab_h: HostBuf::new(2 * hp.n_expert * 32)?,
             s: Stream::new_nonblocking_high()?,
             up: events()?,
@@ -279,8 +283,13 @@ pub struct Engine {
     /// when there are host rows: the VRAM copies of a chunk of them (K, V) that prefill reads, and its state between
     /// passes [T_MAX][8][PF_STATE]
     stage: Option<[DevBuf; 3]>,
-    /// VRAM for the expert cache and the mapped rows of kv_vm together
+    /// VRAM for the expert cache, the mapped rows of kv_vm and, while prefill runs, its region
     vram_budget: usize,
+    /// the device buffers that only prefill uses (b, the expert stream's, stage): their memory is the expert cache's
+    /// while decode runs (pf_mode)
+    region: Region,
+    /// whether prefill has the region's memory
+    pf_on: bool,
     ring: Vec<u32>,
     conv: Vec<DevBuf>, // per slot: k [kv][3], v [kv][3], post [n][3], ffn [n][3]
     sc: Scratch,
@@ -454,61 +463,65 @@ impl Engine {
         };
         let sched = hp.schedule();
         let tm = T_MAX;
-        let fv = |m: usize| (0..m).map(|_| f(tm * n)).collect::<Result<Vec<_>>>();
+        // prefill's buffers: views in a region that has memory only while prefill runs (pf_region)
+        let rg = std::cell::RefCell::new(Region::reserve(PF_REGION, ctx.device)?);
+        let g = |len: usize| -> Result<DevBuf> { Ok(rg.borrow_mut().take(len * 4)) };
+        let fv = |m: usize| (0..m).map(|_| g(tm * n)).collect::<Result<Vec<_>>>();
         let blocks_t = Blocks {
-            b0: f(tm * n)?,
+            b0: g(tm * n)?,
             b6: fv(hp.n_passes)?,
             b12: fv(hp.n_passes)?,
-            b18: f(tm * n)?,
-            prelude: f(tm * n)?,
+            b18: g(tm * n)?,
+            prelude: g(tm * n)?,
             pass_out: fv(hp.n_passes)?,
         };
         let b = BatchBufs {
-            x: f(tm * n)?,
-            inp_sa: f(tm * n)?,
+            x: g(tm * n)?,
+            inp_sa: g(tm * n)?,
             mix: fv(3)?,
             msg: fv(4)?,
             ctl: fv(4)?,
-            ctl_g: f(tm * 2 * n)?,
-            ctl_gate: f(tm * 64)?,
+            ctl_g: g(tm * 2 * n)?,
+            ctl_gate: g(tm * 64)?,
             inn: fv(3)?,
-            g0: f(tm * w.layers[0].g0_rows())?,
-            gk: f(tm * (kv + 32))?,
-            gv: f(tm * (kv + 32))?,
-            kc: f(tm * kv)?,
-            vc: f(tm * kv)?,
-            q: f(tm * hp.n_head * hp.head_dim)?,
-            k: f(tm * kv)?,
-            v: f(tm * kv)?,
-            r: f(tm * hp.n_head * hp.n_rel)?,
-            att: f(tm * hp.n_head * hp.head_dim)?,
-            att2: f(tm * hp.n_head * hp.head_dim)?,
-            a: f(tm * n)?,
-            a2: f(tm * n)?,
-            ffm: f(tm * n)?,
-            ffm2: f(tm * n)?,
-            xn: f(tm * n)?,
-            rlog: f(tm * hp.n_expert)?,
-            ids: f(tm * 8)?,
-            wts: f(tm * 8)?,
-            slots: f(tm * 8)?,
-            moe: f(tm * n)?,
-            f: f(tm * n)?,
-            tau: f(tm)?,
-            one: DevBuf::from_slice(&vec![1f32; tm])?,
+            g0: g(tm * w.layers[0].g0_rows())?,
+            gk: g(tm * (kv + 32))?,
+            gv: g(tm * (kv + 32))?,
+            kc: g(tm * kv)?,
+            vc: g(tm * kv)?,
+            q: g(tm * hp.n_head * hp.head_dim)?,
+            k: g(tm * kv)?,
+            v: g(tm * kv)?,
+            r: g(tm * hp.n_head * hp.n_rel)?,
+            att: g(tm * hp.n_head * hp.head_dim)?,
+            att2: g(tm * hp.n_head * hp.head_dim)?,
+            a: g(tm * n)?,
+            a2: g(tm * n)?,
+            ffm: g(tm * n)?,
+            ffm2: g(tm * n)?,
+            xn: g(tm * n)?,
+            rlog: g(tm * hp.n_expert)?,
+            ids: g(tm * 8)?,
+            wts: g(tm * 8)?,
+            slots: g(tm * 8)?,
+            moe: g(tm * n)?,
+            f: g(tm * n)?,
+            tau: g(tm)?,
+            one: g(tm)?,
             bl: blocks_t,
             host_ids: HostBuf::new(4 * tm * 8)?,
             host_xn: HostBuf::new(4 * tm * n)?,
             host_slots: HostBuf::new(4 * tm * 8)?,
             cpu_out: HostBuf::new(4 * tm * 8 * n)?,
-            pf_gu: f(8 * PF_GROUP * 2 * hp.n_ff_exp)?,
-            pf_af: f(8 * PF_GROUP * hp.n_ff_exp)?,
-            pf_dn: f(8 * PF_GROUP * n)?,
-            grp: DevBuf::new(grp_bytes(&hp))?,
+            pf_gu: g(8 * PF_GROUP * 2 * hp.n_ff_exp)?,
+            pf_af: g(8 * PF_GROUP * hp.n_ff_exp)?,
+            pf_dn: g(8 * PF_GROUP * n)?,
+            grp: rg.borrow_mut().take(grp_bytes(&hp)),
             grp_h: HostBuf::new(grp_bytes(&hp))?,
         };
         let stream_on = std::env::var("IK_PF_STREAM").map_or(true, |v| v != "0");
-        let pf_stream = if GPU_EXPERTS && stream_on { Some(PfStream::new(&ex, &hp)?) } else { None };
+        let mut region = rg.into_inner();
+        let pf_stream = if GPU_EXPERTS && stream_on { Some(PfStream::new(&ex, &hp, &mut region)?) } else { None };
         // the expert cache and the full-attention KV rows share what is free once the rest exists, less a margin for
         // the CUDA graph and the driver (IK_VRAM_MARGIN_MIB, default 160); the KV rows take memory as the context grows
         // and give it back when a new sequence is shorter (plan_kv)
@@ -563,6 +576,8 @@ impl Engine {
             attn_out: HostBuf::new(4 * ATTN_OUT)?,
             stage: None,
             vram_budget,
+            region,
+            pf_on: false,
             ring,
             conv,
             sc,
@@ -590,24 +605,26 @@ impl Engine {
             let r = (budget / per_step * KV_STEP).min(all);
             cap.map_or(r, |c| r.min(c.div_ceil(KV_STEP) * KV_STEP))
         };
+        // the VRAM rows leave prefill its region
         let host_ok = VmBuf::host_pages_supported(e.ctx.device);
-        let mut vram_rows = if host_ok { rows_for(e.vram_budget) } else { all };
+        let mut vram_rows = if host_ok { rows_for(e.vram_budget.saturating_sub(e.region.bytes())) } else { all };
         if vram_rows < all {
-            let stage = [DevBuf::new(STAGE_ROWS * KV_ROW)?, DevBuf::new(STAGE_ROWS * KV_ROW)?, DevBuf::new(T_MAX * e.hp.n_head_kv * PF_STATE * 4)?];
-            e.vram_budget = e.vram_budget.saturating_sub(stage.iter().map(|b| b.len).sum());
-            vram_rows = rows_for(e.vram_budget);
+            let rg = &mut e.region;
+            let stage = [rg.take(STAGE_ROWS * KV_ROW), rg.take(STAGE_ROWS * KV_ROW), rg.take(T_MAX * e.hp.n_head_kv * PF_STATE * 4)];
+            vram_rows = rows_for(e.vram_budget.saturating_sub(e.region.bytes()));
             e.stage = Some(stage);
         }
         let (need_vram, need_host) = (e.kv_bytes(vram_rows), e.kv_bytes(all) - e.kv_bytes(vram_rows));
         let host_free = host_mem_free().saturating_sub(HOST_MARGIN);
-        if need_vram > e.vram_budget || need_host > host_free {
+        let kv_budget = e.vram_budget.saturating_sub(e.region.bytes());
+        if need_vram > kv_budget || need_host > host_free {
             let per = per_step / KV_STEP;
-            let most = if host_ok { (e.vram_budget / per_step * KV_STEP) + host_free / per } else { e.vram_budget / per };
+            let most = if host_ok { (kv_budget / per_step * KV_STEP) + host_free / per } else { kv_budget / per };
             return Err(format!(
                 "a context of {} tokens needs {} MiB of KV cache; there are {} MiB of VRAM for it and the experts{}: {} tokens at most",
                 e.n_ctx,
                 e.kv_bytes(all) >> 20,
-                e.vram_budget >> 20,
+                kv_budget >> 20,
                 if host_ok { format!(", and {} MiB of host memory past that", host_free >> 20) } else { String::new() },
                 most
             ));
@@ -655,13 +672,15 @@ impl Engine {
     }
 
     /// Gives the full-attention KV caches memory for `rows` positions (rounded up to KV_STEP) and the expert cache the
-    /// rest of the budget. As the context grows the last slots go, with their experts; when a new sequence is shorter
-    /// they come back empty and fill as experts are used.
+    /// rest of the budget, less prefill's region while it runs. As the context grows the last slots go, with their
+    /// experts; when a new sequence is shorter, or decode takes over from prefill, they come back empty and fill as
+    /// experts are used.
     fn plan_kv(&mut self, rows: usize) -> Result<()> {
         let rows = (rows.div_ceil(KV_STEP) * KV_STEP).min(self.n_ctx.div_ceil(KV_STEP) * KV_STEP);
-        // the VRAM rows; new ensured they fit
+        // the VRAM rows; new ensured they fit with the region
         let kv = self.kv_bytes(rows.min(self.kv_vram_rows));
-        let slots = self.cache.fit(self.vram_budget.saturating_sub(kv));
+        let pf = if self.pf_on { self.region.bytes() } else { 0 };
+        let slots = self.cache.fit(self.vram_budget.saturating_sub(kv + pf));
         if rows == self.kv_mapped && slots == [self.cache.banks[0].n_slots, self.cache.banks[1].n_slots] {
             return Ok(());
         }
@@ -695,6 +714,28 @@ impl Engine {
         self.s.sync()?;
         let flat: Vec<i32> = self.cache.slot_of.iter().flatten().copied().collect();
         self.map.upload(&flat)
+    }
+
+    /// Prefill's region takes its memory from the expert cache (`on`), with the experts of the slots that go, or gives
+    /// it back as free slots, which fill as decode misses experts.
+    fn pf_mode(&mut self, on: bool) -> Result<()> {
+        if on == self.pf_on {
+            return Ok(());
+        }
+        // nothing in flight may touch the pages that go (the expert stream's work ends before self.s's)
+        self.s.sync()?;
+        self.copy_s.sync()?;
+        self.pf_on = on;
+        if on {
+            self.plan_kv(self.kv_mapped)?;
+            self.region.set(true, &self.s)?;
+            self.s.sync()?;
+            self.b.one.upload(&[1f32; T_MAX])?;
+        } else {
+            self.region.set(false, &self.s)?;
+            self.plan_kv(self.kv_mapped)?;
+        }
+        Ok(())
     }
 
     pub fn phys(hp: &Hp, il: usize) -> usize {
@@ -935,6 +976,7 @@ impl Engine {
         if self.pos >= self.n_ctx {
             return Err(format!("context of {} tokens is full", self.n_ctx));
         }
+        self.pf_mode(false)?;
         if self.pos + 1 > self.kv_mapped {
             self.plan_kv(self.pos + 1)?;
         }
@@ -1112,6 +1154,7 @@ impl Engine {
         if self.pos + nt > self.n_ctx {
             return Err(format!("context of {} tokens is full", self.n_ctx));
         }
+        self.pf_mode(true)?;
         // the usage counts as decode leaves them: each token decays them once, and the ubatch's uses count at their
         // mean weight over it. With a decay per ubatch, a long prompt's experts counted thousands and held their slots
         // for hundreds of tokens of decode after it.
@@ -1577,10 +1620,7 @@ impl Engine {
         }
         self.s.sync()?;
         let mut v = vec![0f32; len];
-        let tmp = DevBuf { ptr: buf, len: len * 4 };
-        let r = tmp.download_at::<f32>(0, len);
-        std::mem::forget(tmp);
-        v.copy_from_slice(&r?);
+        v.copy_from_slice(&DevBuf::view(buf, len * 4).download_at::<f32>(0, len)?);
         if let Some(p) = self.probe.as_mut() {
             p(name, il, &v);
         }
@@ -1927,7 +1967,8 @@ impl Engine {
         let hp = self.hp.clone();
         let n = hp.n_embd as u32;
         let reps = 50;
-        // the attention cases read up to n_ctx keys
+        // the attention cases read up to n_ctx keys; the prefill cases use the region
+        self.pf_mode(true)?;
         self.plan_kv(self.n_ctx)?;
         let mut res = vec![];
         let ev0 = cuda::Event::new(true)?;

@@ -252,10 +252,11 @@ impl Drop for Graph {
     }
 }
 
-/// Device memory, in bytes.
+/// Device memory, in bytes: its own allocation, or a view of memory that something else owns (a Region's).
 pub struct DevBuf {
     pub ptr: CUdeviceptr,
     pub len: usize,
+    owned: bool,
 }
 unsafe impl Send for DevBuf {}
 unsafe impl Sync for DevBuf {}
@@ -264,7 +265,11 @@ impl DevBuf {
     pub fn new(len: usize) -> Result<DevBuf> {
         let mut ptr = 0;
         ck!(cuMemAlloc_v2(&mut ptr, len.max(1)))?;
-        Ok(DevBuf { ptr, len })
+        Ok(DevBuf { ptr, len, owned: true })
+    }
+    /// `len` bytes at `ptr`, which the view does not free.
+    pub fn view(ptr: CUdeviceptr, len: usize) -> DevBuf {
+        DevBuf { ptr, len, owned: false }
     }
     pub fn zeroed(len: usize, s: &Stream) -> Result<DevBuf> {
         let b = DevBuf::new(len)?;
@@ -304,7 +309,45 @@ impl DevBuf {
 
 impl Drop for DevBuf {
     fn drop(&mut self) {
-        unsafe { cuMemFree_v2(self.ptr) };
+        if self.owned {
+            unsafe { cuMemFree_v2(self.ptr) };
+        }
+    }
+}
+
+/// Buffers at fixed addresses in one VmBuf that is mapped only at times: views handed out one after another, usable
+/// while `on`. Prefill's buffers live in one, whose pages are the expert cache's while decode runs.
+pub struct Region {
+    vm: VmBuf,
+    used: usize,
+}
+
+impl Region {
+    /// Addresses for `len` bytes of views; no memory yet.
+    pub fn reserve(len: usize, dev: CUdevice) -> Result<Region> {
+        Ok(Region { vm: VmBuf::reserve(len, dev)?, used: 0 })
+    }
+
+    /// A view of `len` bytes after the last one, at a multiple of 256 bytes.
+    pub fn take(&mut self, len: usize) -> DevBuf {
+        let at = self.used.next_multiple_of(256);
+        assert!(at + len <= self.vm.len, "region of {} bytes: {len} more at {at}", self.vm.len);
+        self.used = at + len;
+        DevBuf::view(self.vm.ptr + at as u64, len)
+    }
+
+    /// The memory that the views take when mapped: whole pages.
+    pub fn bytes(&self) -> usize {
+        self.vm.pages_for(self.used)
+    }
+
+    pub fn on(&self) -> bool {
+        self.vm.mapped() > 0
+    }
+
+    /// Maps the views' pages (zeroed on `s`) or releases them. The caller makes sure no work in flight uses them.
+    pub fn set(&mut self, on: bool, s: &Stream) -> Result<()> {
+        self.vm.resize(if on { self.used } else { 0 }, s)
     }
 }
 

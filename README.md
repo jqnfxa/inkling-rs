@@ -160,7 +160,9 @@ The model has 8 full-attention layer passes per token; the other 40 use a slidin
 passes' KV cache takes 32 KiB per token (f16 K and V). It has addresses for all of `--ctx` from the start but memory
 only for the tokens in use, mapped in 2 MiB pages (CUDA virtual memory) as the context grows: the expert cache gets the
 rest, so a short chat runs with the whole budget whatever `--ctx` is, and each 1024 tokens of context take about 7
-slots back. A new chat that is shorter than the last gives the pages back to the expert cache.
+slots back. A new chat that is shorter than the last gives the pages back to the expert cache. Prefill's buffers (a
+ubatch's activations, the expert stream's staging slots) are mapped the same way, only while prefill runs: decode
+gets their pages as expert slots (49 more on an RTX 3050 Laptop), which fill at its first token.
 
 Decode slows as the context fills, from fewer expert slots and from attention over more keys. The table was measured
 with the int4 caches of before, when full attention took about 0.22 ms per token for each 8k tokens; the f16 caches
