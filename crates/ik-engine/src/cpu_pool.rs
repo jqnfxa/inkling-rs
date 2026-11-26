@@ -89,6 +89,7 @@ struct Shared {
     dn_done: AtomicU32,
     kind: AtomicU64,      // epoch << 2 | KIND_*
     batch_req: AtomicU32,  // the host posts a batch job (prefill): 1 pending, 0 done
+    batch_ns: AtomicU64,   // the last batch job's time on the team, from the leader taking it to its end
     n: usize,
     work: UnsafeCell<Work>,
     attn: std::sync::OnceLock<AttnCtx>,
@@ -455,6 +456,7 @@ impl Pool {
             dn_done: AtomicU32::new(0),
             kind: AtomicU64::new(0),
             batch_req: AtomicU32::new(0),
+            batch_ns: AtomicU64::new(0),
             n,
             work: UnsafeCell::new(Work::default()),
             attn: std::sync::OnceLock::new(),
@@ -523,6 +525,7 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
     let nff = cx.ex.n_ff;
     loop {
         if sh.batch_req.load(Ordering::Acquire) == 1 {
+            let tb = std::time::Instant::now();
             // SAFETY: the host wrote the batch before batch_req; helpers are idle until epoch changes
             let w = unsafe { &mut *sh.work.get() };
             let npairs: usize = w.batch.as_ref().map_or(0, |b| b.misses.iter().map(|m| m.1.len()).sum());
@@ -550,6 +553,7 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
                 }
             }
             w.batch = None;
+            sh.batch_ns.store(tb.elapsed().as_nanos() as u64, Ordering::Relaxed);
             sh.batch_req.store(0, Ordering::Release);
             continue;
         }
@@ -749,12 +753,14 @@ impl Pool {
         self.shared.batch_req.store(1, Ordering::Release);
     }
 
-    /// Returns when the job of start_batch is done.
-    pub fn wait_batch(&self) {
+    /// Returns when the job of start_batch is done, with its seconds on the team (from the leader taking it to its
+    /// end, which can be well before this returns).
+    pub fn wait_batch(&self) -> f64 {
         let mut spins = 0;
         while self.shared.batch_req.load(Ordering::Acquire) != 0 {
             pause(&mut spins);
         }
+        self.shared.batch_ns.load(Ordering::Relaxed) as f64 / 1e9
     }
 }
 

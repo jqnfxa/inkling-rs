@@ -457,7 +457,7 @@ pub struct Stats {
     /// decode: misses of experts, and those of an expert that had missed earlier in the same token
     pub misses_all: usize,
     pub misses_repeat: usize,
-    /// prefill: seconds waiting for the GPU up to the router, grouping on the host, in the CPU experts
+    /// prefill: seconds waiting for the GPU up to the router, grouping on the host, and of the CPU team on its pairs
     pub pf_gpu_s: f64,
     pub pf_host_s: f64,
     pub pf_cpu_s: f64,
@@ -1843,15 +1843,13 @@ impl Engine {
             self.stream_experts(ip, &streamed)?;
         }
         if cpu_pairs > 0 {
-            let te = std::time::Instant::now();
-            self.pool.wait_batch();
-            let t4 = std::time::Instant::now();
-            self.stats.pf_cpu_s += (t4 - t3).as_secs_f64();
-            // the team's time is known when it was still running once the GPU's work was queued
-            if let Some(ps) = self.pf_stream.as_mut()
-                && (t4 - te).as_secs_f64() > 1e-3
-            {
-                ps.cpu_pair_s = 0.8 * ps.cpu_pair_s + 0.2 * (t4 - t3).as_secs_f64() / cpu_pairs as f64;
+            let team_s = self.pool.wait_batch();
+            self.stats.pf_cpu_s += team_s;
+            // the team's own time, also where it was done before the host had queued the stream: a share too small
+            // to outlast the host must still show how fast it went, or a high estimate would never come down (the
+            // stream then took nearly every pair, and its copies slowed the team, ~15% of prefill's speed)
+            if let Some(ps) = self.pf_stream.as_mut() {
+                ps.cpu_pair_s = 0.8 * ps.cpu_pair_s + 0.2 * team_s / cpu_pairs as f64;
             }
         }
         if let Some(ps) = &self.pf_stream
