@@ -237,14 +237,21 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn attn_part(
         &self, s: &Stream, q: P, r: P, sink: P, rb: P, kc: P, vc: P, pm: P, pl: P, pacc: P, params: P, ring: u32, extent: u32, scale: f32, maxs: u32,
-        nsplit: u32, window: u32, cs: u32,
+        nsplit: u32, window: u32, cs: u32, vram: u32,
     ) -> Result<()> {
-        self.run(s, "attn_part", (8, nsplit, 1), 128, &[&q, &r, &sink, &rb, &kc, &vc, &pm, &pl, &pacc, &params, &ring, &extent, &scale, &maxs, &window, &cs])
+        self.run(s, "attn_part", (8, nsplit, 1), 128, &[&q, &r, &sink, &rb, &kc, &vc, &pm, &pl, &pacc, &params, &ring, &extent, &scale, &maxs, &window, &cs, &vram])
     }
 
+    /// `cpu`: the CPU's partials of the rows past the first `vram` (u32::MAX: none).
     #[allow(clippy::too_many_arguments)]
-    pub fn attn_reduce(&self, s: &Stream, pm: P, pl: P, pacc: P, out: P, params: P, window: u32, maxs: u32, cs: u32, n_head: u32) -> Result<()> {
-        self.run(s, "attn_reduce", (n_head, 1, 1), 128, &[&pm, &pl, &pacc, &out, &params, &window, &maxs, &cs])
+    pub fn attn_reduce(&self, s: &Stream, pm: P, pl: P, pacc: P, out: P, params: P, window: u32, maxs: u32, cs: u32, n_head: u32, cpu: P, vram: u32) -> Result<()> {
+        self.run(s, "attn_reduce", (n_head, 1, 1), 128, &[&pm, &pl, &pacc, &out, &params, &window, &maxs, &cs, &cpu, &vram])
+    }
+
+    /// Posts a job of `step` to the CPU team: `word`, the position, and the floats of a, b and c (see the kernel).
+    #[allow(clippy::too_many_arguments)]
+    pub fn job_post(&self, s: &Stream, a: P, na: u32, b: P, nb: u32, c: P, nc: u32, job: P, params: P, step: u32, word: u32) -> Result<()> {
+        self.run(s, "job_post", (1, 1, 1), 256, &[&a, &na, &b, &nb, &c, &nc, &job, &params, &step, &word])
     }
 
     // ---------------------------------------------------------------- controllers, several at once (grid.z)

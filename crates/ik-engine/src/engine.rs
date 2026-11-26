@@ -1386,13 +1386,13 @@ impl Engine {
         let window = if swa { hp.n_swa as u32 } else { u32::MAX };
         let cs = if swa { CS_SWA } else { CS_FULL };
         let nsplit = if swa { hp.n_swa } else { self.n_ctx }.div_ceil(1 << cs) as u32;
-        self.k.attn_part(&self.s, self.sc.q.ptr, self.sc.r.ptr, sink, l.rel_proj.ptr, kc, vc, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, p_pos, ring, extent, scale, maxs, nsplit, window, cs)?;
+        self.k.attn_part(&self.s, self.sc.q.ptr, self.sc.r.ptr, sink, l.rel_proj.ptr, kc, vc, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, p_pos, ring, extent, scale, maxs, nsplit, window, cs, u32::MAX)?;
         if !swa {
             // the per-chunk max and sum of each head: [kv head][chunk][3]
             self.probe("attn_pm", il, self.sc.pm.ptr, 8 * maxs as usize * 3)?;
             self.probe("attn_pl", il, self.sc.pl.ptr, 8 * maxs as usize * 3)?;
         }
-        self.k.attn_reduce(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, p_pos, window, maxs, cs, hp.n_head as u32)?;
+        self.k.attn_reduce(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, p_pos, window, maxs, cs, hp.n_head as u32, 0, u32::MAX)?;
         self.probe("kqv_out", il, self.sc.att.ptr, nh as usize)?;
         self.k.mul_sigmoid(&self.s, self.sc.att.ptr, gate, self.sc.att2.ptr, nh)?;
         let l = &self.w.layers[ip];
@@ -1532,8 +1532,8 @@ impl Engine {
             let [kc, vc] = self.kv(kvi);
             let lr = &self.w.layers[kvi];
             time!(format!("attn part+reduce {keys} keys"), keys as usize * 2 * KV_ROW, {
-                self.k.attn_part(&self.s, self.sc.q.ptr, self.sc.r.ptr, self.sc.g0.ptr, lr.rel_proj.ptr, kc, vc, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.params.ptr, ring, 1024, 0.088, maxs, nsplit, window, cs)?;
-                self.k.attn_reduce(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, self.params.ptr, window, maxs, cs, hp.n_head as u32)?
+                self.k.attn_part(&self.s, self.sc.q.ptr, self.sc.r.ptr, self.sc.g0.ptr, lr.rel_proj.ptr, kc, vc, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.params.ptr, ring, 1024, 0.088, maxs, nsplit, window, cs, u32::MAX)?;
+                self.k.attn_reduce(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, self.params.ptr, window, maxs, cs, hp.n_head as u32, 0, u32::MAX)?
             });
         }
         let list = vec![self.bl.b0.ptr, self.bl.b6[0].ptr, self.bl.b12[0].ptr, self.sc.x.ptr];

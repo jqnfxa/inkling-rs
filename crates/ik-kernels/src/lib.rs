@@ -995,6 +995,61 @@ pub mod gpu {
         }
     }
 
+    /// Posts a job of `step` to the CPU team through host-mapped `job`, as moe_dispatch does: `word` @4, the token's
+    /// position params[0] @8, from byte 128 on the na floats of a, then the nb of b and the nc of c; the seq last, after a
+    /// system fence.
+    #[reqntid(256)]
+    pub unsafe extern "ptx-kernel" fn job_post(
+        a: *const f32, na: u32, b: *const f32, nb: u32, c: *const f32, nc: u32, job: *mut u32, params: *const u32, step: u32, word: u32,
+    ) {
+        let t: u32;
+        mov.u32(t, tid.x);
+        let (n1, n2, i): (u32, u32, u32);
+        add.u32(n1, na, nb);
+        add.u32(n2, n1, nc);
+        mov.u32(i, t);
+        label(top);
+        let done: pred;
+        setp.ge.u32(done, i, n2);
+        if done {
+            bra(end);
+        }
+        let (inb, inc): (pred, pred);
+        setp.ge.u32(inb, i, na);
+        setp.ge.u32(inc, i, n1);
+        let (ib, ic, ji): (u32, u32, u32);
+        sub.u32(ib, i, na);
+        sub.u32(ic, i, n1);
+        let (sa, sb, scc, src, ja): (u64, u64, u64, u64, u64);
+        mad.wide.u32(sa, i, 4, a);
+        mad.wide.u32(sb, ib, 4, b);
+        mad.wide.u32(scc, ic, 4, c);
+        selp.b64(src, sb, sa, inb);
+        selp.b64(src, scc, src, inc);
+        let v: f32;
+        ld.global.f32(v, [src]);
+        add.u32(ji, i, 32);
+        mad.wide.u32(ja, ji, 4, job);
+        st.volatile.global.f32([ja], v);
+        add.u32(i, i, 256);
+        bra(top);
+        label(end);
+        bar.sync(0);
+        let first: pred;
+        setp.eq.u32(first, t, 0);
+        if first {
+            let (tok, seq, pos): (u32, u32, u32);
+            st.volatile.global.u32([job + 4], word);
+            ld.global.u32(pos, [params]);
+            st.volatile.global.u32([job + 8], pos);
+            ld.global.u32(tok, [params + 12]);
+            mad.lo.u32(seq, tok, 64, step);
+            add.u32(seq, seq, 1);
+            membar.sys();
+            st.volatile.global.u32([job], seq);
+        }
+    }
+
     /// Waits until the CPU acknowledges the job of `step` (host-mapped `ack` == seq), at most about `timeout_ns`;
     /// on timeout writes the seq to `err`.
     #[reqntid(32)]
@@ -1485,11 +1540,13 @@ pub mod gpu {
 
     /// One chunk of 2^cs keys (cs at most 8) of one kv head, for its 3 query heads: scores (scale q.k + relative bias -
     /// sink), their max m and sum l of exp(s - m), and acc = sum exp(s - m) v. Partials go to pm/pl [kvh][maxs][3] and
-    /// pacc [kvh][maxs][3][128]. grid = (8 kv heads, chunks); chunks past the keys of the token do nothing.
+    /// pacc [kvh][maxs][3][128]. grid = (8 kv heads, chunks); chunks past the keys of the token do nothing. Only rows
+    /// below `vram` count: the chunks start at the distance of row vram - 1 if the token is past it (the CPU takes the
+    /// distances before, see attn_reduce).
     #[reqntid(128)]
     pub unsafe extern "ptx-kernel" fn attn_part(
         q: *const f32, r: *const f32, sink: *const f32, rb: *const u16, kc: *const u16, vc: *const u16, pm: *mut f32, pl: *mut f32,
-        pacc: *mut f32, params: *const u32, ring: u32, extent: u32, scale: f32, maxs: u32, window: u32, cs: u32,
+        pacc: *mut f32, params: *const u32, ring: u32, extent: u32, scale: f32, maxs: u32, window: u32, cs: u32, vram: u32,
     ) {
         let qsh: shared<[f32; 384], 16>;
         let rsh: shared<[f32; 48], 16>;
@@ -1500,11 +1557,15 @@ pub mod gpu {
         mov.u32(kvh, ctaid.x);
         mov.u32(sp, ctaid.y);
         mov.u32(t, tid.x);
-        let (pos, nk, pmod, start, cnt, csz): (u32, u32, u32, u32, u32, u32);
+        let (pos, nk, pmod, start, cnt, csz, d0): (u32, u32, u32, u32, u32, u32, u32);
         ld.global.u32(pos, [params]);
         add.u32(nk, pos, 1);
         min.u32(nk, nk, window);
+        // distances below d0 are rows past the first `vram`, in host memory: the CPU's
+        max.u32(d0, nk, vram);
+        sub.u32(d0, d0, vram);
         shl.b32(start, sp, cs);
+        add.u32(start, start, d0);
         let none: pred;
         setp.ge.u32(none, start, nk);
         if none {
@@ -1734,27 +1795,54 @@ pub mod gpu {
         }
     }
 
-    /// Combines the chunks of 2^cs keys of attn_part and the zero sink logit: out[h][d], a block per query head, a thread
-    /// per dimension.
+    /// Combines the chunks of 2^cs keys of attn_part, the CPU's partial of the rows past the first `vram` if the token
+    /// is past them (cpu [24][130]: m, l, acc[128] of each head), and the zero sink logit: out[h][d], a block per query
+    /// head, a thread per dimension.
     #[reqntid(128)]
-    pub unsafe extern "ptx-kernel" fn attn_reduce(pm: *const f32, pl: *const f32, pacc: *const f32, out: *mut f32, params: *const u32, window: u32, maxs: u32, cs: u32) {
+    pub unsafe extern "ptx-kernel" fn attn_reduce(
+        pm: *const f32, pl: *const f32, pacc: *const f32, out: *mut f32, params: *const u32, window: u32, maxs: u32, cs: u32, cpu: *const f32, vram: u32,
+    ) {
         let (h, t, kvh, hh): (u32, u32, u32, u32);
         mov.u32(h, ctaid.x);
         mov.u32(t, tid.x);
         div.u32(kvh, h, 3);
         rem.u32(hh, h, 3);
-        let (pos, nk, pmod, ns): (u32, u32, u32, u32);
+        let (pos, nk, pmod, ns, d0): (u32, u32, u32, u32, u32);
         ld.global.u32(pos, [params]);
         add.u32(nk, pos, 1);
         min.u32(nk, nk, window);
+        max.u32(d0, nk, vram);
+        sub.u32(d0, d0, vram);
         mov.u32(pmod, 0);
         mov.u32(ns, 1);
         shl.b32(ns, ns, cs);
         sub.u32(ns, ns, 1);
         add.u32(ns, ns, nk);
+        sub.u32(ns, ns, d0);
         shr.u32(ns, ns, cs);
+        let has_cpu: pred;
+        setp.ne.u32(has_cpu, d0, 0);
+        let (cm, cl, ca): (f32, f32, f32);
+        mov.f32(cm, 0.0);
+        mov.f32(cl, 0.0);
+        mov.f32(ca, 0.0);
+        if has_cpu {
+            let (ci, ct): (u32, u32);
+            let (cma, caa): (u64, u64);
+            mul.lo.u32(ci, h, 130);
+            mad.wide.u32(cma, ci, 4, cpu);
+            ld.volatile.global.f32(cm, [cma]);
+            ld.volatile.global.f32(cl, [cma + 4]);
+            add.u32(ct, ci, 2);
+            add.u32(ct, ct, t);
+            mad.wide.u32(caa, ct, 4, cpu);
+            ld.volatile.global.f32(ca, [caa]);
+        }
         let (mm, sp): (f32, u32);
         mov.f32(mm, 0.0);
+        if has_cpu {
+            max.f32(mm, mm, cm);
+        }
         mov.u32(sp, 0);
         label(mt);
         let md: pred;
@@ -1777,6 +1865,13 @@ pub mod gpu {
         sub.rn.f32(ll, 0.0, mm);
         exp(ll, ll);
         mov.f32(acc, 0.0);
+        if has_cpu {
+            let ce: f32;
+            sub.rn.f32(ce, cm, mm);
+            exp(ce, ce);
+            fma.rn.f32(ll, cl, ce, ll);
+            fma.rn.f32(acc, ca, ce, acc);
+        }
         mov.u32(sp, 0);
         label(at);
         let ad: pred;

@@ -4,7 +4,7 @@
 //! decode the stored formats themselves, and take the same f32 inputs as the kernels.
 use ik_engine::checkpoint::{Checkpoint, Dtype};
 use ik_engine::cpu::{dot_row, order_x};
-use ik_engine::cuda::{Ctx, DevBuf, Stream};
+use ik_engine::cuda::{Ctx, DevBuf, HostBuf, Stream};
 use ik_engine::experts::{Fmt, Mat as XMat};
 use ik_engine::kernels::Kernels;
 
@@ -498,11 +498,27 @@ fn main() -> Result<(), String> {
             let r: Vec<f32> = (0..24 * 16).map(|_| rnd(&mut seed)).collect();
             let sink: Vec<f32> = (0..24).map(|_| rnd(&mut seed) * 2.0).collect();
             let (bq, br, bs, bp) = (DevBuf::from_slice(&q)?, DevBuf::from_slice(&r)?, DevBuf::from_slice(&sink)?, DevBuf::from_slice(&[pos as u32, 0, 0, 0])?);
-            k.attn_part(&s, bq.ptr, br.ptr, bs.ptr, brb.ptr, bkc.ptr, bvc.ptr, bpm.ptr, bpl.ptr, bpacc.ptr, bp.ptr, ring as u32, 1024, scale, maxs as u32, maxs as u32, w, cs)?;
-            k.attn_reduce(&s, bpm.ptr, bpl.ptr, bpacc.ptr, bout.ptr, bp.ptr, w, maxs as u32, cs, 24)?;
+            k.attn_part(&s, bq.ptr, br.ptr, bs.ptr, brb.ptr, bkc.ptr, bvc.ptr, bpm.ptr, bpl.ptr, bpacc.ptr, bp.ptr, ring as u32, 1024, scale, maxs as u32, maxs as u32, w, cs, u32::MAX)?;
+            k.attn_reduce(&s, bpm.ptr, bpl.ptr, bpacc.ptr, bout.ptr, bp.ptr, w, maxs as u32, cs, 24, 0, u32::MAX)?;
             s.sync()?;
             let want = attn_ref(&q, &r, &sink, rb, &kc, &vc, pos, ring, window, 1024, scale as f64);
             check(&format!("attn_part + attn_reduce {what}, pos {pos}"), rel_err(&bout.download::<f32>(24 * 128)?, &want), 1e-5, &mut fails);
+            if ring == 0 && pos > 600 {
+                // the rows past the first `vram` on the CPU (cpu_attn), the rest in chunks of the GPU from distance
+                // pos + 1 - vram on: past the profiles' extent, within it, and one row
+                for vram in [pos / 3, pos - 600, pos] {
+                    let proj: Vec<u16> = rb.chunks(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+                    let qy = ik_engine::cpu_attn::Query { q: &q, r: &r, sink: &sink, proj: &proj, extent: 1024, scale, pos };
+                    let mut part = [ik_engine::cpu_attn::Partial::EMPTY; 24];
+                    unsafe { ik_engine::cpu_attn::rows(&qy, kc.as_ptr(), vc.as_ptr(), 0, pos + 1 - vram, &mut part) };
+                    let flat: Vec<f32> = part.iter().flat_map(|p| [p.m, p.l].into_iter().chain(p.acc)).collect();
+                    let bcpu = DevBuf::from_slice(&flat)?;
+                    k.attn_part(&s, bq.ptr, br.ptr, bs.ptr, brb.ptr, bkc.ptr, bvc.ptr, bpm.ptr, bpl.ptr, bpacc.ptr, bp.ptr, 0, 1024, scale, maxs as u32, maxs as u32, w, cs, vram as u32)?;
+                    k.attn_reduce(&s, bpm.ptr, bpl.ptr, bpacc.ptr, bout.ptr, bp.ptr, w, maxs as u32, cs, 24, bcpu.ptr, vram as u32)?;
+                    s.sync()?;
+                    check(&format!("attn_part + cpu_attn rows + attn_reduce full, pos {pos}, rows past {vram} on the CPU"), rel_err(&bout.download::<f32>(24 * 128)?, &want), 1e-5, &mut fails);
+                }
+            }
         }
         let (p0, nt, qs, rs, ss) = (positions[1] - 2, 3, 3072 + 64, 384 + 16, 24 + 8);
         let q: Vec<f32> = (0..nt * qs).map(|_| rnd(&mut seed) * 3.0).collect();
@@ -518,6 +534,24 @@ fn main() -> Result<(), String> {
             err = err.max(rel_err(&out[t * 3072..][..3072], &want));
         }
         check(&format!("attn_prefill {what}, pos {p0}..{}", p0 + nt), err, 1e-5, &mut fails);
+    }
+
+    // an attention job for the CPU: word, position, then q [24][128], r [24][16] and the sink [24] copied whole into
+    // host-mapped memory, the seq of the token's step last (its own seed: the checks after it keep their inputs)
+    {
+        let (na, nb, nc) = (3072usize, 384usize, 24usize);
+        let mut seed = 0x5eed_0b5u64;
+        let x: Vec<f32> = (0..na + nb + nc).map(|_| rnd(&mut seed)).collect();
+        let (ba, bb, bc) = (DevBuf::from_slice(&x[..na])?, DevBuf::from_slice(&x[na..na + nb])?, DevBuf::from_slice(&x[na + nb..])?);
+        let job = HostBuf::new(4 * (32 + na + nb + nc))?;
+        let bp = DevBuf::from_slice(&[1234u32, 0, 0, 77])?;
+        k.job_post(&s, ba.ptr, na as u32, bb.ptr, nb as u32, bc.ptr, nc as u32, job.dev, bp.ptr, 50, 41)?;
+        s.sync()?;
+        // SAFETY: the host side of the mapped buffer, after the stream is done
+        let got = unsafe { std::slice::from_raw_parts(job.ptr as *const u32, 32 + na + nb + nc) };
+        let head_ok = got[0] == 77 * 64 + 50 + 1 && got[1] == 41 && got[2] == 1234;
+        let wrong = (0..x.len()).filter(|&i| f32::from_bits(got[32 + i]) != x[i]).count();
+        check("job_post header and floats (wrong)", (wrong + !head_ok as usize) as f64, 0.0, &mut fails);
     }
 
     // the prefill cache writer: K and V of 5 tokens at positions 1278.. of a ring of 1280 rows, then of 3 tokens at 7..
