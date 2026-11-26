@@ -3,10 +3,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::checkpoint::{Checkpoint, Dtype};
-use crate::cpu_pool::{ATTN_JOB, ATTN_OUT, ATTN_STEP, AttnCtx, Pool};
+use crate::cpu_pool::{ATTN_JOB, ATTN_OUT, ATTN_STEP, AttnCtx, Pool, UNEMBED_STEP, UnembedCtx};
 use crate::cuda::{self, Ctx, DevBuf, Graph, HostBuf, Region, Result, Stream, VmBuf};
 use crate::experts::{ExpertCache, Experts, Fmt};
 use crate::hp::{Hp, Step};
@@ -28,6 +28,11 @@ const GPU_EXPERTS: bool = true;
 /// The row of `Scratch::msgs` that holds the message of controller c (q, k, v, the MoE input): the loop's cross-pass
 /// queries give the q and MoE messages (rows 0, 1), its kv queries the k and v ones (rows 2, 3).
 const MSG: [usize; 4] = [0, 2, 3, 1];
+
+/// The unembedding rows that the CPU team takes (IK_UNEMBED_CPU_ROWS), the last of the vocabulary: decode's GPU reads
+/// its rows at ~185 GB/s, the team its own at ~30 GB/s at once, so about 1/7 take as long; their VRAM goes to the
+/// expert cache and the KV rows.
+const UNEMBED_CPU_ROWS: usize = 27 * 1024;
 
 /// Tokens of a prefill ubatch, at most; the SWA rings hold this many rows past the window.
 pub const T_MAX: usize = 1024;
@@ -475,6 +480,8 @@ pub struct Stats {
     /// KV pages moved between VRAM and host memory as decode's split and prefill's take turns, and the seconds it took
     pub kv_moved: u64,
     pub kv_move_s: f64,
+    /// decode: seconds the host waited for the CPU team's rows of the logits once the GPU was done
+    pub unembed_wait_s: f64,
 }
 
 /// Host memory that can still be taken: MemAvailable, and within the memory limit of this process's cgroup if it has
@@ -498,7 +505,9 @@ impl Engine {
         let ck = Arc::new(Checkpoint::open(path)?);
         let hp = Hp::from_config(&ck.config)?;
         let k = Kernels::load()?;
-        let w = Weights::load(&ck, &hp)?;
+        let cpu_rows = std::env::var("IK_UNEMBED_CPU_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(UNEMBED_CPU_ROWS);
+        let mut w = Weights::load(&ck, &hp, cpu_rows)?;
+        let output_cpu = std::mem::take(&mut w.output_cpu);
         let ex = Arc::new(Experts::new(ck.clone(), &hp)?);
         let n_swa = hp.n_swa;
         let s = Stream::new()?;
@@ -681,6 +690,8 @@ impl Engine {
             copy_s: Stream::new_nonblocking()?,
             pf_stream,
         };
+        let first = e.w.output.rows;
+        e.pool.set_unembed(UnembedCtx { w: output_cpu, k: e.hp.n_embd, first, cap: e.hp.softcap, out: e.logits_h.ptr as usize });
         // the full-attention KV rows: in VRAM as far as the budget goes (IK_KV_VRAM_ROWS caps them while prefill runs;
         // decode's follow dec_split), the rest in host memory where the device can map it there
         let all = e.n_ctx.div_ceil(KV_STEP) * KV_STEP;
@@ -1299,12 +1310,32 @@ impl Engine {
         if e != 0 {
             return Err(format!("the CPU experts did not answer job {e}"));
         }
+        if self.w.output.rows < hp.n_vocab {
+            self.wait_unembed()?;
+        }
         let logits = self.logits_h.as_slice::<f32>()[..hp.n_vocab].to_vec();
         self.tokens.push(token);
         self.pos += 1;
         self.stats.tokens += 1;
         self.admit()?;
         Ok(logits)
+    }
+
+    /// Waits for the CPU team's rows of the token's logits: the unembedding job that the GPU posted and did not wait
+    /// for. At most 5 s.
+    fn wait_unembed(&mut self) -> Result<()> {
+        let seq = self.tok.wrapping_mul(64).wrapping_add(UNEMBED_STEP + 1);
+        // SAFETY: host-mapped memory that lives as long as the engine, where the team writes the seq it acknowledged
+        let ack = unsafe { &*(self.ack.ptr as *const AtomicU32) };
+        let t = std::time::Instant::now();
+        while ack.load(Ordering::Acquire) != seq {
+            if t.elapsed().as_secs() >= 5 {
+                return Err(format!("the CPU team did not answer the unembedding job {seq}"));
+            }
+            std::hint::spin_loop();
+        }
+        self.stats.unembed_wait_s += t.elapsed().as_secs_f64();
+        Ok(())
     }
 
     /// All the launches of one token, from the embedding in `x` to the logits in host memory.
@@ -1361,8 +1392,13 @@ impl Engine {
         let orq = self.w.output_res_query.ptr;
         self.mix(&blocks.clone(), x, orq, self.sc.a.ptr, 1)?;
         self.k.rms_norm(&self.s, self.sc.a.ptr, Some(self.w.output_norm.ptr), self.sc.a.ptr, nu, 1, hp.eps)?;
+        // the CPU team's rows of the logits, at once (decode waits for them)
+        if self.w.output.rows < hp.n_vocab {
+            let a = self.sc.a.ptr;
+            self.k.job_post(&self.s, a, nu, a, 0, a, 0, self.job.dev, p_pos, UNEMBED_STEP, 0)?;
+        }
         self.gemv(&self.w.output, self.sc.a.ptr, self.sc.logits_raw.ptr)?;
-        self.k.softcap(&self.s, self.sc.logits_raw.ptr, self.logits_h.dev, hp.n_vocab as u32, hp.softcap)?;
+        self.k.softcap(&self.s, self.sc.logits_raw.ptr, self.logits_h.dev, self.w.output.rows as u32, hp.softcap)?;
         self.k.prof_stop();
         Ok(())
     }
@@ -1504,9 +1540,13 @@ impl Engine {
         self.k.mix(&self.s, pl, last.len() as u32, orq, self.sc.a.ptr, 1, n as u32)?;
         self.k.rms_norm(&self.s, self.sc.a.ptr, Some(self.w.output_norm.ptr), self.sc.a.ptr, n as u32, 1, hp.eps)?;
         self.gemv(&self.w.output, self.sc.a.ptr, self.sc.logits_raw.ptr)?;
-        self.k.softcap(&self.s, self.sc.logits_raw.ptr, self.logits_h.dev, hp.n_vocab as u32, hp.softcap)?;
+        self.k.softcap(&self.s, self.sc.logits_raw.ptr, self.logits_h.dev, self.w.output.rows as u32, hp.softcap)?;
         self.s.sync()?;
-        let logits = self.logits_h.as_slice::<f32>()[..hp.n_vocab].to_vec();
+        let mut logits = self.logits_h.as_slice::<f32>()[..hp.n_vocab].to_vec();
+        // the CPU's rows, here: once a prompt
+        if self.w.output.rows < hp.n_vocab {
+            self.pool.unembed_here(&self.sc.a.download::<f32>(n)?, &mut logits);
+        }
         self.pos += nt;
         self.tokens.extend_from_slice(toks);
         self.stats.tokens += nt as u64;

@@ -58,6 +58,35 @@ pub fn dot_row_scalar(m: &Mat, r: usize, x: &[f32]) -> f32 {
     }
 }
 
+/// A BF16 row . x, summed in f32: the unembedding rows that the CPU team takes.
+pub fn dot_bf16(w: &[u16], x: &[f32]) -> f32 {
+    assert_eq!(w.len(), x.len());
+    #[cfg(target_arch = "x86_64")]
+    if simd() && w.len().is_multiple_of(32) {
+        // SAFETY: the features are present; w and x hold the same number of values
+        return unsafe { dot_bf16_avx2(w, x) };
+    }
+    w.iter().zip(x).map(|(&b, &v)| f32::from_bits((b as u32) << 16) * v).sum()
+}
+
+/// [`dot_bf16`] by 32 values: each BF16 widened to the f32 of the same bits, four sums.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_bf16_avx2(w: &[u16], x: &[f32]) -> f32 {
+    unsafe {
+        let mut acc = [_mm256_setzero_ps(); 4];
+        let (wp, xp) = (w.as_ptr(), x.as_ptr());
+        for i in (0..w.len()).step_by(32) {
+            for (j, a) in acc.iter_mut().enumerate() {
+                let b = _mm_loadu_si128(wp.add(i + 8 * j) as *const __m128i);
+                let f = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(b), 16));
+                *a = _mm256_fmadd_ps(f, _mm256_loadu_ps(xp.add(i + 8 * j)), *a);
+            }
+        }
+        hsum(_mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3])))
+    }
+}
+
 /// An NVFP4 row (E2M1 codes q, two a byte, the low nibble first; E4M3 scales s, one per 16 values) . x.
 pub fn dot_nvfp4_ref(q: &[u8], s: &[u8], x: &[f32]) -> f32 {
     let mut acc = 0f32;
@@ -372,6 +401,24 @@ pub(crate) mod tests {
                     .collect();
                 let s = (0..sb).map(|_| 110 + (rnd(seed) % 12) as u8).collect();
                 (q, s)
+            }
+        }
+    }
+
+    /// dot_bf16 against the f64 sum of the rows it reads, within 1e-5 of the sum of |w x|, with and without SIMD
+    #[test]
+    fn bf16_dots_match_f64() {
+        let mut seed = 0x05ee_db16_u64;
+        for k in [32, 64, 2304, 2305] {
+            let x = random_x(k, &mut seed);
+            for _ in 0..8 {
+                // normal BF16 values of either sign, exponents 2^-7..2^6
+                let w: Vec<u16> = (0..k).map(|_| (rnd(&mut seed) as u16 & 0x807F) | (120 + (rnd(&mut seed) % 14) as u16) << 7).collect();
+                let wf = |b: u16| f32::from_bits((b as u32) << 16) as f64;
+                let want: f64 = w.iter().zip(&x).map(|(&b, &v)| wf(b) * v as f64).sum();
+                let l1: f64 = w.iter().zip(&x).map(|(&b, &v)| (wf(b) * v as f64).abs()).sum();
+                let got = dot_bf16(&w, &x);
+                assert!((got as f64 - want).abs() <= 1e-5 * l1, "k {k}: {got} vs f64 {want} (sum of |w x| {l1})");
             }
         }
     }

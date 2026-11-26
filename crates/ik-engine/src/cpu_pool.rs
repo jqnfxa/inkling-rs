@@ -23,6 +23,32 @@ pub const ATTN_STEP: u32 = 48;
 pub const ATTN_JOB: usize = HEADS * DIM + HEADS * N_REL + HEADS;
 /// floats of the CPU's attention partials: [24] of m, l, acc[128]
 pub const ATTN_OUT: usize = HEADS * (2 + DIM);
+/// The step of a token's unembedding job, its last: the CPU team's rows of the logits, which the GPU does not wait for.
+pub const UNEMBED_STEP: u32 = 63;
+const U_ROWS: usize = 256; // unembedding rows per chunk
+
+/// The unembedding rows that the CPU team takes: BF16 [rows][k], rows `first`.. of the vocabulary, the soft cap of the
+/// logits, and the host address of the logits, [n_vocab] f32, where the team writes its rows'.
+pub struct UnembedCtx {
+    pub w: Vec<u16>,
+    pub k: usize,
+    pub first: usize,
+    pub cap: f32,
+    pub out: usize,
+}
+
+impl UnembedCtx {
+    fn rows(&self) -> usize {
+        self.w.len() / self.k
+    }
+
+    /// The logits of the CPU's rows lo..hi of normed state x, into out[..hi - lo]: cap tanh(w x / cap), as softcap.
+    fn run(&self, x: &[f32], lo: usize, hi: usize, out: &mut [f32]) {
+        for (r, o) in (lo..hi).zip(out) {
+            *o = self.cap * (crate::cpu::dot_bf16(&self.w[r * self.k..(r + 1) * self.k], x) / self.cap).tanh();
+        }
+    }
+}
 
 /// What the attention jobs need besides the job: the full-attention caches of each layer slot (host addresses of K
 /// and V row 0), the rows in VRAM (the CPU takes those past them), and the bias profiles of each physical layer.
@@ -66,11 +92,13 @@ struct Shared {
     n: usize,
     work: UnsafeCell<Work>,
     attn: std::sync::OnceLock<AttnCtx>,
+    unembed: std::sync::OnceLock<UnembedCtx>,
 }
 
 const KIND_DECODE: u64 = 0;
 const KIND_BATCH: u64 = 1;
 const KIND_ATTN: u64 = 2;
+const KIND_UNEMBED: u64 = 3;
 
 // SAFETY: `work` is written by the leader before it bumps `epoch`, and read by helpers after: a batch job's phases are
 // separated by barriers, a decode job's by the done counters (see `take`).
@@ -103,6 +131,7 @@ struct Work {
     a_d0: usize,
     a_chunk: usize,
     a_parts: Vec<[Partial; HEADS]>,
+    ux: Vec<f32>, // an unembedding job's normed state
 }
 
 /// nanoseconds of the batch phases: gate_up, activations, down
@@ -298,6 +327,7 @@ fn run(sh: &Shared, cx: &Ctx, t: usize, epoch: u32) {
     match kind & 3 {
         KIND_BATCH => run_batch(sh, cx, t),
         KIND_ATTN => run_attn(sh, epoch),
+        KIND_UNEMBED => run_unembed(sh, epoch),
         _ => run_decode(sh, cx, t, epoch),
     }
 }
@@ -326,6 +356,22 @@ fn run_attn(sh: &Shared, epoch: u32) {
             let part = &mut *(w.a_parts.as_ptr().add(c) as *mut [Partial; HEADS]);
             *part = [Partial::EMPTY; HEADS];
             cpu_attn::rows(&qy, k as *const u16, v as *const u16, lo, hi, part);
+        }
+        sh.gu_done.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Chunks of an unembedding job: U_ROWS rows of the logits each.
+fn run_unembed(sh: &Shared, epoch: u32) {
+    let w = sh.work.get() as *const Work;
+    let Some(u) = sh.unembed.get() else { return };
+    while let Take::Chunk(c) = take(&sh.gu_next, epoch) {
+        let (lo, hi) = (c * U_ROWS, ((c + 1) * U_ROWS).min(u.rows()));
+        // SAFETY: the epoch holds while this chunk is not done, and the leader writes ux only between epochs; the
+        // chunk's logits are its own, in host memory that the host reads after the ack
+        unsafe {
+            let out = std::slice::from_raw_parts_mut((u.out as *mut f32).add(u.first + lo), hi - lo);
+            u.run(&(*w).ux, lo, hi, out);
         }
         sh.gu_done.fetch_add(1, Ordering::Release);
     }
@@ -412,6 +458,7 @@ impl Pool {
             n,
             work: UnsafeCell::new(Work::default()),
             attn: std::sync::OnceLock::new(),
+            unembed: std::sync::OnceLock::new(),
         });
         let usage = Arc::new(Mutex::new(Usage { freq: vec![vec![0.0; n_expert]; n_layers], misses: vec![], hits: 0, miss_count: 0 }));
         let busy_ns = Arc::new(AtomicU64::new(0));
@@ -526,6 +573,11 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
         let t0 = std::time::Instant::now();
         LEADER_T0.with(|c| c.set(t0));
         last = seq;
+        if (seq - 1) % 64 == UNEMBED_STEP {
+            unembed_job(sh, job, n);
+            ack.store(seq, Ordering::Release);
+            continue;
+        }
         if (seq - 1) % 64 >= ATTN_STEP {
             attn_job(sh, job);
             ack.store(seq, Ordering::Release);
@@ -590,6 +642,26 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
     }
 }
 
+/// The unembedding job in `job` (the normed state, n floats): the CPU's rows of the logits, in chunks on the team.
+fn unembed_job(sh: &Shared, job: *const u32, n: usize) {
+    let Some(u) = sh.unembed.get() else { return };
+    {
+        // SAFETY: no thread reads the job between epochs
+        let w = unsafe { &mut *sh.work.get() };
+        w.ux.clear();
+        // SAFETY: host-mapped memory the GPU wrote before seq
+        w.ux.extend_from_slice(unsafe { std::slice::from_raw_parts(job.add(JOB_X) as *const f32, n) });
+    }
+    let n_chunks = u.rows().div_ceil(U_ROWS);
+    let g = sh.epoch.load(Ordering::Relaxed).wrapping_add(1);
+    sh.gu_done.store(0, Ordering::Relaxed);
+    sh.gu_next.store((g as u64) << 32 | (n_chunks as u64) << 16, Ordering::Release);
+    sh.kind.store((g as u64) << 2 | KIND_UNEMBED, Ordering::Release);
+    sh.epoch.store(g, Ordering::Release);
+    run_unembed(sh, g);
+    wait_done(sh, &sh.gu_done, n_chunks as u32, g);
+}
+
 /// attention jobs: [jobs, of them with rows for the CPU, ns from the job to its ack, rows]
 pub static ATTN_NS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
@@ -648,6 +720,18 @@ impl Pool {
     /// Sets what the attention jobs need; once, before the first.
     pub fn set_attn(&self, ac: AttnCtx) {
         let _ = self.shared.attn.set(ac);
+    }
+
+    /// Sets the unembedding rows that the CPU team takes; once, before the first job.
+    pub fn set_unembed(&self, u: UnembedCtx) {
+        let _ = self.shared.unembed.set(u);
+    }
+
+    /// The CPU's rows of the logits of normed state x on this thread (prefill's last token), into out[first..].
+    pub fn unembed_here(&self, x: &[f32], out: &mut [f32]) {
+        if let Some(u) = self.shared.unembed.get() {
+            u.run(x, 0, u.rows(), &mut out[u.first..u.first + u.rows()]);
+        }
     }
 
     /// Moves the split of the attention jobs: the rows from `rows` on are the CPU's. No job may be in flight.

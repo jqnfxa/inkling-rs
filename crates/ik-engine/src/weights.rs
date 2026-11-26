@@ -98,8 +98,10 @@ pub struct Weights {
     pub tok_norm: DevBuf,
     pub output_norm: DevBuf,
     pub output_res_query: DevBuf,
-    /// the unembedding's first n_vocab rows (the rest pad the vocabulary)
+    /// the unembedding's first n_vocab rows (the rest pad the vocabulary), less the last ones, which the CPU takes:
+    /// those in host memory, BF16 [rows][n_embd]
     pub output: Mat,
+    pub output_cpu: Vec<u16>,
     /// [2 loop layers][n_embd] f32 each: middle_cycle_cross_pass_queries (q, mlp) and its kv_queries (k, v)
     pub msg_queries: DevBuf,
     pub msg_kv_queries: DevBuf,
@@ -107,7 +109,8 @@ pub struct Weights {
 }
 
 impl Weights {
-    pub fn load(ck: &Checkpoint, hp: &Hp) -> Result<Weights> {
+    /// The weights, with the last `cpu_rows` rows of the unembedding in host memory.
+    pub fn load(ck: &Checkpoint, hp: &Hp, cpu_rows: usize) -> Result<Weights> {
         let (n, nh, kv) = (hp.n_embd, hp.n_head * hp.head_dim, hp.kv_dim());
         let (bf, f32_) = (Dtype::BF16, Dtype::F32);
         let core = hp.loop_end - hp.loop_start;
@@ -186,7 +189,10 @@ impl Weights {
                 lp,
             });
         }
-        let output = Mat::first_rows(ck, "model.llm.unembed.weight", hp.n_vocab_padded, hp.n_vocab, n)?;
+        let gpu_rows = hp.n_vocab - cpu_rows.min(hp.n_vocab - 1);
+        let output = Mat::first_rows(ck, "model.llm.unembed.weight", hp.n_vocab_padded, gpu_rows, n)?;
+        let b = ck.get("model.llm.unembed.weight", bf, &[hp.n_vocab_padded, n])?;
+        let output_cpu = b[gpu_rows * n * 2..hp.n_vocab * n * 2].as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
         bytes += output.bytes();
         Ok(Weights {
             layers,
@@ -194,6 +200,7 @@ impl Weights {
             output_norm: tensor(ck, "model.llm.norm.weight", bf, &[n])?,
             output_res_query: tensor(ck, "model.llm.attn_res.output_query", f32_, &[n])?,
             output,
+            output_cpu,
             msg_queries,
             msg_kv_queries,
             bytes,
