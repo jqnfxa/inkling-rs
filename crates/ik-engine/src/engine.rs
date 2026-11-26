@@ -53,8 +53,9 @@ const STAGE_ROWS: usize = 4096;
 const PF_STATE: usize = 390;
 /// Prefill runs the pairs of cached experts on the GPU this many tokens at a time.
 const PF_GROUP: usize = 32;
-/// A cached NVFP4 expert with at least this many of a ubatch's tokens runs them grouped (moe_nvfp4_g, a tile of 32
-/// tokens decoding each weight once), the others pair by pair (moe_nvfp4_d, the weights read a pair at a time).
+/// A cached expert with at least this many of a ubatch's tokens runs them grouped (moe_nvfp4_g or moe_mxfp8_g, a tile
+/// of 32 tokens decoding each weight once), the others pair by pair (moe_nvfp4_d or moe_mxfp8_d, the weights read a
+/// pair at a time). Grouped gets faster at 10 to 12 tokens in both formats.
 const G_MIN: usize = 12;
 
 /// Addresses reserved for prefill's region, more than its buffers take.
@@ -266,8 +267,8 @@ struct PfStream {
     /// are written to
     lists: DevBuf,
     lists_h: HostBuf,
-    /// moe_nvfp4_g's entries of each streamed expert, [2 n_expert][4] u64: its gate_up, then its down; and the host
-    /// copy they are written to
+    /// the grouped kernels' entries of each streamed expert, [2 n_expert][4] u64: its gate_up, then its down; and the
+    /// host copy they are written to
     tab: DevBuf,
     tab_h: HostBuf,
     /// the expert stream, at the highest priority: the cached experts' kernels on the main stream, thousands of blocks
@@ -1683,7 +1684,7 @@ impl Engine {
 
     /// Queues the pairs of `streamed` (expert, its (token, pair)s) on the expert stream: the copy stream uploads each
     /// expert to a staging slot once the slot's last reader is done, and the stream gathers its tokens' x, runs gate_up,
-    /// SITU and down (an NVFP4 expert's by moe_nvfp4_g, which decodes each weight once for 32 tokens), and adds the
+    /// SITU and down (by moe_nvfp4_g or moe_mxfp8_g, which decode each weight once for 32 tokens), and adds the
     /// outputs, each weighted by its pair, to acc's rows of their tokens. self.s waits for it.
     /// The experts go through the bounce slots: the host copies each to one once the slot's last upload is done, so
     /// this returns about when the last upload starts.
@@ -1703,15 +1704,13 @@ impl Engine {
         }
         cuda::copy_h2d_async(ps.lists.ptr, ps.lists_h.ptr, 3 * cap * 4, &ps.s)?;
         ps.acc.memset(0, &ps.s)?;
-        // an NVFP4 expert's gate_up reads its staging slot and the gathered x, its down the activations
-        if matches!(f, Fmt::NvFp4) {
-            let tab = ps.tab_h.as_mut_slice::<u64>();
-            for (j, (e, pairs)) in streamed.iter().enumerate() {
-                let (slot, me) = (j % STREAM_SLOTS, pairs.len() as u64 | (*e as u64) << 32);
-                tab[8 * j..8 * j + 8].copy_from_slice(&[ps.gu.at(slot * gu_b), ps.x.ptr, ps.gu_out.ptr, me, ps.dn.at(slot * dn_b), ps.af.ptr, ps.x.ptr, me]);
-            }
-            cuda::copy_h2d_async(ps.tab.ptr, ps.tab_h.ptr, 64 * streamed.len(), &ps.s)?;
+        // an expert's gate_up reads its staging slot and the gathered x, its down the activations
+        let tab = ps.tab_h.as_mut_slice::<u64>();
+        for (j, (e, pairs)) in streamed.iter().enumerate() {
+            let (slot, me) = (j % STREAM_SLOTS, pairs.len() as u64 | (*e as u64) << 32);
+            tab[8 * j..8 * j + 8].copy_from_slice(&[ps.gu.at(slot * gu_b), ps.x.ptr, ps.gu_out.ptr, me, ps.dn.at(slot * dn_b), ps.af.ptr, ps.x.ptr, me]);
         }
+        cuda::copy_h2d_async(ps.tab.ptr, ps.tab_h.ptr, 64 * streamed.len(), &ps.s)?;
         ps.t0.record(&self.copy_s)?;
         let mut o = 0;
         for (j, (e, pairs)) in streamed.iter().enumerate() {
@@ -1752,9 +1751,9 @@ impl Engine {
                     self.k.moe_nvfp4_g(&ps.s, ps.tab.at(64 * j + 32), dn_a, dn_d, n, ffu, m, 1)?;
                 }
                 Fmt::MxFp8 => {
-                    self.k.moe_mxfp8_d(&ps.s, ps.gu.ptr, gu_b as u64, sl, ps.x.ptr, n, 0, ps.gu_out.ptr, 2 * ffu, n, m)?;
+                    self.k.moe_mxfp8_g(&ps.s, ps.tab.at(64 * j), 2 * ffu, n, m, 1)?;
                     self.k.situ(&ps.s, ps.gu_out.ptr, sl, ps.af.ptr, ffu, self.ex.beta, self.ex.lb, m)?;
-                    self.k.moe_mxfp8_d(&ps.s, ps.dn.ptr, dn_b as u64, sl, ps.af.ptr, ffu, 0, ps.x.ptr, n, ffu, m)?;
+                    self.k.moe_mxfp8_g(&ps.s, ps.tab.at(64 * j + 32), n, ffu, m, 1)?;
                 }
             }
             ps.free[slot].record(&ps.s)?;
@@ -2034,16 +2033,13 @@ impl Engine {
         self.k.moe_combine_t(&self.s, b.pf_dn.ptr, slots, b.wts.at(4 * 8 * ta), b.moe.at(4 * n as usize * ta), n, (tb - ta) as u32, true, add)
     }
 
-    /// The cached pairs of the NVFP4 experts with at least G_MIN of the ubatch's nt tokens: each expert's tokens
-    /// gathered and run by moe_nvfp4_g (which decodes a weight once for 32 tokens), the experts one after another in
+    /// The cached pairs of the experts with at least G_MIN of the ubatch's nt tokens: each expert's tokens gathered and
+    /// run by moe_nvfp4_g or moe_mxfp8_g (which decode a weight once for 32 tokens), the experts one after another in
     /// chunks of the pf buffers' 8 PF_GROUP rows (an expert split at a chunk's end), and the chunks' outputs added
     /// into b.moe (the first sets it). Returns the slots left to the pair by pair path (theirs, or -1), as uploaded to
     /// b.grp, if any expert ran grouped.
     fn experts_g(&mut self, ip: usize, nt: usize, ids: &[u32], slots: &[i32]) -> Result<Option<Vec<i32>>> {
-        if !matches!(self.ex.fmt[ip], Fmt::NvFp4) {
-            return Ok(None);
-        }
-        let ne = self.hp.n_expert;
+        let (ne, f) = (self.hp.n_expert, self.ex.fmt[ip]);
         let mut pairs: Vec<Vec<usize>> = vec![vec![]; ne];
         for (p, &e) in ids.iter().enumerate().filter(|&(p, _)| slots[p] >= 0) {
             pairs[e as usize].push(p);
@@ -2054,7 +2050,7 @@ impl Engine {
         let mut pp = slots.to_vec();
         let cap = 8 * PF_GROUP;
         let b = &self.b;
-        let bk = &self.cache.banks[Fmt::NvFp4.index()];
+        let bk = &self.cache.banks[f.index()];
         let (gu_b, dn_b) = (bk.gu_bytes as u64, bk.down_bytes as u64);
         let (n, ffu) = (self.hp.n_embd, self.hp.n_ff_exp);
         // the lists: row q of the tokens is the grouped pairs' q-th, expert after expert; chunk c holds rows c cap..
@@ -2101,16 +2097,23 @@ impl Engine {
             t[tab_at / 8 + 4 * (ne_ + i)..][..4].copy_from_slice(&en[4..]);
         }
         cuda::copy_h2d_async(b.grp.ptr, self.bh.grp.ptr, tab_at + 64 * ne_, &self.s)?;
-        let ((gu_a, gu_d), (dn_a, dn_d)) = (self.cache.factor_ptrs(ip, 0), self.cache.factor_ptrs(ip, 1));
         let (nu, fu) = (n as u32, ffu as u32);
+        // gate_up (rows 2 n_ff, k n) or down (n, n_ff) of the nz experts of tab
+        let grouped = |tab: P, rows: u32, k: u32, down: usize, mm: u32, nz: u32| match f {
+            Fmt::NvFp4 => {
+                let (a, d) = self.cache.factor_ptrs(ip, down);
+                self.k.moe_nvfp4_g(&self.s, tab, a, d, rows, k, mm, nz)
+            }
+            Fmt::MxFp8 => self.k.moe_mxfp8_g(&self.s, tab, rows, k, mm, nz),
+        };
         for (c, &[q0, m, e0, nz, mm]) in chunks.iter().enumerate() {
             let tok = b.grp.at(4 * q0);
             let (m, nz, mm) = (m as u32, nz as u32, mm as u32);
             self.k.gather_rows(&self.s, b.xn.ptr, tok, b.pf_dn.ptr, nu, m)?;
-            self.k.moe_nvfp4_g(&self.s, b.grp.at(tab_at + 32 * e0), gu_a, gu_d, 2 * fu, nu, mm, nz)?;
+            grouped(b.grp.at(tab_at + 32 * e0), 2 * fu, nu, 0, mm, nz)?;
             // the tokens stand for slots: SITU takes every row
             self.k.situ(&self.s, b.pf_gu.ptr, tok, b.pf_af.ptr, fu, self.ex.beta, self.ex.lb, m)?;
-            self.k.moe_nvfp4_g(&self.s, b.grp.at(tab_at + 32 * (ne_ + e0)), dn_a, dn_d, nu, fu, mm, nz)?;
+            grouped(b.grp.at(tab_at + 32 * (ne_ + e0)), nu, fu, 1, mm, nz)?;
             self.k.moe_combine_r(&self.s, b.pf_dn.ptr, b.grp.at(rows_at + 32 * nt * c), b.wts.ptr, b.moe.ptr, nu, nt as u32, c > 0)?;
         }
         self.stats.pf_grouped_pairs += total as u64;
@@ -2216,6 +2219,47 @@ impl Engine {
                         self.k.moe_nvfp4_g(&self.s, tab.at(256), dn_a, dn_d, n, ffu, m, 8)?
                     });
                 }
+            }
+        }
+        // the same of the last layer's MXFP8 experts, if their bank has 8 slots (IK_MX_SHARE=0.6 gives it them beside
+        // the region at IK_CTX=4096)
+        let (ip, bk) = (hp.n_phys - 1, &self.cache.banks[Fmt::MxFp8.index()]);
+        if bk.n_slots >= 8 && matches!(self.ex.fmt[ip], Fmt::MxFp8) {
+            let (b, ffu, nn) = (&self.b, hp.n_ff_exp as u32, n as usize);
+            let (gu_b, dn_b) = (bk.gu_bytes as u64, bk.down_bytes as u64);
+            b.slots.upload(&vec![0i32; tm])?;
+            for m in [24u32, 64, 256] {
+                let flops = 2 * m as usize * 3 * nn * ffu as usize;
+                time!(format!("MxFp8 expert per pair, {m} tokens"), flops, {
+                    self.k.moe_mxfp8_d(&self.s, bk.gu.ptr, gu_b, b.slots.ptr, b.xn.ptr, n, 0, b.pf_gu.ptr, 2 * ffu, n, m)?;
+                    self.k.moe_mxfp8_d(&self.s, bk.down.ptr, dn_b, b.slots.ptr, b.pf_af.ptr, ffu, 0, b.pf_dn.ptr, n, ffu, m)?
+                });
+                let tab = DevBuf::from_slice(&[bk.gu.ptr, b.xn.ptr, b.pf_gu.ptr, m as u64, bk.down.ptr, b.pf_af.ptr, b.pf_dn.ptr, m as u64])?;
+                time!(format!("MxFp8 expert grouped, {m} tokens"), flops, {
+                    self.k.moe_mxfp8_g(&self.s, tab.ptr, 2 * ffu, n, m, 1)?;
+                    self.k.moe_mxfp8_g(&self.s, tab.at(32), n, ffu, m, 1)?
+                });
+            }
+            let sl: Vec<i32> = (0..tm as i32).map(|p| p % 8).collect();
+            b.slots.upload(&sl)?;
+            for m in [4u32, 8, 12, 16, 24, 32] {
+                let flops = 8 * 2 * m as usize * 3 * nn * ffu as usize;
+                time!(format!("MxFp8 8 experts per pair, {m} tokens"), flops, {
+                    self.k.moe_mxfp8_d(&self.s, bk.gu.ptr, gu_b, b.slots.ptr, b.xn.ptr, n, 3, b.pf_gu.ptr, 2 * ffu, n, 8 * m)?;
+                    self.k.moe_mxfp8_d(&self.s, bk.down.ptr, dn_b, b.slots.ptr, b.pf_af.ptr, ffu, 0, b.pf_dn.ptr, n, ffu, 8 * m)?
+                });
+                let mut t = vec![];
+                for k in 0..8u64 {
+                    t.extend([bk.gu.ptr + k * gu_b, b.xn.ptr, b.pf_gu.at(8 * ffu as usize * m as usize * k as usize), m as u64 | k << 32]);
+                }
+                for k in 0..8u64 {
+                    t.extend([bk.down.ptr + k * dn_b, b.pf_af.ptr, b.pf_dn.at(4 * nn * m as usize * k as usize), m as u64 | k << 32]);
+                }
+                let tab = DevBuf::from_slice(&t)?;
+                time!(format!("MxFp8 8 experts grouped, {m} tokens"), flops, {
+                    self.k.moe_mxfp8_g(&self.s, tab.ptr, 2 * ffu, n, m, 8)?;
+                    self.k.moe_mxfp8_g(&self.s, tab.at(256), n, ffu, m, 8)?
+                });
             }
         }
         let maxs = self.maxs as u32;

@@ -308,18 +308,17 @@ fn main() -> Result<(), String> {
         check(&format!("moe_{}_d layer {l} w13, 2 tokens", if nvfp4 { "nvfp4" } else { "mxfp8" }), err, 1e-5, &mut fails);
     }
 
-    // experts, grouped: gate_up and down of 3 NVFP4 experts in one launch, on 1, 33 and 70 tokens of their own (a
-    // tile of tokens and 1 of the next, 2 tiles and 6 of the third); each expert's y has 1 token more, which must stay
-    // 0 (its own seed: the checks after it keep their inputs)
+    // experts, grouped: gate_up and down of 3 experts in one launch, on 1, 33 and 70 tokens of their own (a tile of
+    // tokens and 1 of the next, 2 tiles and 6 of the third), of an NVFP4 layer and an MXFP8 one; each expert's y has 1
+    // token more, which must stay 0 (its own seed: the checks after it keep their inputs)
     {
         let mut seed = 0x06e0_fa11u64;
-        let (l, es3, ms) = (0usize, [17usize, 64, 127], [1usize, 33, 70]);
-        for w in ["w13", "w2"] {
+        let (es3, ms) = ([17usize, 64, 127], [1usize, 33, 70]);
+        for (l, w) in [(0usize, "w13"), (0, "w2"), (21, "w13"), (21, "w2")] {
             let (b, slot) = bank(&ck, l, w, &es3)?;
             let bb = DevBuf::from_slice(&b)?;
             let (_, rows, kk) = expert_ref(&ck, l, w, 0)?;
-            let p = |n: &str| format!("model.llm.layers.{l}.mlp.experts.{w}_weight_{n}");
-            let (ba, bn) = (DevBuf::from_slice(&ck.floats(&p("amax"))?)?, DevBuf::from_slice(&ck.floats(&p("outer_scale_denominator"))?)?);
+            let nvfp4 = ck.tensor(&format!("model.llm.layers.{l}.mlp.experts.{w}_weight"))?.dtype == Dtype::U8;
             let xs: Vec<Vec<f32>> = ms.iter().map(|&m| (0..m * kk).map(|_| rnd(&mut seed) * 2.0).collect()).collect();
             let (mut bufs, mut tab) = (vec![], vec![]);
             for (i, x) in xs.iter().enumerate() {
@@ -328,7 +327,14 @@ fn main() -> Result<(), String> {
                 bufs.push((bx, by));
             }
             let bt = DevBuf::from_slice(&tab)?;
-            k.moe_nvfp4_g(&s, bt.ptr, ba.ptr, bn.ptr, rows as u32, kk as u32, 70, 3)?;
+            let name = if nvfp4 { "moe_nvfp4_g" } else { "moe_mxfp8_g" };
+            if nvfp4 {
+                let p = |n: &str| format!("model.llm.layers.{l}.mlp.experts.{w}_weight_{n}");
+                let (ba, bn) = (DevBuf::from_slice(&ck.floats(&p("amax"))?)?, DevBuf::from_slice(&ck.floats(&p("outer_scale_denominator"))?)?);
+                k.moe_nvfp4_g(&s, bt.ptr, ba.ptr, bn.ptr, rows as u32, kk as u32, 70, 3)?;
+            } else {
+                k.moe_mxfp8_g(&s, bt.ptr, rows as u32, kk as u32, 70, 3)?;
+            }
             s.sync()?;
             let mut err = 0f64;
             for (i, (_, by)) in bufs.iter().enumerate() {
@@ -340,10 +346,10 @@ fn main() -> Result<(), String> {
                     err = err.max(rel_err(&y[t * rows..][..rows], &want));
                 }
                 if y[ms[i] * rows..].iter().any(|&v| v != 0.0) {
-                    fails.push(format!("moe_nvfp4_g layer {l} {w}: wrote past expert {i}'s tokens"));
+                    fails.push(format!("{name} layer {l} {w}: wrote past expert {i}'s tokens"));
                 }
             }
-            check(&format!("moe_nvfp4_g layer {l} {w}, 1, 33, 70 tokens"), err, 1e-5, &mut fails);
+            check(&format!("{name} layer {l} {w}, 1, 33, 70 tokens"), err, 1e-5, &mut fails);
         }
     }
 

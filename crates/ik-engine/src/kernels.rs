@@ -252,6 +252,13 @@ impl Kernels {
         self.run(s, "moe_nvfp4_g", (rows.div_ceil(128), max_m.div_ceil(32), nz), 128, &[&tab, &amax, &denom, &rows, &k])
     }
 
+    /// moe_nvfp4_g for MXFP8 experts: tab[4 z ..] holds the expert's slot (e4m3 values, then UE8M0 scales), x [m][k] f32
+    /// and y [m][rows], then m and the expert as two u32s. `max_m` is the largest m.
+    pub fn moe_mxfp8_g(&self, s: &Stream, tab: P, rows: u32, k: u32, max_m: u32, nz: u32) -> Result<()> {
+        assert!(k.is_multiple_of(32) && rows.is_multiple_of(4) && max_m > 0, "moe_mxfp8_g: rows {rows}, k {k}, m {max_m}");
+        self.run(s, "moe_mxfp8_g", (rows.div_ceil(128), max_m.div_ceil(32), nz), 128, &[&tab, &rows, &k])
+    }
+
     /// y = W x for the `pairs` slots on a bank of MXFP8 slots (e4m3 values, then UE8M0 scales): x f32, as moe_nvfp4_d.
     #[allow(clippy::too_many_arguments)]
     pub fn moe_mxfp8_d(&self, s: &Stream, bank: P, slot_bytes: u64, slots: P, x: P, xstride: u32, xshift: u32, y: P, rows: u32, k: u32, pairs: u32) -> Result<()> {
