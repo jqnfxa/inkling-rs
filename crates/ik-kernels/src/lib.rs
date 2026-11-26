@@ -1050,6 +1050,50 @@ pub mod gpu {
         st.global.v4.f32([da], (v0, v1, v2, v3));
     }
 
+    /// Row didx[i] of dst += wts[widx[i]] * row i of src, rows of n floats (a multiple of 4), for the rows i of grid.y:
+    /// the expert stream adds an expert's outputs to its tokens' rows, each weighted by its pair. The rows didx[i] of a
+    /// launch are distinct (an expert has a token once). A thread per 4 floats.
+    #[maxntid(128)]
+    pub unsafe extern "ptx-kernel" fn add_rows_w(src: *const f32, dst: *mut f32, didx: *const u32, wts: *const f32, widx: *const u32, n: u32) {
+        let (bk, nt, t, c, i): (u32, u32, u32, u32, u32);
+        mov.u32(bk, ctaid.x);
+        mov.u32(nt, ntid.x);
+        mov.u32(t, tid.x);
+        mov.u32(i, ctaid.y);
+        mad.lo.u32(c, bk, nt, t);
+        shl.b32(c, c, 2);
+        let past: pred;
+        setp.ge.u32(past, c, n);
+        if past {
+            ret();
+        }
+        let (di, wi): (u32, u32);
+        let (ia, ja): (u64, u64);
+        mad.wide.u32(ia, i, 4, didx);
+        mad.wide.u32(ja, i, 4, widx);
+        ld.global.u32(di, [ia]);
+        ld.global.u32(wi, [ja]);
+        let wv: f32;
+        let wa: u64;
+        mad.wide.u32(wa, wi, 4, wts);
+        ld.global.f32(wv, [wa]);
+        let (so, dof): (u32, u32);
+        mad.lo.u32(so, i, n, c);
+        mad.lo.u32(dof, di, n, c);
+        let (sa, da): (u64, u64);
+        mad.wide.u32(sa, so, 4, src);
+        mad.wide.u32(da, dof, 4, dst);
+        let (v0, v1, v2, v3): (f32, f32, f32, f32);
+        let (a0, a1, a2, a3): (f32, f32, f32, f32);
+        ld.global.v4.f32((v0, v1, v2, v3), [sa]);
+        ld.global.v4.f32((a0, a1, a2, a3), [da]);
+        fma.rn.f32(a0, wv, v0, a0);
+        fma.rn.f32(a1, wv, v1, a1);
+        fma.rn.f32(a2, wv, v2, a2);
+        fma.rn.f32(a3, wv, v3, a3);
+        st.global.v4.f32([da], (a0, a1, a2, a3));
+    }
+
     /// y = x * sigmoid(g) over n floats.
     #[maxntid(256)]
     pub unsafe extern "ptx-kernel" fn mul_sigmoid(x: *const f32, g: *const f32, y: *mut f32, n: u32, n_row: u32, g_stride: u32) {

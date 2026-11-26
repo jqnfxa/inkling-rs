@@ -430,6 +430,34 @@ fn main() -> Result<(), String> {
         check("copy_rows: rows not their source's", wrong as f64, 0.0, &mut fails);
     }
 
+    // add_rows_w as the expert stream uses it: 5 rows of 2304 floats added, each weighted by its pair, to 5 rows of 12
+    // (the other rows untouched), against f64
+    {
+        let nn = 2304usize;
+        let mut seed = 0xadd_5eedu64;
+        let src: Vec<f32> = (0..5 * nn).map(|_| rnd(&mut seed)).collect();
+        let acc: Vec<f32> = (0..12 * nn).map(|_| rnd(&mut seed)).collect();
+        let wts: Vec<f32> = (0..16).map(|_| rnd(&mut seed).abs()).collect();
+        let (didx, widx) = ([11u32, 2, 7, 4, 0], [3u32, 15, 0, 8, 3]);
+        let (bs, ba, bw) = (DevBuf::from_slice(&src)?, DevBuf::from_slice(&acc)?, DevBuf::from_slice(&wts)?);
+        let (bdi, bwi) = (DevBuf::from_slice(&didx)?, DevBuf::from_slice(&widx)?);
+        k.add_rows_w(&s, bs.ptr, ba.ptr, bdi.ptr, bw.ptr, bwi.ptr, nn as u32, 5)?;
+        s.sync()?;
+        let got: Vec<f32> = ba.download(12 * nn)?;
+        let mut err = 0f64;
+        for r in 0..12 {
+            let at = didx.iter().position(|&x| x as usize == r);
+            for c in 0..nn {
+                let want = match at {
+                    Some(i) => acc[r * nn + c] as f64 + wts[widx[i] as usize] as f64 * src[i * nn + c] as f64,
+                    None => acc[r * nn + c] as f64,
+                };
+                err = err.max((got[r * nn + c] as f64 - want).abs() / want.abs().max(1e-3));
+            }
+        }
+        check("add_rows_w, 5 rows into 12", err, 1e-6, &mut fails);
+    }
+
     // NVFP4 on made-up slots, for what the real tensors may hold little of: every code byte in each row, and E4M3
     // scales of every magnitude, the subnormal ones among them (every 4th row has only those). Each row's error is over
     // its sum of |w x|, which one value decoded wrong moves by about 1/k.

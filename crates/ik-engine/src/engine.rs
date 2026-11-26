@@ -163,6 +163,8 @@ struct BatchBufs {
     ids: DevBuf,
     wts: DevBuf,
     slots: DevBuf,
+    /// the row of cpu_out of each pair that the CPU team computes, -1 for the others: [8 nt] i32
+    crow: DevBuf,
     moe: DevBuf,
     f: DevBuf,
     tau: DevBuf,
@@ -222,6 +224,7 @@ impl BatchBufs {
             ids: g(rg, tm * 8),
             wts: g(rg, tm * 8),
             slots: g(rg, tm * 8),
+            crow: g(rg, tm * 8),
             moe: g(rg, tm * n),
             f: g(rg, tm * n),
             tau: g(rg, tm),
@@ -242,6 +245,7 @@ struct BatchHost {
     ids: HostBuf,
     xn: HostBuf,
     slots: HostBuf,
+    crow: HostBuf,
     cpu_out: HostBuf,
     grp: HostBuf,
 }
@@ -256,6 +260,8 @@ struct PfStream {
     x: DevBuf,
     gu_out: DevBuf,
     af: DevBuf,
+    /// the outputs of the streamed pairs, each weighted by its pair, summed per token: [t][n]
+    acc: DevBuf,
     /// the streamed pairs in expert order, [3][8 tm] u32: staging slot, token, pair (8 t + k); and the host copy they
     /// are written to
     lists: DevBuf,
@@ -296,6 +302,7 @@ impl PfStream {
             x: none(),
             gu_out: none(),
             af: none(),
+            acc: none(),
             lists: none(),
             lists_h: HostBuf::new(3 * 8 * T_MAX * 4)?,
             tab: none(),
@@ -321,6 +328,7 @@ impl PfStream {
         self.x = rg.take(tm * n * 4);
         self.gu_out = rg.take(tm * 2 * nff * 4);
         self.af = rg.take(tm * nff * 4);
+        self.acc = rg.take(tm * n * 4);
         self.lists = rg.take(3 * 8 * tm * 4);
         self.tab = rg.take(2 * hp.n_expert * 32);
     }
@@ -559,6 +567,7 @@ impl Engine {
             ids: HostBuf::new(4 * T_MAX * 8)?,
             xn: HostBuf::new(4 * T_MAX * n)?,
             slots: HostBuf::new(4 * T_MAX * 8)?,
+            crow: HostBuf::new(4 * T_MAX * 8)?,
             cpu_out: HostBuf::new(4 * T_MAX * 8 * n)?,
             grp: HostBuf::new(grp_bytes(&hp, T_MAX))?,
         };
@@ -1586,6 +1595,12 @@ impl Engine {
         }
         self.bh.slots.as_mut_slice::<i32>()[..nt * 8].copy_from_slice(&slots);
         cuda::copy_h2d_async(self.b.slots.ptr, self.bh.slots.ptr, nt * 8 * 4, &self.s)?;
+        let crow = &mut self.bh.crow.as_mut_slice::<i32>()[..nt * 8];
+        crow.fill(-1);
+        for &(_, p) in groups.iter().flat_map(|g| &g.1) {
+            crow[p] = p as i32;
+        }
+        cuda::copy_h2d_async(self.b.crow.ptr, self.bh.crow.ptr, nt * 8 * 4, &self.s)?;
         let on_gpu = slots.iter().filter(|&&s| s >= 0).count();
         self.stats.pf_gpu_pairs += on_gpu as u64;
         self.stats.pf_cpu_pairs += (nt * 8 - on_gpu) as u64;
@@ -1651,19 +1666,25 @@ impl Engine {
             self.stats.pf_stream_late += 1;
             self.stats.pf_stream_late_s += t.elapsed().as_secs_f64();
         }
-        // the CPU's and the stream's pairs (cpu_out), added to the GPU's where a group has some
+        // the CPU's pairs (cpu_out), added to the GPU's where a group has some, and the stream's sums
         let cpu = self.bh.cpu_out.dev;
         for &(ta, tb, gpu) in &spans {
             let (b, nn) = (&self.b, n * 4);
-            self.k.moe_combine_t(&self.s, cpu + (8 * ta * nn) as u64, b.slots.at(4 * 8 * ta), b.wts.at(4 * 8 * ta), b.moe.at(ta * nn), nu, (tb - ta) as u32, false, gpu || grouped)?;
+            self.k.moe_combine_r(&self.s, cpu, b.crow.at(4 * 8 * ta), b.wts.at(4 * 8 * ta), b.moe.at(ta * nn), nu, (tb - ta) as u32, gpu || grouped)?;
+        }
+        if let Some(ps) = &self.pf_stream
+            && !streamed.is_empty()
+        {
+            let moe = self.b.moe.ptr;
+            self.k.add(&self.s, moe, ps.acc.ptr, moe, (nt * n) as u32)?;
         }
         Ok(())
     }
 
     /// Queues the pairs of `streamed` (expert, its (token, pair)s) on the expert stream: the copy stream uploads each
     /// expert to a staging slot once the slot's last reader is done, and the stream gathers its tokens' x, runs gate_up,
-    /// SITU and down (an NVFP4 expert's by moe_nvfp4_g, which decodes each weight once for 32 tokens), and puts the
-    /// outputs in cpu_out's rows of their pairs, as the CPU team does. self.s waits for it.
+    /// SITU and down (an NVFP4 expert's by moe_nvfp4_g, which decodes each weight once for 32 tokens), and adds the
+    /// outputs, each weighted by its pair, to acc's rows of their tokens. self.s waits for it.
     /// The experts go through the bounce slots: the host copies each to one once the slot's last upload is done, so
     /// this returns about when the last upload starts.
     fn stream_experts(&mut self, ip: usize, streamed: &[(usize, Vec<(usize, usize)>)]) -> Result<()> {
@@ -1681,6 +1702,7 @@ impl Engine {
             }
         }
         cuda::copy_h2d_async(ps.lists.ptr, ps.lists_h.ptr, 3 * cap * 4, &ps.s)?;
+        ps.acc.memset(0, &ps.s)?;
         // an NVFP4 expert's gate_up reads its staging slot and the gathered x, its down the activations
         if matches!(f, Fmt::NvFp4) {
             let tab = ps.tab_h.as_mut_slice::<u64>();
@@ -1736,7 +1758,7 @@ impl Engine {
                 }
             }
             ps.free[slot].record(&ps.s)?;
-            self.k.copy_rows(&ps.s, ps.x.ptr, None, self.bh.cpu_out.dev, Some(pr), n, m)?;
+            self.k.add_rows_w(&ps.s, ps.x.ptr, ps.acc.ptr, tk, self.b.wts.ptr, pr, n, m)?;
             o += pairs.len();
         }
         ps.t1.record(&ps.s)?;

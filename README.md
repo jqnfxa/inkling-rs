@@ -131,7 +131,8 @@ llama-server endpoints the chat UI reads (`/props`, `/tools`, and the resumable 
   the others a pair at a time. The other experts are grouped by expert, each read once per ubatch for all its tokens.
   The CPU threads take most of them; an expert stream takes those with the most tokens, as many as it can upload in
   the time the CPU takes for the rest. The host copies each to a small page-locked slot, the copy stream uploads it
-  from there to a staging slot in VRAM, and the GPU runs its pairs, an NVFP4 expert's by the same tiles. On an RTX 3050
+  from there to a staging slot in VRAM, and the GPU runs its pairs, an NVFP4 expert's by the same tiles, and adds their
+  outputs to its tokens' rows in VRAM; only the CPU's outputs cross PCIe back to the GPU. On an RTX 3050
   Laptop one expert's gate_up and down take 378 us on 64 tokens (2.7 TFLOPS) and 1125 us on 256 (3.6), against 749
   and 2997 us a pair at a time; 8 experts on 12 tokens each take 1145 us by tiles and 1173 us a pair at a time.
   `IK_PF_STREAM=0` turns the stream off.
@@ -165,8 +166,8 @@ ubatch's activations, the expert stream's staging slots) are mapped the same way
 gets their pages as expert slots (49 more on an RTX 3050 Laptop), which fill at its first token. They are laid out for
 each prompt, for the least power of two from 32 tokens that holds it in one ubatch, up to 1024: a short chat message
 maps 52 MiB, a 1024-token ubatch 482 MiB. The KV rows in VRAM leave room for the 1024-token layout, or for 512 or 256
-tokens where the whole `--ctx` would not fit beside it, so the longest context stays as long. At 8k of context prefill
-runs 200 t/s by 1024-token ubatches, against 137 by 256.
+tokens where the whole `--ctx` would not fit beside it, so the longest context stays as long. At 8k of context
+1024-token ubatches prefill about 1.5 times as fast as 256-token ones.
 
 Decode slows as the context fills, from fewer expert slots and from attention over more keys. The table was measured
 with the int4 caches of before, when full attention took about 0.22 ms per token for each 8k tokens; the f16 caches
