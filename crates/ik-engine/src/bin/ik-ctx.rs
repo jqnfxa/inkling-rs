@@ -61,6 +61,7 @@ fn main() -> Result<(), String> {
         // the first decoded token warms up; time the rest
         logits = e.decode(argmax(&logits))?;
         let busy0 = e.pool.busy_ns.load(std::sync::atomic::Ordering::Relaxed);
+        let attn0: [u64; 4] = std::array::from_fn(|i| ik_engine::cpu_pool::ATTN_NS[i].load(std::sync::atomic::Ordering::Relaxed));
         let (h1, m1) = {
             let u = e.pool.usage.lock().unwrap();
             (u.hits, u.miss_count)
@@ -81,6 +82,10 @@ fn main() -> Result<(), String> {
             let misses = (m - m1) as f64 / (n_gen - 1) as f64;
             let uses = (h - h1 + m - m1) as f64 / (n_gen - 1) as f64;
             println!("        last token {total:.0} us on the GPU timeline; CPU experts {busy:.2} ms/token (all threads), {misses:.1} misses of {uses:.0} uses a token; {} slots; {} MiB of KV in host memory", e.cache.n_slots(), e.kv_host_bytes() >> 20);
+            let attn = |i: usize| (ik_engine::cpu_pool::ATTN_NS[i].load(std::sync::atomic::Ordering::Relaxed) - attn0[i]) as f64 / (n_gen - 1) as f64;
+            if attn(0) > 0.0 {
+                println!("        CPU attention {:.2} ms/token over {:.0} host rows ({:.1} us per job)", attn(2) / 1e6, attn(3), attn(2) / attn(0) / 1e3);
+            }
             for (name, n, us) in v.iter().take(10) {
                 println!("          {name:22} {n:5} x {:7.1} us = {us:7.0} us ({:4.1}%)", us / *n as f64, 100.0 * us / total);
             }

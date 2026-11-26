@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::checkpoint::{Checkpoint, Dtype};
-use crate::cpu_pool::Pool;
+use crate::cpu_pool::{ATTN_JOB, ATTN_OUT, ATTN_STEP, AttnCtx, Pool};
 use crate::cuda::{self, Ctx, DevBuf, Graph, HostBuf, Result, Stream, VmBuf};
 use crate::experts::{ExpertCache, Experts, Fmt, upload_slot};
 use crate::hp::{Hp, Step};
@@ -173,6 +173,12 @@ pub struct Engine {
     kv_mapped: usize,
     /// the rows of kv_vm in VRAM; the rows past them are host memory
     kv_vram_rows: usize,
+    /// whether the caches have rows past kv_vram_rows: then decode posts attention jobs to the CPU team for them
+    kv_cpu: bool,
+    /// the order of each full-attention slot among them: its attention job's step is ATTN_STEP + this
+    attn_idx: Vec<u32>,
+    /// the CPU team's partials of the host rows, [24] of m, l, acc[128]
+    attn_out: HostBuf,
     /// VRAM for the expert cache and the mapped rows of kv_vm together
     vram_budget: usize,
     ring: Vec<u32>,
@@ -386,7 +392,7 @@ impl Engine {
         let max_slots = if GPU_EXPERTS { (vram_budget / (ex.gu_bytes[0] + ex.down_bytes[0])).min(opt.cache_slots) } else { 0 };
         let cache = ExpertCache::new(&ex, &hp, max_slots, ctx.device)?;
         s.sync()?;
-        let job = HostBuf::new(4 * (32 + n))?;
+        let job = HostBuf::new(4 * (32 + n.max(ATTN_JOB)))?;
         let ack = HostBuf::new(64)?;
         let err = HostBuf::new(64)?;
         let cpu_out = HostBuf::new(4 * 8 * n)?;
@@ -426,6 +432,9 @@ impl Engine {
             kv_vm,
             kv_mapped: 0,
             kv_vram_rows: 0,
+            kv_cpu: false,
+            attn_idx: vec![],
+            attn_out: HostBuf::new(4 * ATTN_OUT)?,
             vram_budget,
             ring,
             conv,
@@ -474,6 +483,30 @@ impl Engine {
             v.set_host_from(vram_rows * KV_ROW);
         }
         e.kv_vram_rows = vram_rows;
+        e.kv_cpu = vram_rows < all;
+        let mut g = 0;
+        for b in &e.kv_vm {
+            e.attn_idx.push(g);
+            g += b.is_some() as u32;
+        }
+        if g > 64 - ATTN_STEP {
+            return Err(format!("{g} full-attention layers: more attention jobs than a token has steps for"));
+        }
+        if e.kv_cpu {
+            let hp = &e.hp;
+            let proj = (0..hp.n_phys)
+                .map(|ip| if hp.is_swa[ip] { Ok(vec![]) } else { e.w.layers[ip].rel_proj.download::<u16>(hp.n_rel * hp.rel_extent) })
+                .collect::<Result<Vec<_>>>()?;
+            e.pool.set_attn(AttnCtx {
+                kv: e.kv_vm.iter().map(|b| b.as_ref().map(|b| (b[0].ptr as usize, b[1].ptr as usize))).collect(),
+                phys: (0..e.kv_vm.len()).map(|il| Self::phys(hp, il)).collect(),
+                proj,
+                vram: vram_rows,
+                extent: hp.rel_extent,
+                scale: 1.0 / (hp.head_dim as f32).sqrt(),
+                out: e.attn_out.ptr as usize,
+            });
+        }
         e.plan_kv(T_MAX)?;
         Ok(e)
     }
@@ -1385,14 +1418,25 @@ impl Engine {
         let maxs = self.maxs as u32;
         let window = if swa { hp.n_swa as u32 } else { u32::MAX };
         let cs = if swa { CS_SWA } else { CS_FULL };
-        let nsplit = if swa { hp.n_swa } else { self.n_ctx }.div_ceil(1 << cs) as u32;
-        self.k.attn_part(&self.s, self.sc.q.ptr, self.sc.r.ptr, sink, l.rel_proj.ptr, kc, vc, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, p_pos, ring, extent, scale, maxs, nsplit, window, cs, u32::MAX)?;
+        // full attention with rows in host memory: the CPU team takes them (an attention job, posted first so the two
+        // parts run together), the GPU the rows in VRAM
+        let cpu = !swa && self.kv_cpu;
+        let (vram, step) = if cpu { (self.kv_vram_rows as u32, ATTN_STEP + self.attn_idx[il]) } else { (u32::MAX, 0) };
+        if cpu {
+            let nr = (hp.n_head * hp.n_rel) as u32;
+            self.k.job_post(&self.s, self.sc.q.ptr, nh, self.sc.r.ptr, nr, sink, hp.n_head as u32, self.job.dev, p_pos, step, il as u32)?;
+        }
+        let nsplit = if swa { hp.n_swa } else { self.n_ctx.min(self.kv_vram_rows) }.div_ceil(1 << cs).max(1) as u32;
+        self.k.attn_part(&self.s, self.sc.q.ptr, self.sc.r.ptr, sink, l.rel_proj.ptr, kc, vc, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, p_pos, ring, extent, scale, maxs, nsplit, window, cs, vram)?;
         if !swa {
             // the per-chunk max and sum of each head: [kv head][chunk][3]
             self.probe("attn_pm", il, self.sc.pm.ptr, 8 * maxs as usize * 3)?;
             self.probe("attn_pl", il, self.sc.pl.ptr, 8 * maxs as usize * 3)?;
         }
-        self.k.attn_reduce(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, p_pos, window, maxs, cs, hp.n_head as u32, 0, u32::MAX)?;
+        if cpu {
+            self.k.moe_wait(&self.s, self.ack.dev, self.params.ptr, step, self.err.dev, 5_000_000_000)?;
+        }
+        self.k.attn_reduce(&self.s, self.sc.pm.ptr, self.sc.pl.ptr, self.sc.pacc.ptr, self.sc.att.ptr, p_pos, window, maxs, cs, hp.n_head as u32, self.attn_out.dev, vram)?;
         self.probe("kqv_out", il, self.sc.att.ptr, nh as usize)?;
         self.k.mul_sigmoid(&self.s, self.sc.att.ptr, gate, self.sc.att2.ptr, nh)?;
         let l = &self.w.layers[ip];

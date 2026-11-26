@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 use crate::cpu::{dot_row, order_x, x_pos};
+use crate::cpu_attn::{self, DIM, HEADS, N_REL, Partial};
 use crate::cpu_batch::dot_tokens;
 use crate::cuda::HostBuf;
 use crate::experts::Experts;
@@ -15,6 +16,26 @@ use crate::experts::Experts;
 const JOB_IDS: usize = 2; // u32 index of ids
 const JOB_SLOTS: usize = 10;
 const JOB_X: usize = 32;
+/// The steps of a token's jobs (seq = token * 64 + step + 1): its MoE layers from 0, the attention of its
+/// full-attention layers from ATTN_STEP (8 of them).
+pub const ATTN_STEP: u32 = 48;
+/// floats of an attention job: q [24][128], r [24][16], sink [24]
+pub const ATTN_JOB: usize = HEADS * DIM + HEADS * N_REL + HEADS;
+/// floats of the CPU's attention partials: [24] of m, l, acc[128]
+pub const ATTN_OUT: usize = HEADS * (2 + DIM);
+
+/// What the attention jobs need besides the job: the full-attention caches of each layer slot (host addresses of K
+/// and V row 0), the rows in VRAM (the CPU takes those past them), and the bias profiles of each physical layer.
+pub struct AttnCtx {
+    pub kv: Vec<Option<(usize, usize)>>,
+    pub phys: Vec<usize>,
+    pub proj: Vec<Vec<u16>>,
+    pub vram: usize,
+    pub extent: usize,
+    pub scale: f32,
+    /// host address of the partials, [ATTN_OUT] f32
+    pub out: usize,
+}
 const ROWS: usize = 32; // rows per chunk of the interleaved split (prefill)
 const ACT: usize = 32; // decode: activations per gate_up chunk (its gate and up rows, and one block of the activations)
 const DN_ROWS: usize = 32; // decode: down rows per chunk
@@ -39,11 +60,16 @@ struct Shared {
     dn_next: AtomicU64,
     gu_done: AtomicU32,
     dn_done: AtomicU32,
-    kind: AtomicU64,      // epoch << 1 | 1 for a batch job
+    kind: AtomicU64,      // epoch << 2 | KIND_*
     batch_req: AtomicU32,  // the host posts a batch job (prefill): 1 pending, 0 done
     n: usize,
     work: UnsafeCell<Work>,
+    attn: std::sync::OnceLock<AttnCtx>,
 }
+
+const KIND_DECODE: u64 = 0;
+const KIND_BATCH: u64 = 1;
+const KIND_ATTN: u64 = 2;
 
 // SAFETY: `work` is written by the leader before it bumps `epoch`, and read by helpers after: a batch job's phases are
 // separated by barriers, a decode job's by the done counters (see `take`).
@@ -68,6 +94,14 @@ struct Work {
     x: Vec<f32>,
     acts: Vec<Vec<f32>>, // activations per miss, written a block per gate_up chunk
     out: usize,    // host address of cpu_out [8][n]
+    // an attention job: its query (q, r, sink), slot, position, the distances 0..a_d0 in chunks of a_chunk, and the
+    // chunks' partials
+    aq: Vec<f32>,
+    a_il: usize,
+    a_pos: usize,
+    a_d0: usize,
+    a_chunk: usize,
+    a_parts: Vec<[Partial; HEADS]>,
 }
 
 /// nanoseconds of the batch phases: gate_up, activations, down
@@ -255,13 +289,42 @@ fn wait_done(sh: &Shared, done: &AtomicU32, total: u32, epoch: u32) -> bool {
 /// The work of thread `t` on the job of epoch `epoch`.
 fn run(sh: &Shared, cx: &Ctx, t: usize, epoch: u32) {
     let kind = sh.kind.load(Ordering::Acquire);
-    if (kind >> 1) as u32 != epoch {
+    if (kind >> 2) as u32 != epoch {
         return; // a later job has started: this thread takes part in it next
     }
-    if kind & 1 == 1 {
-        run_batch(sh, cx, t)
-    } else {
-        run_decode(sh, cx, t, epoch)
+    match kind & 3 {
+        KIND_BATCH => run_batch(sh, cx, t),
+        KIND_ATTN => run_attn(sh, epoch),
+        _ => run_decode(sh, cx, t, epoch),
+    }
+}
+
+/// Chunks of an attention job: the partials of their distances.
+fn run_attn(sh: &Shared, epoch: u32) {
+    let w = sh.work.get() as *const Work;
+    let Some(ac) = sh.attn.get() else { return };
+    while let Take::Chunk(c) = take(&sh.gu_next, epoch) {
+        // SAFETY: the epoch holds while this chunk is not done; the leader writes the job only between epochs, and
+        // chunk c's partials are this thread's alone
+        unsafe {
+            let w = &*w;
+            let (lo, hi) = (c * w.a_chunk, ((c + 1) * w.a_chunk).min(w.a_d0));
+            let (k, v) = ac.kv[w.a_il].unwrap();
+            let aq = &w.aq;
+            let qy = cpu_attn::Query {
+                q: &aq[..HEADS * DIM],
+                r: &aq[HEADS * DIM..HEADS * (DIM + N_REL)],
+                sink: &aq[HEADS * (DIM + N_REL)..ATTN_JOB],
+                proj: &ac.proj[ac.phys[w.a_il]],
+                extent: ac.extent,
+                scale: ac.scale,
+                pos: w.a_pos,
+            };
+            let part = &mut *(w.a_parts.as_ptr().add(c) as *mut [Partial; HEADS]);
+            *part = [Partial::EMPTY; HEADS];
+            cpu_attn::rows(&qy, k as *const u16, v as *const u16, lo, hi, part);
+        }
+        sh.gu_done.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -345,6 +408,7 @@ impl Pool {
             batch_req: AtomicU32::new(0),
             n,
             work: UnsafeCell::new(Work::default()),
+            attn: std::sync::OnceLock::new(),
         });
         let usage = Arc::new(Mutex::new(Usage { freq: vec![vec![0.0; n_expert]; n_layers], misses: vec![], hits: 0, miss_count: 0 }));
         let busy_ns = Arc::new(AtomicU64::new(0));
@@ -425,7 +489,7 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
             }
             let t0 = std::time::Instant::now();
             let g = sh.epoch.load(Ordering::Relaxed).wrapping_add(1);
-            sh.kind.store((g as u64) << 1 | 1, Ordering::Release);
+            sh.kind.store((g as u64) << 2 | KIND_BATCH, Ordering::Release);
             sh.epoch.store(g, Ordering::Release);
             run_batch(sh, cx, 0);
             busy.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -459,6 +523,12 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
         let t0 = std::time::Instant::now();
         LEADER_T0.with(|c| c.set(t0));
         last = seq;
+        if (seq - 1) % 64 >= ATTN_STEP {
+            attn_job(sh, job);
+            ack.store(seq, Ordering::Release);
+            ATTN_NS[2].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            continue;
+        }
         // SAFETY: the GPU wrote the job before seq, behind a system fence
         let (layer, ids, slots) = unsafe {
             let layer = *job.add(1) as usize;
@@ -487,7 +557,7 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
             sh.dn_done.store(0, Ordering::Relaxed);
             sh.gu_next.store((g as u64) << 32 | gu_total << 16, Ordering::Release);
             sh.dn_next.store((g as u64) << 32 | dn_total << 16, Ordering::Release);
-            sh.kind.store((g as u64) << 1, Ordering::Release);
+            sh.kind.store((g as u64) << 2 | KIND_DECODE, Ordering::Release);
             sh.epoch.store(g, Ordering::Release);
             let t1 = t0.elapsed().as_nanos() as u64;
             run_decode(sh, cx, 0, g);
@@ -517,7 +587,66 @@ fn leader(sh: &Shared, cx: &Ctx, usage: &Mutex<Usage>, busy: &AtomicU64) {
     }
 }
 
+/// attention jobs: [jobs, of them with rows for the CPU, ns from the job to its ack, rows]
+pub static ATTN_NS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The attention job in `job`: the partials of the rows past the VRAM ones, in chunks on the team, merged in order
+/// into the output; nothing when the token is not past them (attn_reduce then reads nothing).
+fn attn_job(sh: &Shared, job: *const u32) {
+    ATTN_NS[0].fetch_add(1, Ordering::Relaxed);
+    let Some(ac) = sh.attn.get() else { return };
+    // SAFETY: the GPU wrote the job before seq, behind a system fence
+    let (il, pos) = unsafe { (std::ptr::read_volatile(job.add(1)) as usize, std::ptr::read_volatile(job.add(2)) as usize) };
+    let d0 = (pos + 1).saturating_sub(ac.vram);
+    if d0 == 0 || ac.kv.get(il).is_none_or(|kv| kv.is_none()) {
+        return;
+    }
+    ATTN_NS[1].fetch_add(1, Ordering::Relaxed);
+    ATTN_NS[3].fetch_add(d0 as u64, Ordering::Relaxed);
+    let n_chunks = {
+        // SAFETY: no thread reads the job between epochs
+        let w = unsafe { &mut *sh.work.get() };
+        w.aq.clear();
+        // SAFETY: host-mapped memory the GPU wrote before seq
+        w.aq.extend_from_slice(unsafe { std::slice::from_raw_parts(job.add(JOB_X) as *const f32, ATTN_JOB) });
+        let n_chunks = d0.div_ceil(128).min(4 * sh.n).max(1);
+        (w.a_il, w.a_pos, w.a_d0, w.a_chunk) = (il, pos, d0, d0.div_ceil(n_chunks));
+        let n_chunks = d0.div_ceil(w.a_chunk);
+        if w.a_parts.len() < n_chunks {
+            w.a_parts.resize(n_chunks, [Partial::EMPTY; HEADS]);
+        }
+        n_chunks
+    };
+    let g = sh.epoch.load(Ordering::Relaxed).wrapping_add(1);
+    sh.gu_done.store(0, Ordering::Relaxed);
+    sh.gu_next.store((g as u64) << 32 | (n_chunks as u64) << 16, Ordering::Release);
+    sh.kind.store((g as u64) << 2 | KIND_ATTN, Ordering::Release);
+    sh.epoch.store(g, Ordering::Release);
+    run_attn(sh, g);
+    wait_done(sh, &sh.gu_done, n_chunks as u32, g);
+    // SAFETY: all chunks are done, so no thread writes the work now
+    let w = unsafe { &*sh.work.get() };
+    let mut all = [Partial::EMPTY; HEADS];
+    for p in &w.a_parts[..n_chunks] {
+        for (a, b) in all.iter_mut().zip(p) {
+            a.merge(b);
+        }
+    }
+    // SAFETY: host-mapped memory of ATTN_OUT floats that the GPU reads after the ack
+    let out = unsafe { std::slice::from_raw_parts_mut(ac.out as *mut f32, ATTN_OUT) };
+    for (h, p) in all.iter().enumerate() {
+        out[h * (2 + DIM)] = p.m;
+        out[h * (2 + DIM) + 1] = p.l;
+        out[h * (2 + DIM) + 2..(h + 1) * (2 + DIM)].copy_from_slice(&p.acc);
+    }
+}
+
 impl Pool {
+    /// Sets what the attention jobs need; once, before the first.
+    pub fn set_attn(&self, ac: AttnCtx) {
+        let _ = self.shared.attn.set(ac);
+    }
+
     /// Runs a prefill job on the team, and returns when it is done.
     pub fn run_batch(&self, job: BatchJob) {
         // SAFETY: the leader reads the job only after batch_req is set, and the previous one is done
