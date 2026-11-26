@@ -177,7 +177,6 @@ the average up to it; the hit rate changes with the text, and runs vary 10-20% w
 | `ik-bench <model> [n_gen]` | decode speed and expert cache hit rate; `IK_PROF=1` adds the GPU time of each kernel kind, `IK_PREFILL=1` prefills the prompt |
 | `ik-ctx <model> <text> <n_ctx> [n_gen] [max depth]` | prefill and decode speed as the context grows |
 | `ik-ppl <model> <text> [n]` | perplexity |
-| `ik-check <model> <ref.bin> [slots]` | compares every tensor with a llama.cpp dump from `tools/refdump.cpp` |
 | `ik-pfcheck <model> <text> [n]` | prefill against decode |
 | `ik-rollback <model> [repeats]` | KV cache rollback against a fresh prefill |
 | `ik-branch <model> [tokens]` | a branch taken at a checkpoint and dropped, against no branch |
