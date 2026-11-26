@@ -15,10 +15,10 @@ pub struct Kernels {
 /// Stamps a profile holds, at most.
 pub const PROF_MAX: usize = 8192;
 
-/// `rms_norm_1` for `_ZN2ik10ik_kernels3gpu8rms_normILj1EEE`: the kernel's name, and its instance if any (the module,
-/// gpu or attn, left out).
+/// `rms_norm_1` for `_ZN2ik10ik_kernels3gpu8rms_normILj1EEE`: the kernel's name, and its instance if any (the module
+/// left out).
 fn short(mangled: &str) -> String {
-    let rest = &mangled[["3gpu", "4attn"].iter().find_map(|m| mangled.find(m).map(|i| i + m.len())).unwrap_or(0)..];
+    let rest = &mangled[mangled.find("3gpu").map_or(0, |i| i + 4)..];
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     let len: usize = digits.parse().unwrap_or(0);
     let name = &rest[digits.len()..digits.len() + len];
@@ -88,12 +88,6 @@ impl Kernels {
     pub fn gemv_bf16t(&self, s: &Stream, tab: P, max_rows: u32, k: u32, nz: u32) -> Result<()> {
         assert!(k % 256 == 0, "gemv_bf16t: k {k}");
         self.run(s, "gemv_bf16t", (max_rows.div_ceil(16), 1, nz), 256, &[&tab, &k])
-    }
-
-    /// y[t][r] = W x[t] for `ntok` tokens, W repacked Q8_0 [rows][k]
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemv_q8(&self, s: &Stream, qs: P, d: P, x: P, y: P, rows: u32, k: u32, ntok: u32, y_stride: u32) -> Result<()> {
-        self.run(s, "gemv_q8", (rows.div_ceil(16), ntok, 1), 256, &[&qs, &d, &x, &y, &rows, &k, &y_stride])
     }
 
     /// RMS norm of `nvec` vectors of n floats, times w if given
@@ -183,23 +177,6 @@ impl Kernels {
         self.run(s, "router", (1, 1, 1), 128, &[&wt, &x, &bias, &ids, &wts, &ids2, &wts2, &n, &scale])
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn kv_store(&self, s: &Stream, k: P, v: P, kc: P, vc: P, params: P, ring: u32, nkv: u32) -> Result<()> {
-        self.run(s, "kv_store", (nkv.div_ceil(256), 1, 1), 256, &[&k, &v, &kc, &vc, &params, &ring, &nkv])
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn attn_decode(
-        &self, s: &Stream, q: P, r: P, sink: P, rb: P, kc: P, vc: P, out: P, params: P, ring: u32, extent: u32, n_head: u32,
-        group: u32, scale: f32,
-    ) -> Result<()> {
-        self.run(s, "attn_decode", (n_head, 1, 1), 256, &[&q, &r, &sink, &rb, &kc, &vc, &out, &params, &ring, &extent, &group, &scale])
-    }
-
-    pub fn moe_combine(&self, s: &Stream, gpu: P, cpu: P, slots: P, wts: P, out: P, n: u32) -> Result<()> {
-        self.run(s, "moe_combine", (n.div_ceil(256), 1, 1), 256, &[&gpu, &cpu, &slots, &wts, &out, &n])
-    }
-
     pub fn add(&self, s: &Stream, a: P, b: P, y: P, n: u32) -> Result<()> {
         self.run(s, "add", (n.div_ceil(256), 1, 1), 256, &[&a, &b, &y, &n])
     }
@@ -227,16 +204,6 @@ impl Kernels {
         self.run(s, "moe_wait", (1, 1, 1), 32, &[&ack, &params, &step, &err, &timeout_ns])
     }
 
-    /// q8_1 of `nvec` vectors of n floats (n a multiple of 32)
-    pub fn quant_q8_1(&self, s: &Stream, x: P, q: P, d: P, sum: P, n: u32, nvec: u32) -> Result<()> {
-        self.run(s, "quant_q8_1", ((n / 32).div_ceil(8), nvec, 1), 256, &[&x, &q, &d, &sum, &n])
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemv_q8d(&self, s: &Stream, qs: P, dw: P, xq: P, xd: P, y: P, rows: u32, k: u32) -> Result<()> {
-        self.run(s, "gemv_q8d", (rows.div_ceil(16), 1, 1), 256, &[&qs, &dw, &xq, &xd, &y, &rows, &k])
-    }
-
     /// The SITU activation of the cached experts of `slots`: gate_up [8][2 nff] (gate i row 2i, up i row 2i + 1) to
     /// af [8][nff], f32.
     #[allow(clippy::too_many_arguments)]
@@ -257,15 +224,6 @@ impl Kernels {
     pub fn moe_mxfp8_d(&self, s: &Stream, bank: P, slot_bytes: u64, slots: P, x: P, xstride: u32, y: P, rows: u32, k: u32) -> Result<()> {
         assert!(k % 128 == 0, "moe_mxfp8_d: k {k}");
         self.run(s, "moe_mxfp8_d", (rows.div_ceil(64), 8, 1), 128, &[&bank, &slot_bytes, &slots, &x, &xstride, &y, &rows, &k])
-    }
-
-    pub fn router_logits(&self, s: &Stream, w: P, x: P, logits: P, n_expert: u32, n: u32) -> Result<()> {
-        self.router_logits_t(s, w, x, logits, n_expert, n, 1)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn router_logits_t(&self, s: &Stream, w: P, x: P, logits: P, n_expert: u32, n: u32, ntok: u32) -> Result<()> {
-        self.run(s, "router_logits", (n_expert.div_ceil(8), ntok, 1), 256, &[&w, &x, &logits, &n_expert, &n])
     }
 
     pub fn router_topk(&self, s: &Stream, logits: P, bias: P, ids: P, wts: P, scale: f32) -> Result<()> {
@@ -291,23 +249,6 @@ impl Kernels {
 
     // ---------------------------------------------------------------- controllers, several at once (grid.z)
 
-    pub fn ctrl_in_qz(&self, s: &Stream, tab: P, q: P, d: P, sum: P, n: u32, nz: u32) -> Result<()> {
-        if n == 2304 && std::env::var("IK_OLD_CTRL").is_err() {
-            return self.run(s, "ctrl_in_z768", (1, 1, nz), 768, &[&tab, &q, &d, &sum]);
-        }
-        self.run(s, "ctrl_in_qz", (1, 1, nz), 256, &[&tab, &q, &d, &sum, &n])
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemv_q8dz(&self, s: &Stream, tab: P, xq: P, xd: P, y: P, rows: u32, k: u32, nz: u32) -> Result<()> {
-        self.run(s, "gemv_q8dz", (rows.div_ceil(16), 1, nz), 256, &[&tab, &xq, &xd, &y, &rows, &k])
-    }
-
-    /// `nz` GEMVs in one launch, their arguments in `tab` (see the kernel); `max_rows` sizes the grid.
-    pub fn gemv_q8dt(&self, s: &Stream, tab: P, max_rows: u32, k: u32, nz: u32) -> Result<()> {
-        self.run(s, "gemv_q8dt", (max_rows.div_ceil(16), 1, nz), 256, &[&tab, &k])
-    }
-
     /// ctrl_out of `nz` controllers of one token: cur, msg, gw, fw, y of controller z at tab[5 z ..]; its gate at
     /// gate + 64 z.
     pub fn ctrl_outz(&self, s: &Stream, tab: P, gate: P, n: u32, nz: u32) -> Result<()> {
@@ -315,11 +256,6 @@ impl Kernels {
     }
 
     // ---------------------------------------------------------------- batched (prefill)
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemm_q8d_t(&self, s: &Stream, qs: P, dw: P, xq: P, xd: P, y: P, rows: u32, k: u32, ntok: u32, y_stride: u32) -> Result<()> {
-        self.run(s, "gemm_q8d_t", (rows.div_ceil(32), ntok.div_ceil(32), 1), 128, &[&qs, &dw, &xq, &xd, &y, &rows, &k, &ntok, &y_stride])
-    }
 
     #[allow(clippy::too_many_arguments)]
     pub fn conv4_seq(
@@ -346,24 +282,11 @@ impl Kernels {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn situ_q8_n(&self, s: &Stream, gu: P, aq: P, ad: P, asum: P, nff: u32, beta: f32, lb: f32, npairs: u32) -> Result<()> {
-        self.run(s, "situ_q8_n", ((nff / 32).div_ceil(8), npairs, 1), 256, &[&gu, &aq, &ad, &asum, &nff, &beta, &lb])
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub fn moe_combine_t(&self, s: &Stream, gpu: P, cpu: P, slots: P, wts: P, out: P, n: u32, ntok: u32) -> Result<()> {
         self.run(s, "moe_combine_t", (n.div_ceil(256), ntok, 1), 256, &[&gpu, &cpu, &slots, &wts, &out, &n])
     }
 
     // ---------------------------------------------------------------- fused decode
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn norm_q8(&self, s: &Stream, x: P, w: P, y: P, q: P, d: P, sum: P, n: u32, eps: f32, nvec: u32, xs: u32) -> Result<()> {
-        if n == 2304 && std::env::var("IK_OLD_NORM").is_err() {
-            return self.run(s, "norm_q8_768", (nvec, 1, 1), 768, &[&x, &w, &y, &q, &d, &sum, &eps, &xs]);
-        }
-        self.run(s, "norm_q8", (nvec, 1, 1), 256, &[&x, &w, &y, &q, &d, &sum, &n, &eps, &xs])
-    }
 
     #[allow(clippy::too_many_arguments)]
     pub fn kv_prep(
@@ -376,10 +299,6 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn clip_qr(&self, s: &Stream, qin: P, qs: P, qout: P, rin: P, rs: P, rout: P, n_head: u32, thr_q: f32, thr_r: f32, post: P) -> Result<()> {
         self.run(s, "clip_qr", ((2 * n_head).div_ceil(8), 1, 1), 256, &[&qin, &qs, &qout, &rin, &rs, &rout, &n_head, &thr_q, &thr_r, &post])
-    }
-
-    pub fn gate_q8(&self, s: &Stream, a: P, g: P, q: P, d: P, sum: P, n: u32) -> Result<()> {
-        self.run(s, "gate_q8", ((n / 32).div_ceil(8), 1, 1), 256, &[&a, &g, &q, &d, &sum, &n])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -401,10 +320,5 @@ impl Kernels {
         &self, s: &Stream, logits: P, bias: P, ids: P, wts: P, scale: f32, map: P, slots: P, x: P, job: P, params: P, step: u32, layer: u32, n: u32,
     ) -> Result<()> {
         self.run(s, if std::env::var("IK_OLD_ROUTER").is_ok() { "router_dispatch" } else { "router_dispatch2" }, (1, 1, 1), 128, &[&logits, &bias, &ids, &wts, &scale, &map, &slots, &x, &job, &params, &step, &layer, &n])
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn ctrl_in_q(&self, s: &Stream, cur: P, msg: P, q: P, d: P, sum: P, n: u32) -> Result<()> {
-        self.run(s, "ctrl_in_q", (1, 1, 1), 256, &[&cur, &msg, &q, &d, &sum, &n])
     }
 }
